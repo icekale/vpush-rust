@@ -7094,6 +7094,13 @@ async fn ensure_news_admin_columns(pool: &SqlitePool) -> Result<(), sqlx::Error>
         )
         .await?;
     }
+    if !sources.is_empty() && !sources.iter().any(|column| column == "last_success_at") {
+        add_column(
+            pool,
+            "ALTER TABLE news_sources ADD COLUMN last_success_at TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+    }
     sqlx::query("UPDATE news_sources SET internal = 1 WHERE slug LIKE 'xincai-%' AND internal = 0")
         .execute(pool)
         .await?;

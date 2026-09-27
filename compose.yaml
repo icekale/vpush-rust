@@ -18,6 +18,7 @@ services:
       VPUSH_FETCH: ${VPUSH_FETCH:-0}
     volumes:
       - ./data:/app/data
+      - ./avatars:/app/static/avatars:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/"]
       interval: 30s

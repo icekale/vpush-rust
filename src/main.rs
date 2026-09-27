@@ -6567,6 +6567,63 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn http_kol_request_handlers_audit_authenticated_admin() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('reader', 'x')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let reader = db.user_by_username("reader").await.unwrap().unwrap();
+        let approved_request = db
+            .add_kol_request_without_category("xueqiu", "910", reader.id, "")
+            .await
+            .unwrap();
+        let rejected_request = db
+            .add_kol_request_without_category("weibo", "911", reader.id, "")
+            .await
+            .unwrap();
+        let state = AppState {
+            db: db.clone(),
+            secret: "route-test-secret".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let token = auth::create_token(
+            admin.id,
+            &admin.username,
+            &state.secret,
+            admin.token_version,
+            now_secs(),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).unwrap(),
+        );
+        let Json(approved) = approve_kol_request(
+            State(state.clone()),
+            headers.clone(),
+            UrlPath(approved_request),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.detail));
+        assert_eq!(approved["ok"], true);
+        let _ = reject_kol_request(State(state.clone()), headers, UrlPath(rejected_request))
+            .await
+            .unwrap_or_else(|err| panic!("{}", err.detail));
+        let logs = db.list_admin_logs(20).await.unwrap();
+        assert!(logs.iter().any(|log| {
+            log["user_id"] == admin.id && log["action"] == "approve_kol_request"
+        }));
+        assert!(logs.iter().any(|log| {
+            log["user_id"] == admin.id && log["action"] == "reject_kol_request"
+        }));
+    }
+
     #[test]
     fn download_token_prefers_header_then_query_then_cookie() {
         let mut headers = HeaderMap::new();

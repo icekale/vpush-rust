@@ -5154,13 +5154,6 @@ async fn update_me(
 }
 
 async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result<(), ApiError> {
-    if let Some(value) = &body.telegram_chat_id {
-        state
-            .db
-            .set_user_text(user.id, "telegram_chat_id", value.trim())
-            .await
-            .map_err(db_err)?;
-    }
     if let Some(value) = &body.telegram_bot_token {
         let value = value.trim();
         if !masked_secret(value) {
@@ -5223,6 +5216,20 @@ async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result
                     .await
                     .map_err(db_err)?;
             }
+        }
+    }
+    if body.telegram_bot_token.as_ref().is_none()
+        || body
+            .telegram_bot_token
+            .as_ref()
+            .is_some_and(|value| masked_secret(value.trim()))
+    {
+        if let Some(value) = &body.telegram_chat_id {
+            state
+                .db
+                .set_user_text(user.id, "telegram_chat_id", value.trim())
+                .await
+                .map_err(db_err)?;
         }
     }
     for (field, column) in [
@@ -6513,7 +6520,7 @@ mod tests {
             &state,
             &user,
             &MeUpdate {
-                telegram_chat_id: None,
+                telegram_chat_id: Some("should-not-bind".into()),
                 telegram_bot_token: Some("123456:ABCDEFGHIJKLMNOPQRST".into()),
                 feishu_open_id: None,
                 feishu_chat_id: None,
@@ -6541,6 +6548,14 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, StatusCode::BAD_REQUEST);
         assert_eq!(err.detail, "未配置 FEISHU_CREDENTIAL_KEY");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT telegram_chat_id FROM users WHERE id = ?")
+                .bind(user.id)
+                .fetch_one(state.db.pool())
+                .await
+                .unwrap(),
+            ""
+        );
         let _ = std::fs::remove_dir_all(&path);
         match previous {
             Some(value) => std::env::set_var("FEISHU_CREDENTIAL_KEY", value),

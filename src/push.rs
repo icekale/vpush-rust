@@ -27,18 +27,14 @@ pub async fn test_user(
             send_bark_text(&user.bark_key, "测试推送", &text).await,
         ));
     }
-    if picked.telegram {
+    if picked.telegram && !user.telegram_chat_id.trim().is_empty() {
         let key = crate::feishu_personal::credential_key().unwrap_or_default();
         match telegram_secret(&user.telegram_bot_token, &key) {
             Ok(token) if token.is_empty() => {}
-            Ok(token) => {
-                let result = if telegram_token_ok(&token) && chat_id_ok(&user.telegram_chat_id) {
-                    send_telegram(&token, &user.telegram_chat_id, &text).await
-                } else {
-                    Err("Telegram 配置无效".into())
-                };
-                results.push(outcome("telegram", result));
-            }
+            Ok(token) => results.push(outcome(
+                "telegram",
+                send_telegram(&token, &user.telegram_chat_id, &text).await,
+            )),
             Err(err) => results.push(outcome("telegram", Err(err))),
         }
     }
@@ -83,13 +79,10 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
         send_bark_text(&user.bark_key, "每日精选", text).await?;
         sent = true;
     }
-    if picked.telegram {
+    if picked.telegram && !user.telegram_chat_id.trim().is_empty() {
         let key = crate::feishu_personal::credential_key().unwrap_or_default();
         let token = telegram_secret(&user.telegram_bot_token, &key)?;
         if !token.is_empty() {
-            if !telegram_token_ok(&token) || !chat_id_ok(&user.telegram_chat_id) {
-                return Err("Telegram 配置无效".into());
-            }
             send_telegram(&token, &user.telegram_chat_id, text).await?;
             sent = true;
         }
@@ -144,18 +137,14 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     .await;
             }
         }
-        if channels.telegram {
+        if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
             let key = crate::feishu_personal::credential_key().unwrap_or_default();
             match telegram_secret(&target.telegram_bot_token, &key) {
                 Ok(token) if token.is_empty() => {}
                 Ok(token) => {
-                    let result =
-                        if telegram_token_ok(&token) && chat_id_ok(&target.telegram_chat_id) {
-                            send_telegram(&token, &target.telegram_chat_id, &plain(note)).await
-                        } else {
-                            Err("Telegram 配置无效".into())
-                        };
-                    if let Err(err) = result {
+                    if let Err(err) =
+                        send_telegram(&token, &target.telegram_chat_id, &plain(note)).await
+                    {
                         tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
                         note_push_failure(db, &format!("Telegram：{err}")).await;
                         let _ = remember_failure(
@@ -667,10 +656,16 @@ pub async fn resolve_telegram_bot(token: &str) -> Result<(String, String), Strin
     parse_telegram_bind(&me, &updates)
 }
 
-async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
-    if !telegram_token_ok(token) || !chat_id_ok(chat_id) {
-        return Ok(());
+fn validate_telegram_send(token: &str, chat_id: &str) -> Result<(), String> {
+    if telegram_token_ok(token) && chat_id_ok(chat_id) {
+        Ok(())
+    } else {
+        Err("Telegram 配置无效".into())
     }
+}
+
+async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
+    validate_telegram_send(token, chat_id)?;
     let body = serde_json::json!({
         "chat_id": chat_id,
         "text": truncate(text, 4000),
@@ -860,6 +855,14 @@ mod tests {
         assert!(telegram_secret("not-a-telegram-token", &key).is_err());
     }
 
+    #[tokio::test]
+    async fn send_telegram_rejects_unbound_configuration() {
+        assert!(send_telegram("", "", "test").await.is_err());
+        assert!(send_telegram("123456:ABCDEFGHIJKLMNOPQRST", "", "test")
+            .await
+            .is_err());
+    }
+
     #[test]
     fn quiet_hours_skip_ordinary_posts() {
         let quiet = target("22:00", "08:00", false, false);
@@ -898,6 +901,21 @@ mod tests {
         user.push_channels = "wecom".into();
         let err = test_user(&db, &user, "你好").await.unwrap_err();
         assert_eq!(err, "该用户未绑定任何推送渠道");
+        user.push_channels = "telegram".into();
+        user.telegram_bot_token = "123456:ABCDEFGHIJKLMNOPQRST".into();
+        user.telegram_chat_id.clear();
+        let err = test_user(&db, &user, "你好").await.unwrap_err();
+        assert_eq!(err, "该用户未绑定任何推送渠道");
+        db.set_user_text(user.id, "push_channels", "telegram")
+            .await
+            .unwrap();
+        db.set_user_text(user.id, "telegram_bot_token", "123456:ABCDEFGHIJKLMNOPQRST")
+            .await
+            .unwrap();
+        assert_eq!(
+            send_user_text(&db, user.id, "你好").await.unwrap_err(),
+            "该用户未绑定任何推送渠道"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -928,6 +946,155 @@ mod tests {
             ),
             "https://api.telegram.org/bot<redacted>/x"
         );
+    }
+
+    #[tokio::test]
+    async fn deliver_skips_unbound_telegram_in_all_channels() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-deliver-unbound-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, telegram_bot_token, push_channels) VALUES ('telegram', 'x', '123456:ABCDEFGHIJKLMNOPQRST', '')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'telegram'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let kol_id = db
+            .add_kol(
+                "xueqiu",
+                "测试",
+                "deliver-unbound",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id, type) VALUES (?, ?, 'post')")
+            .bind(user_id)
+            .bind(kol_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'deliver-unbound', '标题', 'https://example.test/post')")
+            .bind(kol_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let note = Note {
+            kol_name: "测试",
+            platform: "xueqiu",
+            post_type: "post",
+            title: "标题",
+            content: "正文",
+            url: "https://example.test/post",
+            published_at: "2026-01-01 00:00",
+        };
+        let targets = db.push_targets(kol_id).await.unwrap();
+        assert_eq!(targets.len(), 1);
+        assert!(targets[0].notify_enabled);
+        assert!(targets[0].telegram_chat_id.is_empty());
+        assert!(telegram_token_ok(&targets[0].telegram_bot_token));
+        deliver(&db, kol_id, &note).await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM push_retries WHERE channel = 'telegram'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM push_logs WHERE channel = 'telegram'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_invalid_telegram_delivery_pending() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-retry-telegram-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('telegram', 'x')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'telegram'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let kol_id = db
+            .add_kol(
+                "xueqiu",
+                "测试",
+                "retry-telegram",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id, type) VALUES (?, ?, 'post')")
+            .bind(user_id)
+            .bind(kol_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'retry-telegram', '标题', 'https://example.test/retry')")
+            .bind(kol_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        remember_failure(
+            &db,
+            kol_id,
+            "https://example.test/retry",
+            "telegram",
+            user_id,
+            "Telegram 配置无效",
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retry_due(&db, 1_000, |_, _, _| async {
+                send_telegram("", "", "retry").await
+            })
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

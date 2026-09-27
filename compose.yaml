@@ -1,0 +1,26 @@
+services:
+  vpush-rust:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: vpush-rust:local
+    container_name: vpush-rust
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 8000
+      VPUSH_DB: /app/data/vpush.db
+      VPUSH_STATIC: /app/static
+      WEB_TOKEN_SECRET: ${WEB_TOKEN_SECRET:?set WEB_TOKEN_SECRET}
+      WEB_ALLOW_REGISTER: ${WEB_ALLOW_REGISTER:-0}
+      VPUSH_FETCH: ${VPUSH_FETCH:-0}
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3

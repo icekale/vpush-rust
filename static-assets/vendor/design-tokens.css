@@ -1,0 +1,235 @@
+:root {
+  color-scheme: light;
+
+  /* Typography：四档阅读角色 + 登录字标 / 头像字形 */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "PingFang SC", "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  --font-weight-medium: 500;
+  --font-weight-semibold: 600;
+  --font-weight-bold: 600;
+
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-body: 15px;
+  --text-title: 17px;
+  --text-display: 30px;
+  --text-icon: 20px;
+
+  /* Core colors */
+  --color-white: #ffffff;
+
+  --color-bg: #f5f5f7;
+  --color-bg-table-head: #f7f7fa;
+  --color-bg-muted: #f3f4f7;
+
+  --color-surface: #ffffff;
+  --color-surface-soft: rgba(255, 255, 255, 0.82);
+  --color-surface-hover: rgba(255, 255, 255, 0.96);
+  --color-surface-panel: rgba(255, 255, 255, 0.95);
+  --color-surface-panel-soft: rgba(255, 255, 255, 0.86);
+  --color-surface-muted: #f4f7fb;
+  --color-surface-accent: #eef4ff;
+  --color-surface-button-active: rgba(248, 250, 253, 0.98);
+  --color-surface-accent-soft: rgba(0, 113, 227, 0.08);
+  --color-surface-row-hover: rgba(255, 255, 255, 0.72);
+
+  --color-text: #1d1d1f;
+  --color-text-strong: #222c3c;
+  --color-text-subtle: #464a55;
+  --color-text-muted: #6e6e73;
+  --color-muted-soft: rgba(100, 116, 139, 0.14);
+  --color-text-faint: #667080;
+  --color-link: #0b6fbd;
+
+  --color-line: rgba(12, 18, 34, 0.1);
+  --color-line-strong: rgba(12, 18, 34, 0.16);
+  --color-line-soft: rgba(12, 18, 34, 0.06);
+  --color-line-success: rgba(58, 110, 75, 0.4);
+  --color-line-danger: rgba(220, 38, 38, 0.3);
+
+  --color-accent: #1668e0;
+  --color-accent-strong: #1258c4;
+  --color-accent-soft: rgba(22, 119, 255, 0.12);
+  /* 实底白字 ≥4.5:1；浅底蓝字 5.1:1 */
+  --color-accent-text: #1668e0;
+  /* 品牌渐变（logo/头像底）：两端都深过亮蓝，白字全程 ≥4.5:1 */
+  --brand-gradient: linear-gradient(180deg, var(--color-accent), var(--color-accent-strong));
+
+  /* 平台角标统一 Duty Blue；通知渠道仍用品牌色 */
+  --color-brand-xueqiu: var(--color-accent-text);
+  --color-brand-weibo: var(--color-accent-text);
+  --color-brand-twitter: var(--color-accent-text);
+  --color-brand-zsxq: var(--color-accent-text);
+  --color-brand-truth: var(--color-accent-text);
+  --color-brand-telegram: #26a5e4;
+  --color-brand-feishu: #3370ff;
+  --color-brand-wecom: #07c160;
+  --color-success: #3a6e4b;
+  --color-success-strong: #2f5a3d;
+  --color-success-soft: rgba(58, 110, 75, 0.14);
+  --color-danger: #dc2626;
+  --color-danger-strong: #b91c1c;
+  --color-danger-soft: rgba(220, 38, 38, 0.12);
+  --color-warning: #d97706;
+  --color-warning-strong: #b45309;
+  --color-warning-soft: rgba(217, 119, 6, 0.12);
+  --color-data-positive: #b05b63;
+  --color-data-negative: #23714a;
+  --color-data-positive-soft: color-mix(in srgb, var(--color-data-positive) 14%, transparent);
+  --color-data-negative-soft: color-mix(in srgb, var(--color-data-negative) 14%, transparent);
+
+  --color-badge-idle-bg: #eff1f4;
+  --color-badge-idle-text: #5d6372;
+  --color-login-tint-1: rgba(22, 104, 224, 0.08);
+  --color-login-tint-2: rgba(148, 163, 184, 0.09);
+  --color-login-grid: rgba(12, 18, 34, 0.04);
+  --shadow-login-card:
+    0 24px 48px -12px rgba(15, 23, 42, 0.08),
+    0 4px 16px -4px rgba(15, 23, 42, 0.03),
+    inset 0 1px 0 rgba(255, 255, 255, 0.9);
+
+  /* Borders */
+  --border-soft: 1px solid var(--color-line-soft);
+  --border-default: 1px solid var(--color-line);
+  --border-strong: 1px solid var(--color-line-strong);
+
+  /* Radius */
+  --radius-2xs: 6px;
+  --radius-xs: 10px;
+  --radius-sm: 14px;
+  --radius-md: 18px;
+  --radius-card: 20px;
+  --radius-control: 12px;
+  --radius-pill: 999px;
+
+  /* Shadow */
+  --shadow-xs: 0 2px 10px rgba(15, 23, 42, 0.04);
+  --shadow-sm: 0 8px 24px rgba(15, 23, 42, 0.06);
+  --shadow-lg: 0 22px 56px rgba(15, 23, 42, 0.1);
+  --shadow-focus-ring: 0 0 0 3px rgba(0, 113, 227, 0.08);
+  --shadow-panel-elevated: 0 12px 30px rgba(15, 23, 42, 0.05);
+
+  /* Spacing */
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --section-padding-lg-y: 22px;
+  --section-padding-lg-x: 22px;
+
+  /* Sizing */
+  --control-height-lg: 34px;
+  --control-height-xl: 36px;
+  --control-height-2xl: 42px;
+
+  /* Motion / effects */
+  --ease-standard: 160ms ease;
+  --outline-focus: 2px solid rgba(0, 113, 227, 0.22);
+
+  --gradient-panel-base: linear-gradient(180deg, var(--color-surface-panel), var(--color-surface-panel-soft));
+  --gradient-login-page:
+    radial-gradient(circle at 16% 20%, var(--color-login-tint-1) 0%, transparent 45%),
+    radial-gradient(circle at 85% 80%, var(--color-login-tint-2) 0%, transparent 45%),
+    var(--color-bg);
+}
+
+/* ---------- 深色模式 ----------
+   JS 统一驱动（localStorage + prefers-color-scheme）切换 html.theme-dark。
+   主色 accent/danger/warning 保持浅色值——它们的对比度是为白字设计的，
+   深色下按钮文字对比度不变。成功绿改为鼠尾草，深色单独提亮以保证字色对比。
+   这里覆盖的是背景/文字/描边/徽章/阴影家族。 */
+:root.theme-dark {
+  color-scheme: dark;
+
+  /* bg */
+  --color-bg: #0f1115;
+  --color-bg-table-head: #1a1e25;
+  --color-bg-muted: #1a1e25;
+
+  /* surface */
+  --color-surface: #171a20;
+  --color-surface-soft: rgba(23, 26, 32, 0.82);
+  --color-surface-hover: rgba(30, 34, 42, 0.96);
+  --color-surface-panel: rgba(23, 26, 32, 0.95);
+  --color-surface-panel-soft: rgba(23, 26, 32, 0.86);
+  --color-surface-muted: #1c2129;
+  --color-surface-accent: #1a2433;
+  --color-surface-button-active: rgba(26, 30, 38, 0.98);
+  --color-surface-accent-soft: rgba(64, 145, 255, 0.14);
+  --color-surface-row-hover: rgba(30, 34, 42, 0.72);
+
+  /* text */
+  --color-text: #e4e6eb;
+  --color-text-strong: #f2f4f8;
+  --color-text-subtle: #b8bec9;
+  --color-text-muted: #9aa3b2;
+  --color-muted-soft: rgba(154, 163, 178, 0.16);
+  --color-text-faint: #8a93a3;
+  --color-link: #5aa9f0;
+
+  /* line */
+  --color-line: rgba(255, 255, 255, 0.1);
+  --color-line-strong: rgba(255, 255, 255, 0.16);
+  --color-line-soft: rgba(255, 255, 255, 0.06);
+  --color-line-success: rgba(106, 155, 120, 0.4);
+  --color-line-danger: rgba(248, 113, 113, 0.4);
+
+  /* accent soft（主色值保持，soft 背景深色化） */
+  --color-accent-soft: rgba(64, 145, 255, 0.16);
+  /* 强调色文字：深底上 #1668e0 对比不足（3.4:1），提亮到 #5a9bf5（6.2:1） */
+  --color-accent-text: #5a9bf5;
+  --color-success: #6a9b78;
+  --color-success-strong: #82b08e;
+  --color-success-soft: rgba(106, 155, 120, 0.18);
+  --color-warning-soft: rgba(241, 165, 60, 0.16);
+  --color-danger-soft: rgba(248, 113, 113, 0.16);
+  --color-danger: #f87171;
+  --color-danger-strong: #fca5a5;
+
+  /* 平台角标随 accent-text（深色已提亮） */
+  --color-brand-xueqiu: var(--color-accent-text);
+  --color-brand-weibo: var(--color-accent-text);
+  --color-brand-twitter: var(--color-accent-text);
+  --color-brand-zsxq: var(--color-accent-text);
+  --color-brand-truth: var(--color-accent-text);
+  --color-brand-telegram: #4aa8e8;
+  --color-brand-feishu: #5b8cff;
+  --color-brand-wecom: #35c26e;
+
+  /* 数据色 */
+  --color-data-positive: #ff8b93;
+  --color-data-negative: #57c78a;
+
+  /* badge */
+  --color-badge-idle-bg: #232730;
+  --color-badge-idle-text: #aeb6c4;
+
+  /* 登录页点缀色与材质 */
+  --color-login-tint-1: rgba(22, 104, 224, 0.16);
+  --color-login-tint-2: rgba(30, 41, 59, 0.45);
+  --color-login-grid: rgba(255, 255, 255, 0.035);
+  --shadow-login-card:
+    0 28px 56px -12px rgba(0, 0, 0, 0.65),
+    0 6px 20px -4px rgba(0, 0, 0, 0.4),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
+
+  /* shadow：深底上加深让卡片浮起 */
+  --shadow-xs: 0 2px 10px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 22px 56px rgba(0, 0, 0, 0.6);
+  --shadow-focus-ring: 0 0 0 3px rgba(64, 145, 255, 0.25);
+  --shadow-panel-elevated: 0 12px 30px rgba(0, 0, 0, 0.5);
+
+  --outline-focus: 2px solid rgba(64, 145, 255, 0.4);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+}

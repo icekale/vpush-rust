@@ -18,7 +18,7 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY --from=builder /build/target/release/vpush /app/vpush
-COPY static /app/static
+COPY static-assets /app/static
 RUN mkdir -p /app/data && chown -R vpush:vpush /app
 
 USER vpush

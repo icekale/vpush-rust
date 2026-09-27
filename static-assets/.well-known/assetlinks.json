@@ -1,0 +1,10 @@
+[{
+  "relation": ["delegate_permission/common.handle_all_urls"],
+  "target": {
+    "namespace": "android_app",
+    "package_name": "net.vpush.twa",
+    "sha256_cert_fingerprints": [
+      "4E:5F:21:C1:7E:64:81:73:E3:5E:E9:0D:56:6A:8B:E2:D0:F4:E5:12:46:65:34:B2:0B:62:4A:9A:05:E7:9E:6F"
+    ]
+  }
+}]

@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#f5f5f7">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="VPush">
+  <title>VPush</title>
+  <link id="manifest" rel="manifest" href="/manifest.webmanifest?v=3">
+  <link rel="apple-touch-icon" href="/icon-192.png">
+  <link rel="apple-touch-icon" href="/icon-192.png" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-icon" href="/icon-192-dark.png" media="(prefers-color-scheme: dark)">
+  <link rel="apple-touch-startup-image" href="/splash-ios.png">
+  <link rel="apple-touch-startup-image" href="/splash-ios.png" media="(prefers-color-scheme: light)">
+  <link rel="apple-touch-startup-image" href="/splash-ios-dark.png" media="(prefers-color-scheme: dark)">
+  <link rel="icon" type="image/svg+xml" href="/logo-mark.svg" media="(prefers-color-scheme: light)">
+  <link rel="icon" type="image/svg+xml" href="/logo-mark-dark.svg" media="(prefers-color-scheme: dark)">
+  <link id="favicon" rel="icon" type="image/svg+xml" href="/logo-mark.svg">
+  <script>
+    /* 首屏前同步主题与状态栏：安卓 PWA 独立窗口取启动时的 meta/manifest */
+    (function () {
+      try {
+        var m = localStorage.getItem("theme") || "auto";
+        var dark = m === "dark" || (m === "auto" && window.matchMedia("(prefers-color-scheme: dark)").matches);
+        if (dark) document.documentElement.classList.add("theme-dark");
+        if (localStorage.getItem("sidebar-slim") === "1") document.documentElement.classList.add("sidebar-slim");
+        var themeColor = document.querySelector('meta[name="theme-color"]');
+        if (themeColor) themeColor.content = dark ? "#0f1115" : "#f5f5f7";
+        var statusBar = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]');
+        if (statusBar) statusBar.content = dark ? "black-translucent" : "default";
+        // 安卓部分机型独立窗口只认 manifest 静态 theme_color（无视运行时 meta）：
+        // 深色时整体换成深色 manifest，状态栏/启动色才跟得上
+        var manifestLink = document.getElementById("manifest");
+        if (manifestLink) manifestLink.href = dark ? "/manifest-dark.webmanifest?v=3" : "/manifest.webmanifest?v=3";
+        var fav = document.getElementById("favicon");
+        if (fav) fav.setAttribute("href", dark ? "/logo-mark-dark.svg" : "/logo-mark.svg");
+      } catch (e) { /* localStorage 不可用时静默 */ }
+    })();
+  </script>
+  <!-- asset-importmap:start -->
+  <script type="importmap">{"imports":{"/core/dialog.js":"/core/dialog.b2db015b3a5e.js","/core/html.js":"/core/html.817ab2339b89.js","/core/icons.js":"/core/icons.7fb4f43f1230.js","/core/lightbox.js":"/core/lightbox.63db409ddbd8.js","/core/platforms.js":"/core/platforms.e3f9b30aa971.js","/views/admin/cicc.js":"/views/admin/cicc.0cd7529b8514.js","/views/admin/codes.js":"/views/admin/codes.2b9b97a7ba6e.js","/views/admin/dashboard.js":"/views/admin/dashboard.7985406ff5a8.js","/views/admin/ima-collector.js":"/views/admin/ima-collector.f5df4416f5ed.js","/views/admin/infra.js":"/views/admin/infra.e13cdf4ab5b3.js","/views/admin/knowledge.js":"/views/admin/knowledge.42883ccab396.js","/views/admin/kol.js":"/views/admin/kol.9fb9705ffce4.js","/views/admin/news.js":"/views/admin/news.269a9edcf5f0.js","/views/admin/users.js":"/views/admin/users.171b6837216e.js","/views/feishu-personal.js":"/views/feishu-personal.d74ec140be8a.js","/views/ima.js":"/views/ima.4ee73e107acf.js","/views/market.js":"/views/market.0a97a470169d.js","/views/news.js":"/views/news.5c106892e6a3.js","/views/post-card-export.js":"/views/post-card-export.27dbd2f5c5fa.js","/views/push-settings.js":"/views/push-settings.43f099553f09.js"}}</script>
+  <!-- asset-importmap:end -->
+  <link rel="stylesheet" href="/vendor/design-tokens.965639a4e5c3.css">
+  <link rel="stylesheet" href="/style.3f71545cd2f8.css">
+</head>
+<body>
+  <!-- 登录 / 注册 -->
+  <div id="auth-view" class="auth-view hidden">
+    <div class="auth-topbar">
+      <button type="button" class="theme-toggle-btn auth-theme-toggle" onclick="cycleTheme()" aria-label="切换主题" title="切换主题"></button>
+    </div>
+    <main class="login-shell">
+      <div class="login-brand">
+        <div class="login-brand-header">
+          <img id="login-logo" class="login-logo" src="/logo-mark.svg" alt="VPush">
+          <h1 class="login-brand-title">VPush</h1>
+          <p class="login-brand-desc">多源动态监控 · 私有即时推送</p>
+        </div>
+        <ul class="login-features">
+          <li class="login-feature">
+            <div class="login-feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13"/><path d="M3 6h.01M3 12h.01M3 18h.01"/></svg>
+            </div>
+            <div class="login-feature-content">
+              <div class="login-feature-header">
+                <span class="login-feature-name">多源动态聚合</span>
+                <span class="status-pulse-dot" title="活跃监控中" aria-label="活跃监控中"></span>
+              </div>
+              <span class="login-feature-meta">聚合雪球 / 微博 / X 大V动态</span>
+            </div>
+          </li>
+          <li class="login-feature">
+            <div class="login-feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4z"/></svg>
+            </div>
+            <div class="login-feature-content">
+              <div class="login-feature-header">
+                <span class="login-feature-name">全渠道即时分发</span>
+                <span class="status-pulse-dot" title="实时推送" aria-label="实时推送"></span>
+              </div>
+              <span class="login-feature-meta">新帖推到 Telegram / 飞书 / Bark / 浏览器</span>
+            </div>
+          </li>
+          <li class="login-feature">
+            <div class="login-feature-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+            </div>
+            <div class="login-feature-content">
+              <div class="login-feature-header">
+                <span class="login-feature-name">自托管私有自治</span>
+                <span class="status-pulse-dot" title="私有安全" aria-label="私有安全"></span>
+              </div>
+              <span class="login-feature-meta">自托管部署，订阅数据完全私有</span>
+            </div>
+          </li>
+        </ul>
+      </div>
+      <section class="login-card">
+        <div class="login-card-body">
+          <div class="auth-switch" role="tablist" aria-label="登录或注册">
+            <button type="button" class="switch-btn active" id="tab-auth-login" data-mode="login" role="tab" aria-selected="true" aria-controls="login-form">登录</button>
+            <button type="button" class="switch-btn" id="tab-auth-register" data-mode="register" role="tab" aria-selected="false" aria-controls="register-form">注册</button>
+          </div>
+          <form id="login-form" class="login-form" role="tabpanel" aria-labelledby="tab-auth-login">
+            <h2 class="login-title">欢迎回来</h2>
+            <p class="login-subtitle">回到你的订阅流，继续接收大V动态。</p>
+            <label class="field-label" for="login-username">用户名</label>
+            <input id="login-username" class="form-control" placeholder="输入用户名" autocomplete="username" required>
+            <label class="field-label" for="login-password">密码</label>
+            <div class="pw-field">
+              <input id="login-password" class="form-control" type="password" placeholder="输入密码" autocomplete="current-password" required>
+              <button type="button" class="pw-toggle" aria-label="显示密码" onclick="togglePassword('login-password', this)">
+                <svg class="pw-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                <svg class="pw-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="m1 1 22 22"/></svg>
+              </button>
+            </div>
+            <div id="login-turnstile" class="cf-turnstile"></div>
+            <p id="auth-error" class="form-error" role="alert"></p>
+            <button type="submit" class="btn-normal btn-fluid">登 录</button>
+          </form>
+          <form id="register-form" class="login-form hidden" role="tabpanel" aria-labelledby="tab-auth-register" hidden>
+            <h2 class="login-title">创建账号</h2>
+            <p class="login-subtitle">注册后即可自选大V，开启订阅推送。</p>
+            <label class="field-label" for="reg-username">用户名</label>
+            <input id="reg-username" class="form-control" placeholder="6-30 位，字母或中文开头" autocomplete="username" maxlength="30" required>
+            <label class="field-label" for="reg-password">密码</label>
+            <div class="pw-field">
+              <input id="reg-password" class="form-control" type="password" placeholder="至少 10 位字符" autocomplete="new-password" required>
+              <button type="button" class="pw-toggle" aria-label="显示密码" onclick="togglePassword('reg-password', this)">
+                <svg class="pw-eye" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+                <svg class="pw-eye-off" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19M14.12 14.12a3 3 0 1 1-4.24-4.24"/><path d="m1 1 22 22"/></svg>
+              </button>
+            </div>
+            <label class="field-label" for="reg-code">邀请码</label>
+            <input id="reg-code" class="form-control" placeholder="向管理员索取注册邀请码" required>
+            <div id="register-turnstile" class="cf-turnstile"></div>
+            <p id="reg-error" class="form-error" role="alert"></p>
+            <button type="submit" class="btn-normal btn-fluid">创建账号</button>
+          </form>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <!-- 主应用 -->
+  <div id="app-view" class="app-view hidden">
+    <a class="skip-link" href="#main">跳到主要内容</a>
+    <aside class="sidebar">
+      <div class="sidebar-brand">
+        <button type="button" class="sidebar-brand-toggle" id="sidebar-toggle" aria-label="收起侧栏" aria-expanded="true" title="收起侧栏" onclick="toggleSidebarSlim()">
+          <img class="sidebar-logo" id="sidebar-logo" src="/logo-mark.svg" alt="">
+        </button>
+        <div class="sidebar-brand-text">
+          <span class="sidebar-brand-name">VPush</span>
+        </div>
+      </div>
+      <nav id="sidebar-nav" class="sidebar-nav"></nav>
+      <div class="sidebar-foot">
+        <div id="sidebar-user" class="sidebar-user"></div>
+      </div>
+    </aside>
+    <div class="main-col">
+      <header class="topbar">
+        <div class="topbar-title">
+          <button id="btn-back" class="icon-btn hidden" aria-label="返回上一页"></button>
+          <img class="topbar-logo" src="/logo-mark.svg" alt="VPush">
+          <h1 id="page-title">订阅广场</h1>
+        </div>
+        <div id="topbar-user" class="topbar-user"></div>
+      </header>
+      <main id="main" class="page-main"></main>
+    </div>
+    <nav id="bottom-nav" class="bottom-nav"></nav>
+  </div>
+  <script type="module" src="/app.c08d56fbfb7f.js"></script>
+</body>
+</html>

@@ -24,13 +24,15 @@
 
 ### Task 2: Safe offline legacy-secret conversion
 
-**Files:** Create `tools/migrate_telegram_secrets.py`; test `tools/test_migrate_telegram_secrets.py` using a temporary SQLite DB and ephemeral Fernet key. Do not use live credentials in tests.
+**Files:** Create `tools/migrate_telegram_secrets.py`; test `tools/test_migrate_telegram_secrets.py` using a temporary SQLite DB and ephemeral Fernet/AES keys. Do not use live credentials in tests.
 
-- [ ] Write a failing test inserting one Fernet-wrapped `enc1:` token and one bare legacy token, then verify dry-run counts, AES-GCM round-trip, and second-run idempotency. Wrong key must leave the DB byte-for-byte unchanged.
-- [ ] Run `python3 -m unittest tools/test_migrate_telegram_secrets.py -v`; expect failure.
-- [ ] Implement CLI requiring an explicit path to an **offline copy** and credential key via protected file descriptor or environment (never positional arguments). Preflight every `enc1:` token with `Fernet(key).decrypt`, calculate all replacements in memory, then execute one `BEGIN IMMEDIATE` transaction. Produce `enc2:` + `base64.urlsafe_b64encode(nonce + AESGCM(decoded_key).encrypt(nonce, value.encode(), None)).decode()`; 12 random nonce bytes. Keep existing `enc2:` and empty values. Never print token/key/ciphertext, only row counts and pass/fail.
+- [x] Write focused tests inserting Fernet-wrapped `enc1:` tokens, valid bare legacy tokens and valid `enc2:` tokens, then verify dry-run counts, Rust-compatible AES-GCM round-trip, second-copy idempotency, invalid token rejection, key mismatch behavior, output cleanup and unchanged input bytes. Include a committed WAL row.
+- [x] Run `python3 -m unittest tools/test_migrate_telegram_secrets.py -v`; expect failure before implementation.
+- [x] Implement CLI with required `input` and apply-only required new `output` paths. Open input through SQLite URI `mode=ro`; reject same/existing output and reserve a new output exclusively. Use `Connection.backup` so committed WAL pages are included, then `BEGIN IMMEDIATE` on the output before selecting rows. Preflight every `enc1:` and existing `enc2:` value, validate decrypted tokens against Rust `telegram_token_ok`, calculate replacements in memory, update only inside the transaction, and run `PRAGMA quick_check`. Remove only this invocation's partial output and sidecars on failure; finish successful output in `journal_mode=DELETE`. Dry-run accepts input alone and never creates output.
+- [x] Require canonical padded URL-safe base64 for the AES key. Existing `enc2:` values verify the supplied key; when none exist, the tool cannot prove the key matches the ARM runtime, so staging verification with the same runtime key is required and documented.
+- [x] Keep secrets and token data out of output; report only counts and pass/fail.
 - [ ] Compare counts and SQLite `PRAGMA quick_check` on a separately backed-up ARM copy before considering production. Original DMIT DB is never overwritten; live ARM DB is never replaced by the DMIT snapshot.
-- [ ] Run test, `git diff --check`, commit.
+- [x] Run focused tests, `py_compile`, and `git diff --check`; commit.
 
 ### Task 3: Telegram API transport and routing
 

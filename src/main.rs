@@ -13,6 +13,7 @@ mod feishu_ws;
 mod ima_admin;
 mod ima_client;
 mod ima_collector;
+mod ima_storage;
 mod img_proxy;
 mod imgbed;
 mod llm;
@@ -511,6 +512,22 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/ima-collector",
             get(ima_collector_status).put(save_ima_collector),
+        )
+        .route("/api/admin/ima-storage/health", get(ima_storage_health))
+        .route(
+            "/api/admin/ima-storage/consistency",
+            get(ima_storage_consistency),
+        )
+        .route(
+            "/api/admin/ima-storage/consistency/run",
+            post(ima_storage_consistency_run),
+        )
+        .route("/api/admin/ima-storage/dedup", post(ima_storage_dedup))
+        .route("/api/admin/ima-storage/refresh", post(ima_storage_refresh))
+        .route("/api/admin/ima-storage/backup", post(ima_storage_backup))
+        .route(
+            "/api/admin/ima-storage/alerts",
+            get(ima_storage_alerts).put(save_ima_storage_alerts),
         )
         .route(
             "/api/admin/ima-collector/discover",
@@ -1706,6 +1723,131 @@ async fn system_logs(
     )
     .map_err(|detail| ApiError::new(StatusCode::BAD_REQUEST, detail))?;
     Ok(Json(json!({"lines": lines})))
+}
+
+fn ima_storage_err(err: ima_storage::StorageError) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        err.detail,
+    )
+}
+
+async fn ima_storage_health(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let root = ima_storage::archive_root().map_err(ima_storage_err)?;
+    Ok(Json(
+        ima_storage::health(&state.db, &root)
+            .await
+            .map_err(ima_storage_err)?,
+    ))
+}
+
+async fn ima_storage_consistency(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    let root = ima_storage::archive_root().map_err(ima_storage_err)?;
+    Ok(Json(
+        ima_storage::consistency(&state.db, &root)
+            .await
+            .map_err(ima_storage_err)?,
+    ))
+}
+
+async fn ima_storage_consistency_run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let root = ima_storage::archive_root().map_err(ima_storage_err)?;
+    let result = ima_storage::run_consistency(&state.db, &root)
+        .await
+        .map_err(ima_storage_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "ima_consistency_run", "", "")
+        .await;
+    Ok(Json(result))
+}
+
+async fn ima_storage_dedup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let root = ima_storage::archive_root().map_err(ima_storage_err)?;
+    let result = ima_storage::dedup(&state.db, &root)
+        .await
+        .map_err(ima_storage_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "ima_storage_dedup", "", "")
+        .await;
+    Ok(Json(result))
+}
+
+async fn ima_storage_refresh(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let root = ima_storage::archive_root().map_err(ima_storage_err)?;
+    let result = ima_storage::refresh(&state.db, &root)
+        .await
+        .map_err(ima_storage_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "ima_storage_refresh", "", "requested")
+        .await;
+    Ok(Json(result))
+}
+
+async fn ima_storage_backup(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let root = ima_storage::archive_root().map_err(ima_storage_err)?;
+    let result = ima_storage::backup(&state.db, &root)
+        .await
+        .map_err(ima_storage_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "ima_storage_backup", "", "requested")
+        .await;
+    Ok(Json(result))
+}
+
+async fn ima_storage_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        ima_storage::alert_settings(&state.db)
+            .await
+            .map_err(ima_storage_err)?,
+    ))
+}
+
+async fn save_ima_storage_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let result = ima_storage::save_alert_settings(&state.db, &body)
+        .await
+        .map_err(ima_storage_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "ima_storage_alerts", "", &result.to_string())
+        .await;
+    Ok(Json(result))
 }
 
 async fn polling_config(

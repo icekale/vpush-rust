@@ -2570,6 +2570,7 @@ dependencies = [
  "hex",
  "hkdf",
  "hmac",
+ "libc",
  "md-5",
  "num-bigint",
  "p256",

@@ -16,7 +16,7 @@
 - Create: `src/ima_storage.rs`
 - Modify: `src/main.rs:1-40`
 
-- [ ] **Step 1: Write failing unit tests**
+- [x] **Step 1: Write failing unit tests**
 
 Add tests in `src/ima_storage.rs` for:
 
@@ -30,7 +30,7 @@ async fn consistency_reports_missing_and_orphan_files() {}
 
 The first test must create a root, a regular child, and a symlink to a file outside the root; the symlink must be rejected. The second must create one referenced file, omit one referenced file, and create one unreferenced file; the report must contain each category.
 
-- [ ] **Step 2: Run the focused tests and confirm failure**
+- [x] **Step 2: Run the focused tests and confirm failure**
 
 Run:
 
@@ -41,7 +41,7 @@ cargo test ima_storage::tests::consistency_reports_missing_and_orphan_files -- -
 
 Expected: compile failure because `ima_storage` and its helpers do not exist.
 
-- [ ] **Step 3: Implement the module skeleton**
+- [x] **Step 3: Implement the module skeleton**
 
 Add `mod ima_storage;` and implement:
 
@@ -57,7 +57,7 @@ pub fn safe_child(root: &Path, relative: &str) -> Result<PathBuf, StorageError>;
 
 `safe_child` must reject absolute paths, `..`, symlink components, and paths that do not remain under `root`. `health` must report `available`, `readable`, `writable`, byte capacity, and regular-file count without following symlink directories.
 
-- [ ] **Step 4: Run the focused tests and commit**
+- [x] **Step 4: Run the focused tests and commit**
 
 Run the two focused tests; expected PASS. Then:
 
@@ -76,7 +76,7 @@ cargo test ima_storage::tests
 - Modify: `src/ima_storage.rs`
 - Modify: `src/db.rs` only if a small query helper is required
 
-- [ ] **Step 1: Add failing tests**
+- [x] **Step 1: Add failing tests**
 
 Test that:
 
@@ -88,11 +88,11 @@ assert_eq!(dedup["removed"], json!(1));
 
 Create duplicate content under two unreferenced paths and assert that referenced files and symlinks remain untouched.
 
-- [ ] **Step 2: Implement reference collection**
+- [x] **Step 2: Implement reference collection**
 
 Read referenced relative paths from `ima_document_index.pdf_path`, `ima_document_index.txt_path`, and `feishu_document_sources.timeline_path`/`asset_root`. Normalize to archive-relative paths and ignore empty values. Scan only regular files beneath the archive, excluding symlinks and known request/report metadata files.
 
-- [ ] **Step 3: Implement persistence and deduplication**
+- [x] **Step 3: Implement persistence and deduplication**
 
 Implement:
 
@@ -104,7 +104,7 @@ pub async fn dedup(db: &Db, root: &Path) -> Result<Value, StorageError>;
 
 Persist the report under `REPORT_KEY`. Dedup by SHA-256; retain the lexicographically first unreferenced file per digest and delete later unreferenced regular files only after rechecking the root boundary.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run:
 
@@ -128,7 +128,7 @@ git commit -m "实现 IMA 归档一致性和安全去重"
 - Modify: `src/ima_storage.rs`
 - Modify: `src/main.rs` route handlers
 
-- [ ] **Step 1: Add failing tests**
+- [x] **Step 1: Add failing tests**
 
 Cover:
 
@@ -138,7 +138,7 @@ assert_eq!(refresh_status["status"], "requested");
 assert_eq!(backup_status.unwrap_err().status, 503);
 ```
 
-- [ ] **Step 2: Implement state operations**
+- [x] **Step 2: Implement state operations**
 
 Implement:
 
@@ -151,7 +151,7 @@ pub async fn save_alert_settings(db: &Db, body: &Value) -> Result<Value, Storage
 
 `refresh` writes a timestamped local request marker only if the archive is available and returns `status: requested`. `backup` returns a 503 `StorageUnavailable` error until an existing local backup target is configured; it must not claim `started`. Alert settings accept only bounded numeric thresholds and booleans, reject unknown/invalid values, and persist JSON through `Db::set_setting`.
 
-- [ ] **Step 3: Add admin routes**
+- [x] **Step 3: Add admin routes**
 
 Add to `src/main.rs`:
 
@@ -167,7 +167,7 @@ Add to `src/main.rs`:
 
 Every handler must call `require_admin`, map `StorageUnavailable` to 503, map invalid input to 400, and write an admin log for mutating actions.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit**
 
 Run:
 
@@ -193,7 +193,7 @@ git add src/main.rs src/ima_storage.rs
 - Modify: `tools/route_inventory.py` only if parser coverage is incomplete
 - Modify: `docs/superpowers/plans/2026-09-27-vpush-rust-cutover-plan.md`
 
-- [ ] **Step 1: Run route inventory**
+- [x] **Step 1: Run route inventory**
 
 ```bash
 python3 tools/route_inventory.py --python /tmp/vpush-production-api.py --rust src/main.rs --output /tmp/route-inventory-final.md
@@ -201,7 +201,7 @@ python3 tools/route_inventory.py --python /tmp/vpush-production-api.py --rust sr
 
 Expected: `Python-only: 0` for the route set currently present in the production source.
 
-- [ ] **Step 2: Run all quality gates**
+- [x] **Step 2: Run all quality gates**
 
 ```bash
 cargo fmt --all --check
@@ -210,11 +210,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 git diff --check
 ```
 
-- [ ] **Step 3: Audit changed behavior**
+- [x] **Step 3: Audit changed behavior**
 
 Confirm that no test or implementation writes SSH config, firewall rules, OCI security lists, production database paths, or deployment credentials. Confirm dedup tests prove referenced files survive.
 
-- [ ] **Step 4: Mark the plan and commit**
+- [x] **Step 4: Mark the plan and commit**
 
 Mark completed checkboxes in this plan and the cutover plan. Commit:
 

@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
 use axum::extract::{
     ConnectInfo, DefaultBodyLimit, Extension, Multipart, Path as UrlPath, Query, State,
 };
@@ -2657,6 +2657,8 @@ async fn feishu_document(
 struct ImaFileQuery {
     group: Option<String>,
     download: Option<i64>,
+    // ponytail: query token matches Python file downloads; a one-time ticket if referrer leaks matter
+    token: Option<String>,
 }
 
 fn archive_root() -> PathBuf {
@@ -2692,6 +2694,7 @@ async fn ima_pdf(
         q.group.unwrap_or_default(),
         "pdf",
         q.download.unwrap_or(0) == 1,
+        q.token.as_deref(),
     )
     .await
 }
@@ -2709,6 +2712,7 @@ async fn ima_text(
         q.group.unwrap_or_default(),
         "txt",
         false,
+        q.token.as_deref(),
     )
     .await
 }
@@ -2720,8 +2724,9 @@ async fn serve_ima_file(
     group: String,
     kind: &str,
     download: bool,
+    query_token: Option<&str>,
 ) -> Result<Response, ApiError> {
-    let user = require_user(state, headers).await?;
+    let user = require_download_user(state, headers, query_token).await?;
     if group.len() > 128 || media_id.len() > 128 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "参数过长"));
     }
@@ -2745,7 +2750,7 @@ async fn serve_ima_file(
         }
         Err(msg) => return Err(ApiError::new(StatusCode::NOT_FOUND, msg)),
     };
-    let bytes = std::fs::read(&path).map_err(|_| {
+    let file = tokio::fs::File::open(&path).await.map_err(|_| {
         ApiError::new(
             StatusCode::NOT_FOUND,
             if kind == "pdf" {
@@ -2766,9 +2771,47 @@ async fn serve_ima_file(
             header::CONTENT_DISPOSITION,
             content_disposition(download, &name),
         )
-        .body(Body::from(bytes))
+        .body(file_body(file))
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "读取文档失败"))
 }
+
+fn file_body(file: tokio::fs::File) -> Body {
+    let stream = futures_util::stream::unfold(file, |mut file| async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        match tokio::io::AsyncReadExt::read(&mut file, &mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok::<_, std::io::Error>(Bytes::from(buf)), file))
+            }
+            Err(err) => Some((Err(err), file)),
+        }
+    });
+    Body::from_stream(stream)
+}
+
+fn download_token(headers: &HeaderMap, query_token: Option<&str>) -> String {
+    let header_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if !header_token.is_empty() {
+        return header_token.to_string();
+    }
+    if let Some(token) = query_token.filter(|token| !token.is_empty()) {
+        return token.to_string();
+    }
+    headers
+        .get(header::COOKIE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .split(';')
+        .find_map(|part| part.trim().strip_prefix("vpush_file="))
+        .unwrap_or("")
+        .to_string()
+}
+
 
 async fn feishu_asset(
     State(state): State<AppState>,
@@ -5883,12 +5926,7 @@ async fn require_download_user(
     headers: &HeaderMap,
     query_token: Option<&str>,
 ) -> Result<User, ApiError> {
-    let header_token = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "));
-    let token = header_token.or(query_token).unwrap_or("");
-    user_from_token(state, token).await
+    user_from_token(state, &download_token(headers, query_token)).await
 }
 
 async fn require_user(state: &AppState, headers: &HeaderMap) -> Result<User, ApiError> {
@@ -6441,6 +6479,29 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn download_token_prefers_header_then_query_then_cookie() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(download_token(&headers, Some("query")), "query");
+        headers.insert(header::COOKIE, "vpush_file=cookie; other=1".parse().unwrap());
+        assert_eq!(download_token(&headers, None), "cookie");
+        headers.insert(header::AUTHORIZATION, "Bearer header".parse().unwrap());
+        assert_eq!(download_token(&headers, Some("query")), "header");
+    }
+
+    #[tokio::test]
+    async fn pdf_stream_sends_file_bytes() {
+        let dir = std::env::temp_dir().join(format!("vpush-pdf-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.pdf");
+        std::fs::write(&path, b"%PDF-1.4 hello").unwrap();
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let bytes = to_bytes(file_body(file), 1024).await.unwrap();
+        assert_eq!(&bytes[..], b"%PDF-1.4 hello");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn login_me_and_shell() {

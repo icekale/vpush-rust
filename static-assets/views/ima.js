@@ -161,7 +161,10 @@ export function createImaView(dependencies) {
     if ($("#ima-reader-page")) return;
     $("#main").innerHTML = `
       <section class="section-panel ima-reader-page" id="ima-reader-page">
-        <div id="kb-reader"><div class="admin-skeleton" aria-hidden="true"></div></div>
+        <div id="kb-reader">
+          <button type="button" class="ima-reader-back" onclick="history.back()" aria-label="返回">返回</button>
+          <div class="admin-skeleton" aria-hidden="true"></div>
+        </div>
       </section>`;
   }
 
@@ -1432,8 +1435,8 @@ export function createImaView(dependencies) {
         : "";
       // 快照路由校验（与 currentImaListSnapshot 同思路）：与本次应返回的列表路由不匹配的旧快照不用于导航/计数
       const listSnapshot = _imaListSnapshot && _imaListSnapshot.route === normalizeRoute(backRoute) ? _imaListSnapshot : null;
-      const standalonePwa = isStandalonePwa();
-      const openLabel = standalonePwa ? "打开 PDF" : "新标签打开 PDF";
+      const embedPdf = imaPdfEmbeds();
+      const openLabel = embedPdf ? "新标签打开 PDF" : "打开 PDF";
       const openNewTab = isFeishuTimeline
         ? `<a class="icon-btn" data-feishu-canonical="1" href="${escapeHtml(item.source_url || "")}" ${item.source_url ? "" : "hidden"} target="_blank" rel="noopener" aria-label="打开飞书原文" title="打开飞书原文">${EXTERNAL_LINK_ICON}</a>`
         : item.has_pdf
@@ -1442,9 +1445,9 @@ export function createImaView(dependencies) {
       const documentPanel = isFeishuTimeline
         ? `<div id="ima-document-panel" class="feishu-timeline-panel" aria-busy="true"><p class="ima-reader-status" role="status">正在载入时间线…</p></div>`
         : item.has_pdf
-          ? `<div id="ima-pdf-panel" class="ima-pdf-panel" aria-busy="true"><p class="ima-reader-status" role="status">正在打开预览…</p>${standalonePwa
-              ? `<button id="ima-pdf-pwa-open" type="button" class="btn-normal" onclick="openImaPdfNewTab()" hidden>打开 PDF</button>`
-              : `<iframe id="ima-pdf-frame" title="PDF 预览" hidden style="position:absolute;inset:0;width:100%;height:100%;border:0"></iframe>`}</div>`
+          ? embedPdf
+            ? `<div id="ima-pdf-panel" class="ima-pdf-panel" aria-busy="true"><p class="ima-reader-status" role="status">正在打开预览…</p><iframe id="ima-pdf-frame" title="PDF 预览" hidden style="position:absolute;inset:0;width:100%;height:100%;border:0"></iframe></div>`
+            : `<div id="ima-pdf-panel" class="ima-pdf-panel"><button id="ima-pdf-pwa-open" type="button" class="btn-normal" onclick="openImaPdfNewTab()">打开 PDF</button></div>`
           : `<div class="ima-pdf-panel"><div class="ima-reader-empty" role="status"><p>还没有预览文件</p></div></div>`;
       const sizeLine = isFeishuTimeline ? "" : fmtDocSize(item.size);
       const sizeMeta = sizeLine ? `<span class="ima-reader-meta-item">${escapeHtml(sizeLine)}</span>` : "";
@@ -1483,7 +1486,7 @@ export function createImaView(dependencies) {
           ${imaReaderNavHtml(mediaId, item.group_id || documentGroup, listSnapshot)}
         </article>`;
       if (isFeishuTimeline) await loadFeishuTimeline(item, seq, readerSeq);
-      else if (item.has_pdf) loadImaPdf(mediaId, readerSeq);
+      else if (item.has_pdf && embedPdf) showImaPdfFrame(mediaId, seq, readerSeq);
       if (item.needs_translation) {
         try {
           const translated = await api(`/api/ima-documents/${encodeURIComponent(mediaId)}/translate${groupQuery}`, { method: "POST" });
@@ -1514,62 +1517,47 @@ export function createImaView(dependencies) {
     panel.innerHTML = `<div class="ima-reader-empty" role="status"><p>预览打不开</p></div>`;
   }
 
-  async function loadImaPdf(mediaId, readerSeq) {
-    const seq = currentRouteSeq();
+  function imaPdfEmbeds() {
+    return !isStandalonePwa() && !window.matchMedia("(max-width: 768px)").matches;
+  }
+
+  function armImaFileCookie() {
+    if (!state.token) return;
+    document.cookie = `vpush_file=${state.token}; Path=/api/ima-documents; Max-Age=3600; SameSite=Strict`;
+  }
+
+  function imaPdfStreamUrl(mediaId, download) {
+    armImaFileCookie();
     const group = imaReaderDocumentGroup();
-    const groupQuery = group ? `?group=${encodeURIComponent(group)}` : "";
-    if (_imaPdfAbort) _imaPdfAbort.abort();
-    const abort = new AbortController();
-    _imaPdfAbort = abort;
-    try {
-      const blob = await apiBlob(`/api/ima-documents/${encodeURIComponent(mediaId)}/pdf${groupQuery}`, { signal: abort.signal });
-      if (abort.signal.aborted) return;
-      if (!routeStillActive(seq) || readerSeq !== currentImaReaderSeq()) return;
-      const head = blob.size ? await blob.slice(0, 5).text() : "";
-      if (abort.signal.aborted) return;
-      if (!routeStillActive(seq) || readerSeq !== currentImaReaderSeq()) return;
-      if (blob.size < 64 || head !== "%PDF-") {
-        showImaPdfFail(mediaId, seq, readerSeq);
-        return;
-      }
-      if (window._imaPdfUrl) URL.revokeObjectURL(window._imaPdfUrl);
-      window._imaPdfUrl = URL.createObjectURL(blob);
-      const frame = $("#ima-pdf-frame");
-      const panel = $("#ima-pdf-panel");
-      const pwaOpen = $("#ima-pdf-pwa-open");
-      if (panel && (frame || pwaOpen)) {
-        const status = panel.querySelector(".ima-reader-status");
-        if (status) status.remove();
-        panel.hidden = false;
-        panel.removeAttribute("aria-busy");
-        if (pwaOpen) {
-          pwaOpen.hidden = false;
-        } else if (frame) {
-          frame.src = `${window._imaPdfUrl}#view=FitH&zoom=page-width`;
-          frame.hidden = false;
-          frame.addEventListener("error", () => showImaPdfFail(mediaId, seq, readerSeq), { once: true });
-        }
-      }
-    } catch (err) {
-      if (err && err.name === "AbortError") return;
-      if (routeStillActive(seq) && readerSeq === currentImaReaderSeq()) {
-        const message = String(err.message || "");
-        if (message.includes("频繁") || message.includes("上限")) flash(message, "error");
-        showImaPdfFail(mediaId, seq, readerSeq);
-      }
-    }
+    const params = new URLSearchParams();
+    if (group) params.set("group", group);
+    if (download) params.set("download", "1");
+    return `/api/ima-documents/${encodeURIComponent(mediaId)}/pdf?${params}`;
+  }
+
+  function showImaPdfFrame(mediaId, seq, readerSeq) {
+    if (!routeStillActive(seq) || readerSeq !== currentImaReaderSeq()) return;
+    const frame = $("#ima-pdf-frame");
+    const panel = $("#ima-pdf-panel");
+    if (!frame || !panel) return;
+    const status = panel.querySelector(".ima-reader-status");
+    if (status) status.remove();
+    panel.hidden = false;
+    panel.removeAttribute("aria-busy");
+    frame.src = imaPdfStreamUrl(mediaId, false);
+    frame.hidden = false;
+    frame.addEventListener("error", () => showImaPdfFail(mediaId, seq, readerSeq), { once: true });
   }
 
   function openImaPdfNewTab() {
-    if (!window._imaPdfUrl) {
-      flash("PDF 还没加载好，稍后再试", "error");
+    const mediaId = knowledgeMediaIdFromPath();
+    if (!mediaId) return;
+    const url = imaPdfStreamUrl(mediaId, false);
+    if (!imaPdfEmbeds()) {
+      window.location.assign(url);
       return;
     }
-    if (isStandalonePwa()) {
-      window.location.assign(window._imaPdfUrl);
-      return;
-    }
-    window.open(window._imaPdfUrl, "_blank", "noopener");
+    window.open(url, "_blank", "noopener");
   }
 
   async function downloadImaPdf(mediaId) {
@@ -1688,7 +1676,6 @@ export function createImaView(dependencies) {
     imaReaderNavHtml,
     renderImaDocument,
     showImaPdfFail,
-    loadImaPdf,
     openImaPdfNewTab,
     downloadImaPdf,
   };

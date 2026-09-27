@@ -59,7 +59,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::{CatalogError, Db, FeedFilter, KolPatch, RegisterError, User};
 
-const APP_VERSION: &str = "1.12.276";
+const APP_VERSION: &str = "1.12.277";
 const LOGIN_MAX_FAILURES: usize = 8;
 const LOGIN_WINDOW_SECS: u64 = 300;
 const SPA: &[&str] = &[

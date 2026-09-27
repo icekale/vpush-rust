@@ -1,0 +1,626 @@
+//! 不访问外网就能完成的维护：新资讯源回填、未激活清理、过期数据、到点备份。
+
+use crate::db::Db;
+
+pub fn spawn(db: Db) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = run(&db).await {
+                tracing::warn!("维护任务失败: {err}");
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+async fn with_model(db: &Db, mut cfg: crate::llm::Config, key: &str) -> crate::llm::Config {
+    if let Ok(Some(model)) = db.setting(key).await {
+        if !model.trim().is_empty() {
+            cfg.model = model;
+        }
+    }
+    cfg
+}
+
+async fn admin_llm(db: &Db) -> Option<crate::llm::Config> {
+    use sqlx::Row;
+    let row = sqlx::query(
+        "SELECT llm_api_base, llm_api_key, llm_model, llm_api_format FROM users
+         WHERE is_admin = 1 AND llm_api_base != '' AND llm_api_key != '' ORDER BY id LIMIT 1",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .ok()??;
+    crate::llm::runtime(
+        None,
+        None,
+        row.get::<String, _>("llm_api_base").as_str(),
+        row.get::<String, _>("llm_api_key").as_str(),
+        None,
+        row.get::<String, _>("llm_model").as_str(),
+        None,
+        row.get::<String, _>("llm_api_format").as_str(),
+        true,
+    )
+    .ok()
+}
+
+enum Keep {
+    Alive,
+    Dead(String),
+    Transient,
+    Renewed(String),
+}
+
+async fn cookie_keepalive(db: &Db, now: i64) -> Result<(), sqlx::Error> {
+    let probe_db = db.clone();
+    cookie_keepalive_with(db, now, move |platform, cookie, uid| {
+        let probe_db = probe_db.clone();
+        let platform = platform.to_string();
+        let cookie = cookie.to_string();
+        let uid = uid.to_string();
+        async move {
+            match platform.as_str() {
+                "xueqiu" => match crate::xueqiu::probe_keepalive(&cookie, &uid) {
+                    crate::xueqiu::Keepalive::Alive => Keep::Alive,
+                    crate::xueqiu::Keepalive::Dead(msg) => Keep::Dead(msg),
+                    crate::xueqiu::Keepalive::Transient => Keep::Transient,
+                },
+                "weibo" => match crate::weibo::probe_keepalive(&probe_db, &cookie, &uid).await {
+                    crate::weibo::Keepalive::Alive => Keep::Alive,
+                    crate::weibo::Keepalive::Dead(msg) => Keep::Dead(msg),
+                    crate::weibo::Keepalive::Transient => Keep::Transient,
+                    crate::weibo::Keepalive::Renewed(cookie) => Keep::Renewed(cookie),
+                },
+                _ => Keep::Transient,
+            }
+        }
+    })
+    .await
+}
+
+async fn cookie_keepalive_with<F, Fut>(db: &Db, now: i64, mut probe: F) -> Result<(), sqlx::Error>
+where
+    F: FnMut(&str, &str, &str) -> Fut,
+    Fut: std::future::Future<Output = Keep>,
+{
+    let interval = db.setting("config_cookie_keepalive_interval_seconds").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+    if interval <= 0 {
+        return Ok(());
+    }
+    let last = db.setting("cookie_keepalive_last_at").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+    if last > 0 && now.saturating_sub(last) < interval {
+        return Ok(());
+    }
+    db.set_setting("cookie_keepalive_last_at", &now.to_string()).await?;
+    for (platform, key) in [("xueqiu", "xueqiu_cookie"), ("weibo", "weibo_cookie")] {
+        let cookie = db.setting(key).await?.unwrap_or_default();
+        if cookie.trim().is_empty() {
+            continue;
+        }
+        let uid: Option<String> = sqlx::query_scalar("SELECT external_id FROM kols WHERE platform = ? AND enabled = 1 ORDER BY id LIMIT 1")
+            .bind(platform)
+            .fetch_optional(db.pool())
+            .await?;
+        let Some(uid) = uid.filter(|value| !value.trim().is_empty()) else { continue };
+        match probe(platform, cookie.trim(), uid.trim()).await {
+            Keep::Alive => {
+                db.set_setting(&format!("source_ok_{platform}"), &now.to_string()).await?;
+                db.set_setting(&format!("source_err_{platform}"), "").await?;
+                db.set_setting(&format!("{key}_updated_at"), &now.to_string()).await?;
+            }
+            Keep::Renewed(cookie) => {
+                db.save_cookie(key, &cookie).await?;
+                db.set_setting(&format!("source_ok_{platform}"), &now.to_string()).await?;
+                db.set_setting(&format!("source_err_{platform}"), "").await?;
+            }
+            Keep::Dead(detail) => {
+                let detail: String = detail.chars().take(300).collect();
+                db.set_setting(&format!("source_err_{platform}"), &detail).await?;
+                alert_cookie(db, now, platform, &detail).await?;
+            }
+            Keep::Transient => {}
+        }
+    }
+    Ok(())
+}
+
+async fn alert_cookie(db: &Db, now: i64, platform: &str, detail: &str) -> Result<(), sqlx::Error> {
+    let last = db.setting("cookie_keepalive_alert_at").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+    if last > 0 && now.saturating_sub(last) < 6 * 3600 {
+        return Ok(());
+    }
+    let label = if platform == "weibo" { "微博" } else { "雪球" };
+    let message = format!("⚠️ {label} cookie 保活失败：会话可能已过期或登录态被清除。请到后台更新 {label} Cookie。详情：{detail}");
+    db.set_setting("cookie_keepalive_alert_at", &now.to_string()).await?;
+    db.add_admin_log(0, "cookie_keepalive", platform, &message).await?;
+    tracing::warn!("{message}");
+    Ok(())
+}
+
+async fn stock_alias_if_due(db: &Db) {
+    let Ok(today): Result<String, _> = sqlx::query_scalar("SELECT date('now', '+8 hours')").fetch_one(db.pool()).await else {
+        return;
+    };
+    if db.setting("stock_alias_last_date").await.ok().flatten().as_deref() == Some(today.as_str()) {
+        return;
+    }
+    match crate::tags::maintain(db, "none").await {
+        Ok(_) => {}
+        Err(crate::db::CatalogError::Conflict(_)) => return,
+        Err(err) => {
+            tracing::warn!("标签维护失败: {err:?}");
+            return;
+        }
+    }
+    if let Some(cfg) = admin_llm(db).await {
+        let cfg = cfg.clone();
+        match crate::tags::discover(db, move |marks| {
+            let cfg = cfg.clone();
+            async move {
+                crate::llm::complete(&cfg, &format!("这些是帖子里的股票标记。返回 JSON 数组，每项含 name、official、is_alias。只输出 JSON。\n{marks}")).await
+            }
+        })
+        .await
+        {
+            Ok(added) if added > 0 => tracing::info!(added, "股票别名"),
+            Err(crate::db::CatalogError::Conflict(_)) => return,
+            Err(err) => tracing::warn!("股票别名识别失败: {err:?}"),
+            _ => {}
+        }
+    }
+    let _ = db.set_setting("stock_alias_last_date", &today).await;
+}
+
+pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
+    let added = db.backfill_new_news_sources().await?;
+    if added > 0 {
+        tracing::info!(added, "已为全部用户勾选新资讯源");
+    }
+    let removed = db.purge_inactive_if_due().await?;
+    if removed > 0 {
+        tracing::info!(removed, "清理未激活用户");
+    }
+    let (posts, news, logs, admin) = db.prune_retention_if_due().await?;
+    if posts + news + logs + admin > 0 {
+        tracing::info!(posts, news, logs, admin, "清理过期数据");
+    }
+    match db.health_alerts().await {
+        Ok(alerts) => {
+            for message in alerts {
+                tracing::warn!("{message}");
+            }
+        }
+        Err(err) => tracing::warn!("健康检查失败: {err}"),
+    }
+    match db.take_daily_reports().await {
+        Ok(reports) => {
+            for (user_id, text) in reports {
+                if let Err(err) = crate::push::send_user_text(db, user_id, &text).await {
+                    tracing::warn!(user_id, "每日精选发送失败: {err}");
+                }
+            }
+        }
+        Err(err) => tracing::warn!("每日精选失败: {err}"),
+    }
+    match db.pending_keyword_digests().await {
+        Ok(digests) => {
+            for digest in digests {
+                match crate::push::send_user_text(db, digest.user_id, &digest.text).await {
+                    Ok(()) => {
+                        if let Err(err) = db.mark_keyword_digest(&digest).await {
+                            tracing::warn!(user_id = digest.user_id, "关键词提醒已发出但未能标记: {err}");
+                        }
+                    }
+                    Err(err) => tracing::warn!(user_id = digest.user_id, "关键词提醒发送失败: {err}"),
+                }
+            }
+        }
+        Err(err) => tracing::warn!("关键词提醒失败: {err}"),
+    }
+    stock_alias_if_due(db).await;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    if let Err(err) = cookie_keepalive(db, now).await {
+        tracing::warn!("cookie 保活失败: {err}");
+    }
+    if let Some(cfg) = crate::imgbed::runtime(db).await {
+        match crate::imgbed::process_due(
+            db,
+            cfg.retention_days,
+            crate::imgbed::live_download,
+            |url, bytes, kind| crate::imgbed::live_upload(&cfg, url, bytes, kind),
+            |url| crate::imgbed::live_delete(&cfg, url),
+        )
+        .await
+        {
+            Ok(done) if done > 0 => tracing::info!(done, "图床镜像"),
+            Err(err) => tracing::warn!("图床镜像失败: {err}"),
+            _ => {}
+        }
+    }
+    if let Some(cfg) = admin_llm(db).await {
+        if db.setting("config_translate_twitter_content").await.ok().flatten().as_deref() == Some("1") {
+        match crate::truth::backfill(db, 3, |text| {
+            let cfg = cfg.clone();
+            async move { crate::llm::complete(&cfg, &format!("把下面内容翻译成简体中文，只输出译文：\n{text}")).await }
+        })
+        .await
+        {
+            Ok(done) if done > 0 => tracing::info!(done, "Truth 翻译回填"),
+            Err(err) => tracing::warn!("Truth 翻译回填失败: {err}"),
+            _ => {}
+        }
+        }
+        let extract_cfg = with_model(db, cfg.clone(), "report_extract_model").await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        match crate::reports::extract_due(db, now, crate::reports::read_text, |title, text| {
+            let cfg = extract_cfg.clone();
+            async move { crate::llm::complete(&cfg, &format!("{}\n标题：{title}\n正文：{text}", crate::reports::EXTRACT_PROMPT)).await }
+        })
+        .await
+        {
+            Ok(done) if done > 0 => tracing::info!(done, "研报抽取"),
+            Err(err) => tracing::warn!("研报抽取失败: {err}"),
+            _ => {}
+        }
+        let digest_cfg = with_model(db, cfg, "ima_digest_model").await;
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        match crate::reports::digest_due(db, now, |prompt| {
+            let cfg = digest_cfg.clone();
+            async move { crate::llm::complete(&cfg, &prompt).await }
+        })
+        .await
+        {
+            Ok(done) if done > 0 => tracing::info!(done, "个股综述"),
+            Err(err) => tracing::warn!("个股综述失败: {err}"),
+            _ => {}
+        }
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    if let Err(err) = crate::proxy_admin::refresh_due(db, now, crate::proxy_admin::live_get).await {
+        tracing::warn!("代理池刷新失败: {err}");
+    }
+    let backup = crate::backup::run_scheduled(db).await;
+    if let Ok(false) | Err(_) = &backup {
+        let detail = match &backup {
+            Err(err) => err.detail.to_string(),
+            _ => db.setting("backup_last_error").await.ok().flatten().filter(|item| !item.is_empty()).unwrap_or_else(|| "定时备份失败".into()),
+        };
+        if let Err(err) = crate::alerts::backup_failure(db, &detail, |message| async move { crate::alerts::notify_admins(db, &message).await }).await {
+            tracing::warn!("备份失败告警失败: {err}");
+        }
+    }
+    if let Err(err) = &backup {
+        tracing::warn!("定时备份异常: {}", err.detail);
+    }
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|item| item.as_secs() as i64).unwrap_or(0);
+    if let Err(err) = crate::alerts::probe_xueqiu(db, now, |cookie, uid| {
+        let cookie = cookie.to_string();
+        let uid = uid.to_string();
+        async move {
+            match crate::xueqiu::probe_keepalive(&cookie, &uid) {
+                crate::xueqiu::Keepalive::Alive => crate::alerts::Probe::Alive,
+                crate::xueqiu::Keepalive::Dead(_) => crate::alerts::Probe::Dead,
+                crate::xueqiu::Keepalive::Transient => crate::alerts::Probe::Error("探测失败".into()),
+            }
+        }
+    })
+    .await
+    {
+        tracing::warn!("雪球探测失败: {err}");
+    }
+    let status = crate::cicc::from_env().map(|ctl| ctl.status()).unwrap_or(serde_json::json!({}));
+    if let Err(err) = crate::alerts::check_cicc(db, now, &status, |message| async move { crate::alerts::notify_admins(db, &message).await }).await {
+        tracing::warn!("中金告警失败: {err}");
+    }
+    if let Err(err) = crate::alerts::source_health(db, now, |message| async move { crate::alerts::notify_admins(db, &message).await }).await {
+        tracing::warn!("数据源健康告警失败: {err}");
+    }
+    if let Err(err) = crate::push::retry_due_live(db, now).await {
+        tracing::warn!("推送重试失败: {err}");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn local_maintenance_backfills_purges_and_prunes_once() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-maint-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('甲', 'x'), ('乙', 'x'), ('丙', 'x')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET created_at = datetime('now', '-10 days') WHERE username = '甲'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET created_at = datetime('now', '-10 days'), last_login_at = datetime('now') WHERE username = '丙'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id) SELECT id, 1 FROM users WHERE username = '乙'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_sources (slug, name, internal, enabled) VALUES ('internal-a', '内部', 1, 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_sources (slug, name, internal, enabled) VALUES ('public-a', '公开', 0, 1)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.set_setting("inactive_after_days", "1").await.unwrap();
+        db.set_setting("inactive_purge_after_days", "1").await.unwrap();
+        db.set_setting("stats_posts_retention_days", "1").await.unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, fetched_at) VALUES ('xueqiu', 1, 'old', datetime('now', '-3 days')), ('xueqiu', 1, 'new', datetime('now'))")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        run(&db).await.unwrap();
+        let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_news_sources").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(grants, 2);
+        let names: Vec<String> = sqlx::query_scalar("SELECT username FROM users ORDER BY username").fetch_all(db.pool()).await.unwrap();
+        assert_eq!(names, vec!["丙".to_string(), "乙".to_string()]);
+        let posts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(posts, 1);
+        run(&db).await.unwrap();
+        let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(still, 2);
+        assert!(crate::backup::run_scheduled(&db).await.unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn health_alerts_once_per_day_after_three_failures() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-health-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        sqlx::query("INSERT INTO news_feeds (source_id, name, url, consecutive_failures, last_error_detail) VALUES (1, '华尔街见闻', 'https://example.com/rss', 3, '超时')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let first = db.health_alerts().await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("华尔街见闻"));
+        assert!(db.health_alerts().await.unwrap().is_empty());
+        db.note_platform("xueqiu", Some("cookie 失效")).await.unwrap();
+        db.note_platform("xueqiu", Some("cookie 失效")).await.unwrap();
+        assert!(db.health_alerts().await.unwrap().is_empty());
+        db.note_platform("xueqiu", Some("cookie 失效")).await.unwrap();
+        let alerts = db.health_alerts().await.unwrap();
+        assert_eq!(alerts, vec!["平台 xueqiu 已连续失败 3 次：cookie 失效".to_string()]);
+        assert!(db.health_alerts().await.unwrap().is_empty());
+        db.note_platform("xueqiu", None).await.unwrap();
+        let failures: i64 = sqlx::query_scalar("SELECT consecutive_failures FROM platform_runs WHERE platform = 'xueqiu'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(failures, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn daily_report_is_once_per_day_and_follows_the_cursor() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-digest-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("config_daily_report_hour", "0").await.unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, daily_report) VALUES ('甲', 'x', 1), ('乙', 'x', 0)")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let kol = db.add_kol("xueqiu", "段永平", "111", None, false, false, false).await.unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = '甲'").fetch_one(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id) VALUES (?, ?)")
+            .bind(user)
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, content) VALUES ('xueqiu', ?, 'a', '买入', ''), ('xueqiu', ?, 'b', '', '长文要点')")
+            .bind(kol)
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let first = db.take_daily_reports().await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].1.contains("段永平"));
+        assert!(first[0].1.contains("- 买入"));
+        assert!(first[0].1.contains("- 长文要点"));
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title) VALUES ('xueqiu', ?, 'c', '次日')")
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.take_daily_reports().await.unwrap().is_empty());
+        db.set_setting(&format!("daily_report_sent:{user}"), "2000-01-01").await.unwrap();
+        let next = db.take_daily_reports().await.unwrap();
+        assert_eq!(next.len(), 1);
+        assert!(next[0].1.contains("- 次日"));
+        assert!(!next[0].1.contains("- 买入"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn keyword_digests_skip_dnd_unread_reports_and_mark_once() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-kw-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, keywords, keywords_match_news, keywords_match_news_since, keywords_match_reports, keywords_match_reports_since, dnd_start, dnd_end) VALUES ('甲', 'x', ?, 1, '2000-01-01', 1, '2000-01-01', '00:00', '23:59'), ('乙', 'x', ?, 1, '2000-01-01', 1, '2000-01-01', '', '')")
+            .bind(r#"["AI", "ai"]"#)
+            .bind(r#"["银行"]"#)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_sources (id, slug, name, internal) VALUES (1, 'public', '公开源', 0), (2, 'secret', '内部源', 1)").execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO news_articles (id, source_id, external_id, title, summary, published_at) VALUES (1, 1, 'a', 'AI weekly', '', '2026-08-02'), (2, 1, 'b', '其他', '', '2026-08-02'), (3, 2, 'c', '内部 AI', '', '2026-08-02')").execute(db.pool()).await.unwrap();
+        let yi: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = '乙'").fetch_one(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ima_kb_acl (group_id, user_id) VALUES ('reports', ?)").bind(yi).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ima_kb_subscriptions (user_id, group_id, created_at) VALUES (?, 'reports', 1)").bind(yi).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO ima_document_index (group_id, media_id, name, group_name, abstract, downloaded_at) VALUES ('reports', 'm1', '银行策略', '公开库', '', '2026-08-02T00:00:00+00:00'), ('secret', 'm2', '银行机密', '秘密库', '', '2026-08-02T00:00:00+00:00')").execute(db.pool()).await.unwrap();
+        let first = db.pending_keyword_digests().await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].user_id, yi);
+        assert!(first[0].text.contains("银行策略"));
+        assert!(!first[0].text.contains("银行机密"));
+        assert!(!first[0].text.contains("AI weekly"));
+        db.mark_keyword_digest(&first[0]).await.unwrap();
+        assert!(db.pending_keyword_digests().await.unwrap().is_empty());
+        sqlx::query("UPDATE users SET dnd_start = '', dnd_end = '' WHERE username = '甲'").execute(db.pool()).await.unwrap();
+        let later = db.pending_keyword_digests().await.unwrap();
+        assert_eq!(later.len(), 1);
+        assert!(later[0].text.contains("AI weekly"));
+        assert!(!later[0].text.contains("内部 AI"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stock_alias_cleanup_runs_once_per_beijing_day() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-alias-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("stock_names", r#"["贵州茅台"]"#).await.unwrap();
+        db.set_setting("stock_aliases", r#"[{"alias":"酱香茅台","stock":"贵州茅台"},{"alias":"宁王","stock":"宁德时代"}]"#).await.unwrap();
+        run(&db).await.unwrap();
+        let raw = db.setting("stock_aliases").await.unwrap().unwrap();
+        assert!(raw.contains("酱香茅台"));
+        assert!(!raw.contains("宁王"));
+        let marked = db.setting("stock_alias_last_date").await.unwrap().unwrap();
+        db.set_setting("stock_aliases", r#"[{"alias":"宁王","stock":"宁德时代"}]"#).await.unwrap();
+        run(&db).await.unwrap();
+        assert_eq!(db.setting("stock_alias_last_date").await.unwrap().unwrap(), marked);
+        assert!(db.setting("stock_aliases").await.unwrap().unwrap().contains("宁王"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn proxy_extract_refreshes_only_when_due() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-proxy-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let due = crate::proxy_admin::create_pool(&db, "到期", "extract", "http", "https://example.com/a", 60, 3600).await.unwrap();
+        crate::proxy_admin::create_pool(&db, "未到", "extract", "http", "https://example.com/b", 60, 3600).await.unwrap();
+        crate::proxy_admin::create_pool(&db, "关闭", "extract", "http", "https://example.com/c", 60, 0).await.unwrap();
+        let due_id = due["id"].as_i64().unwrap();
+        let later: i64 = sqlx::query_scalar("SELECT id FROM proxy_pools WHERE name = '未到'").fetch_one(db.pool()).await.unwrap();
+        sqlx::query("UPDATE proxy_pools SET last_extract_at = 1000 WHERE id = ?").bind(later).execute(db.pool()).await.unwrap();
+        let mut calls = 0;
+        let fetched = crate::proxy_admin::refresh_due(&db, 2000, |_| {
+            calls += 1;
+            Ok(r#"{"data":[{"ip":"9.9.9.9","port":8000}]}"#.to_string())
+        })
+        .await
+        .unwrap();
+        assert_eq!(fetched, 1);
+        assert_eq!(calls, 1);
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM proxies WHERE pool_id = ?").bind(due_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(count, 1);
+        let again = crate::proxy_admin::refresh_due(&db, 2000, |_| {
+            calls += 1;
+            Ok("".into())
+        })
+        .await
+        .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(calls, 1);
+        let failed = crate::proxy_admin::refresh_due(&db, 2000 + 3600, |_| Err("超时".into())).await.unwrap();
+        assert_eq!(failed, 0);
+        let error: String = sqlx::query_scalar("SELECT last_error FROM proxy_pools WHERE id = ?").bind(due_id).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(error, "超时");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn cookie_keepalive_respects_interval_and_alerts_once() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-cookie-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let mut calls = 0;
+        cookie_keepalive_with(&db, 1_000, |_, _, _| {
+            calls += 1;
+            async { Keep::Dead("过期".into()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 0);
+        db.set_setting("config_cookie_keepalive_interval_seconds", "100").await.unwrap();
+        db.set_setting("xueqiu_cookie", "xq=1").await.unwrap();
+        db.add_kol("xueqiu", "段永平", "111", None, false, false, false).await.unwrap();
+        db.set_setting("weibo_cookie", "SUB=1").await.unwrap();
+        cookie_keepalive_with(&db, 2_000, |_, _, _| {
+            calls += 1;
+            async { Keep::Alive }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 1);
+        db.add_kol("weibo", "乙", "222", None, false, false, false).await.unwrap();
+        cookie_keepalive_with(&db, 2_050, |_, _, _| {
+            calls += 1;
+            async { Keep::Dead("过期".into()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 1);
+        cookie_keepalive_with(&db, 2_200, |platform, _, _| {
+            calls += 1;
+            let platform = platform.to_string();
+            async move {
+                if platform == "weibo" { Keep::Renewed("SUB=new".into()) } else { Keep::Alive }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(db.setting("source_err_xueqiu").await.unwrap().unwrap(), "");
+        assert_eq!(db.setting("weibo_cookie").await.unwrap().unwrap(), "SUB=new");
+        cookie_keepalive_with(&db, 2_300, |_, _, _| {
+            calls += 1;
+            async { Keep::Dead("过期".into()) }
+        })
+        .await
+        .unwrap();
+        cookie_keepalive_with(&db, 2_500, |_, _, _| {
+            calls += 1;
+            async { Keep::Dead("又过期".into()) }
+        })
+        .await
+        .unwrap();
+        let alerts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_logs WHERE action = 'cookie_keepalive'").fetch_one(db.pool()).await.unwrap();
+        assert_eq!(alerts, 1);
+        assert_eq!(db.setting("source_err_xueqiu").await.unwrap().unwrap(), "又过期");
+        cookie_keepalive_with(&db, 2_700, |_, _, _| {
+            calls += 1;
+            async { Keep::Transient }
+        })
+        .await
+        .unwrap();
+        assert_eq!(db.setting("source_err_xueqiu").await.unwrap().unwrap(), "又过期");
+        let _ = std::fs::remove_file(&path);
+    }
+}

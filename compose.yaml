@@ -16,9 +16,11 @@ services:
       WEB_TOKEN_SECRET: ${WEB_TOKEN_SECRET:?set WEB_TOKEN_SECRET}
       WEB_ALLOW_REGISTER: ${WEB_ALLOW_REGISTER:-0}
       VPUSH_FETCH: ${VPUSH_FETCH:-0}
+      IMA_ARCHIVE_ROOT: ${IMA_ARCHIVE_ROOT:-/app/ima-archive}
     volumes:
       - ./data:/app/data
       - ./avatars:/app/static/avatars:ro
+      - ${IMA_ARCHIVE_HOST:-/srv/vpush-ima}:/app/ima-archive:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/"]
       interval: 30s

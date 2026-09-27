@@ -7152,6 +7152,21 @@ async fn ensure_news_article_columns(pool: &SqlitePool) -> Result<(), sqlx::Erro
         sqlx::query_scalar("SELECT name FROM pragma_table_info('news_articles')")
             .fetch_all(pool)
             .await?;
+    if !existing.iter().any(|column| column == "content") {
+        add_column(
+            pool,
+            "ALTER TABLE news_articles ADD COLUMN content TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+    }
+    if existing.iter().any(|column| column == "content_html") {
+        sqlx::query(
+            "UPDATE news_articles SET content = content_html
+             WHERE content = '' AND COALESCE(content_html, '') != ''",
+        )
+        .execute(pool)
+        .await?;
+    }
     let columns = [
         ("issue_key", "TEXT NOT NULL DEFAULT ''"),
         ("issue_label", "TEXT NOT NULL DEFAULT ''"),
@@ -8205,6 +8220,19 @@ mod tests {
         let article = db.news_article(admin.id, id).await.unwrap().unwrap();
         assert_eq!(article["is_read"], true);
         assert_eq!(article["content"], "正文");
+        sqlx::query("ALTER TABLE news_articles RENAME COLUMN content TO content_html")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE news_articles SET content_html = '<p>旧正文</p>' WHERE id = ?")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        ensure_news_article_columns(db.pool()).await.unwrap();
+        let restored = db.news_article(admin.id, id).await.unwrap().unwrap();
+        assert_eq!(restored["content"], "<p>旧正文</p>");
+        ensure_news_article_columns(db.pool()).await.unwrap();
         let sources = db.user_news_sources(admin.id).await.unwrap();
         assert_eq!(sources["items"][0]["unread_count"], 0);
         let other = db.add_news_source("乙报", "").await.unwrap();

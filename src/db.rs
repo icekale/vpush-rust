@@ -3755,6 +3755,26 @@ impl Db {
             .collect())
     }
 
+    pub async fn update_register_code_note(
+        &self,
+        code: &str,
+        note: &str,
+    ) -> Result<Value, CatalogError> {
+        let code = code.trim().to_ascii_uppercase();
+        let changed = sqlx::query("UPDATE register_codes SET note = ? WHERE code = ?")
+            .bind(note)
+            .bind(&code)
+            .execute(&self.pool)
+            .await?;
+        if changed.rows_affected() == 0 {
+            return Err(CatalogError::Missing("注册码不存在"));
+        }
+        self.list_register_codes()
+            .await?
+            .into_iter()
+            .find(|row| row["code"] == code)
+            .ok_or_else(|| CatalogError::Missing("注册码不存在"))
+    }
     pub async fn revoke_register_code(&self, code: &str) -> Result<(), CatalogError> {
         let code = code.trim().to_ascii_uppercase();
         if code.is_empty() || code.len() > 64 {

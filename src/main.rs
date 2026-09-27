@@ -365,9 +365,18 @@ fn router(state: AppState) -> Router {
             "/api/admin/polling-config",
             get(polling_config).put(update_polling),
         )
-        .route("/api/admin/xueqiu-cookie", post(save_xueqiu_cookie))
-        .route("/api/admin/twitter-cookie", post(save_twitter_cookie))
-        .route("/api/admin/zsxq-cookie", post(save_zsxq_cookie))
+        .route(
+            "/api/admin/xueqiu-cookie",
+            get(get_xueqiu_cookie).post(save_xueqiu_cookie),
+        )
+        .route(
+            "/api/admin/twitter-cookie",
+            get(get_twitter_cookie).post(save_twitter_cookie),
+        )
+        .route(
+            "/api/admin/zsxq-cookie",
+            get(get_zsxq_cookie).post(save_zsxq_cookie),
+        )
         .route("/api/admin/cookies/{kind}", delete(clear_cookie))
         .route("/api/admin/zsxq-cache/purge", post(purge_zsxq_cache))
         .route("/api/admin/backup", get(backup_status))
@@ -393,6 +402,10 @@ fn router(state: AppState) -> Router {
         .route(
             "/api/admin/register-codes/batch",
             post(register_codes_batch),
+        )
+        .route(
+            "/api/admin/register-codes/{code}",
+            patch(patch_register_code).delete(revoke_register_code),
         )
         .route(
             "/api/admin/register-codes/{code}/revoke",
@@ -1710,6 +1723,36 @@ struct CookieIn {
     cookie: String,
 }
 
+async fn get_xueqiu_cookie(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        state.db.admin_stats().await.map_err(db_err)?["xueqiu_cookie"].clone(),
+    ))
+}
+
+async fn get_twitter_cookie(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        state.db.admin_stats().await.map_err(db_err)?["twitter_cookie"].clone(),
+    ))
+}
+
+async fn get_zsxq_cookie(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        state.db.admin_stats().await.map_err(db_err)?["zsxq_cookie"].clone(),
+    ))
+}
+
 async fn save_xueqiu_cookie(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1814,6 +1857,34 @@ async fn generate_register_codes(
         )
         .await;
     Ok(Json(made))
+}
+
+#[derive(Deserialize)]
+struct RegisterCodeNote {
+    note: Option<String>,
+}
+
+async fn patch_register_code(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(code): UrlPath<String>,
+    Json(body): Json<RegisterCodeNote>,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let note = body.note.unwrap_or_default();
+    if note.chars().count() > 40 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "备注最长40字"));
+    }
+    let row = state
+        .db
+        .update_register_code_note(&code, note.trim())
+        .await
+        .map_err(catalog_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "update_register_code_note", &code, "")
+        .await;
+    Ok(Json(row))
 }
 
 async fn revoke_register_code(

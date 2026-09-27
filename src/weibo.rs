@@ -87,7 +87,17 @@ async fn poll(db: &Db) -> Result<(), String> {
     let proxy = exit.as_ref().map(|item| item.url.clone());
     let proxy_id = exit.map(|item| item.id);
     for (id, name, external_id, original_only) in kols {
-        match pull(db, &cookie, id, &name, &external_id, original_only, proxy.clone()).await {
+        match pull(
+            db,
+            &cookie,
+            id,
+            &name,
+            &external_id,
+            original_only,
+            proxy.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 crate::proxy_admin::note(db, proxy_id, true, "").await;
                 let _ = db.note_kol_fetch(id, None).await;
@@ -95,7 +105,17 @@ async fn poll(db: &Db) -> Result<(), String> {
             Err(FetchErr::Dead) => match refresh_cookie(db).await? {
                 Some(fresh) => {
                     cookie = fresh;
-                    if let Err(err) = pull(db, &cookie, id, &name, &external_id, original_only, proxy.clone()).await {
+                    if let Err(err) = pull(
+                        db,
+                        &cookie,
+                        id,
+                        &name,
+                        &external_id,
+                        original_only,
+                        proxy.clone(),
+                    )
+                    .await
+                    {
                         let detail = err.to_string();
                         let _ = db.note_kol_fetch(id, Some(&detail)).await;
                         tracing::warn!(kol = id, "{err}");
@@ -105,7 +125,10 @@ async fn poll(db: &Db) -> Result<(), String> {
                 }
                 None => {
                     let _ = db.note_kol_fetch(id, Some("微博登录已失效")).await;
-                    tracing::warn!(kol = id, "微博登录已失效。密码登录未接入，请更新 weibo_cookie 或 weibo_app_cred");
+                    tracing::warn!(
+                        kol = id,
+                        "微博登录已失效。密码登录未接入，请更新 weibo_cookie 或 weibo_app_cred"
+                    );
                 }
             },
             Err(FetchErr::Other(msg)) => {
@@ -119,7 +142,11 @@ async fn poll(db: &Db) -> Result<(), String> {
 }
 
 async fn load_cookie(db: &Db) -> Result<Option<String>, String> {
-    if let Some(saved) = db.setting("weibo_cookie").await.map_err(|e| e.to_string())? {
+    if let Some(saved) = db
+        .setting("weibo_cookie")
+        .await
+        .map_err(|e| e.to_string())?
+    {
         if saved.contains("SUB=") {
             return Ok(Some(saved));
         }
@@ -148,10 +175,18 @@ async fn pull(
     }
     let rows = data["data"]["list"].as_array().cloned().unwrap_or_default();
     let posts = rows.iter().filter_map(parse_mblog).collect::<Vec<_>>();
-    if let Some(avatar) = posts.iter().find_map(|post| (!post.avatar.is_empty()).then(|| post.avatar.clone())) {
-        db.set_avatar(kol_id, &avatar).await.map_err(|e| FetchErr::Other(e.to_string()))?;
+    if let Some(avatar) = posts
+        .iter()
+        .find_map(|post| (!post.avatar.is_empty()).then(|| post.avatar.clone()))
+    {
+        db.set_avatar(kol_id, &avatar)
+            .await
+            .map_err(|e| FetchErr::Other(e.to_string()))?;
     }
-    let watermark = db.max_published_at(kol_id).await.map_err(|e| FetchErr::Other(e.to_string()))?;
+    let watermark = db
+        .max_published_at(kol_id)
+        .await
+        .map_err(|e| FetchErr::Other(e.to_string()))?;
     let now = now_unix();
     for post in posts {
         match keep(&post.published_at, post.published_unix, &watermark, now) {
@@ -178,10 +213,16 @@ async fn pull(
         )
         .await
         .map_err(|e| FetchErr::Other(e.to_string()))?;
-        if !matches!(keep(&post.published_at, post.published_unix, &watermark, now), Keep::Notify) {
+        if !matches!(
+            keep(&post.published_at, post.published_unix, &watermark, now),
+            Keep::Notify
+        ) {
             continue;
         }
-        let push = db.should_push(kol_id, "post").await.map_err(|e| FetchErr::Other(e.to_string()))?;
+        let push = db
+            .should_push(kol_id, "post")
+            .await
+            .map_err(|e| FetchErr::Other(e.to_string()))?;
         if !push {
             continue;
         }
@@ -222,18 +263,34 @@ pub(crate) async fn probe_keepalive(db: &Db, cookie: &str, uid: &str) -> Keepali
     }
 }
 
-async fn timeline(cookie: &str, uid: &str, original_only: bool, proxy: Option<String>) -> Result<Value, FetchErr> {
+async fn timeline(
+    cookie: &str,
+    uid: &str,
+    original_only: bool,
+    proxy: Option<String>,
+) -> Result<Value, FetchErr> {
     let cookie = cookie.to_string();
     let uid = uid.to_string();
     let feature = if original_only { "1" } else { "0" }.to_string();
-    match tokio::task::spawn_blocking(move || fetch_timeline(&cookie, &uid, &feature, proxy.as_deref())).await {
+    match tokio::task::spawn_blocking(move || {
+        fetch_timeline(&cookie, &uid, &feature, proxy.as_deref())
+    })
+    .await
+    {
         Ok(result) => result,
         Err(err) => Err(FetchErr::Other(err.to_string())),
     }
 }
 
-fn fetch_timeline(cookie: &str, uid: &str, feature: &str, proxy: Option<&str>) -> Result<Value, FetchErr> {
-    let agent = crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20)).map_err(FetchErr::Other)?;
+fn fetch_timeline(
+    cookie: &str,
+    uid: &str,
+    feature: &str,
+    proxy: Option<&str>,
+) -> Result<Value, FetchErr> {
+    let agent =
+        crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20))
+            .map_err(FetchErr::Other)?;
     let mut req = agent
         .get(TIMELINE)
         .query("uid", uid)
@@ -266,7 +323,11 @@ fn fetch_timeline(cookie: &str, uid: &str, feature: &str, proxy: Option<&str>) -
 }
 
 async fn refresh_cookie(db: &Db) -> Result<Option<String>, String> {
-    let Some(raw) = db.setting("weibo_app_cred").await.map_err(|e| e.to_string())? else {
+    let Some(raw) = db
+        .setting("weibo_app_cred")
+        .await
+        .map_err(|e| e.to_string())?
+    else {
         return Ok(None);
     };
     let cred: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
@@ -282,7 +343,11 @@ async fn refresh_cookie(db: &Db) -> Result<Option<String>, String> {
         tracing::warn!("微博 App 凭证缺少设备参数 ua 或 android_id");
         return Ok(None);
     }
-    let old = db.setting("weibo_cookie").await.map_err(|e| e.to_string())?.unwrap_or_default();
+    let old = db
+        .setting("weibo_cookie")
+        .await
+        .map_err(|e| e.to_string())?
+        .unwrap_or_default();
     let result = tokio::task::spawn_blocking(move || request_cookie(&gsid, &aid, &secret, &device))
         .await
         .map_err(|e| e.to_string())?;
@@ -297,7 +362,9 @@ async fn refresh_cookie(db: &Db) -> Result<Option<String>, String> {
         tracing::warn!("微博 getcookie 返回的 cookie 缺少 SUB");
         return Ok(None);
     };
-    db.set_setting("weibo_cookie", &merged).await.map_err(|e| e.to_string())?;
+    db.set_setting("weibo_cookie", &merged)
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(Some(merged))
 }
 
@@ -313,7 +380,10 @@ fn request_cookie(gsid: &str, aid: &str, secret: &str, device: &Value) -> Result
             }
         }
     }
-    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
     pairs.push(("s".into(), secret.into()));
     pairs.push(("gsid".into(), gsid.into()));
     pairs.push(("aid".into(), aid.into()));
@@ -338,7 +408,10 @@ fn request_cookie(gsid: &str, aid: &str, secret: &str, device: &Value) -> Result
         return Err(format!("getcookie HTTP {status}"));
     }
     let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let cookie = value["cookie"][".weibo.com"].as_str().unwrap_or("").to_string();
+    let cookie = value["cookie"][".weibo.com"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
     if cookie.is_empty() {
         return Err("getcookie 未返回 .weibo.com cookie".into());
     }
@@ -352,11 +425,19 @@ fn parse_mblog(mblog: &Value) -> Option<WeiboPost> {
     }
     let content = strip_html(&field_str(mblog, "text"));
     let title_src = field_str(mblog, "text_raw");
-    let title_base = if title_src.is_empty() { content.as_str() } else { title_src.as_str() };
+    let title_base = if title_src.is_empty() {
+        content.as_str()
+    } else {
+        title_src.as_str()
+    };
     let (published_at, published_unix) = published(&field_str(mblog, "created_at"));
     let user = &mblog["user"];
     let avatar = field_str(user, "avatar_large");
-    let avatar = if avatar.is_empty() { field_str(user, "profile_image_url") } else { avatar };
+    let avatar = if avatar.is_empty() {
+        field_str(user, "profile_image_url")
+    } else {
+        avatar
+    };
     Some(WeiboPost {
         external_id: external_id.clone(),
         title: title_base.chars().take(80).collect(),
@@ -547,7 +628,11 @@ fn strip_html(input: &str) -> String {
         } else if is_block_close(&lower) {
             out.push_str("\n\n");
         }
-        rest = if end + 1 <= rest.len() { &rest[end + 1..] } else { "" };
+        rest = if end < rest.len() {
+            &rest[end + 1..]
+        } else {
+            ""
+        };
     }
     tidy(&unescape(&out))
 }
@@ -600,7 +685,10 @@ fn unescape(input: &str) -> String {
             Some('\'')
         } else if token == "nbsp" || token == "#160" {
             Some('\u{00a0}')
-        } else if let Some(hex) = token.strip_prefix("#x").or_else(|| token.strip_prefix("#X")) {
+        } else if let Some(hex) = token
+            .strip_prefix("#x")
+            .or_else(|| token.strip_prefix("#X"))
+        {
             u32::from_str_radix(hex, 16).ok().and_then(char::from_u32)
         } else if let Some(dec) = token.strip_prefix('#') {
             dec.parse::<u32>().ok().and_then(char::from_u32)
@@ -673,7 +761,13 @@ fn merge_cookie(old: &str, fresh: &str) -> Option<String> {
     if !found_sub {
         return None;
     }
-    Some(pairs.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("; "))
+    Some(
+        pairs
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
 }
 
 fn cookie_pairs(cookie: &str) -> Vec<(String, String)> {
@@ -682,7 +776,11 @@ fn cookie_pairs(cookie: &str) -> Vec<(String, String)> {
         .filter_map(|seg| {
             let seg = seg.trim();
             let (k, v) = seg.split_once('=')?;
-            if k.is_empty() { None } else { Some((k.to_string(), v.to_string())) }
+            if k.is_empty() {
+                None
+            } else {
+                Some((k.to_string(), v.to_string()))
+            }
         })
         .collect()
 }
@@ -716,18 +814,24 @@ fn field_str(value: &Value, key: &str) -> String {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn read_response(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, String), String> {
     match result {
         Ok(resp) => {
             let status = resp.status();
-            resp.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
+            resp.into_string()
+                .map(|text| (status, text))
+                .map_err(|e| e.to_string())
         }
-        Err(ureq::Error::Status(status, resp)) => {
-            resp.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
-        }
+        Err(ureq::Error::Status(status, resp)) => resp
+            .into_string()
+            .map(|text| (status, text))
+            .map_err(|e| e.to_string()),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -761,12 +865,30 @@ mod tests {
         assert_eq!(post.avatar, "https://wx.qlogo.cn/a.jpg");
         assert_eq!(post.images.len(), 4);
         assert_eq!(post.url, "https://weibo.com/detail/100");
-        assert_eq!(published("Thu Jan 01 00:30:00 +0000 1970").0, "1970-01-01 08:30");
+        assert_eq!(
+            published("Thu Jan 01 00:30:00 +0000 1970").0,
+            "1970-01-01 08:30"
+        );
         let old_hour = 1_700_000_000;
-        assert!(matches!(keep("2023-11-14 22:13", Some(old_hour), "", old_hour + 40 * 3600), Keep::Drop));
-        assert!(matches!(keep("2023-11-14 22:13", Some(old_hour), "", old_hour + 120), Keep::Notify));
-        assert!(matches!(keep("2023-11-14 22:13", Some(old_hour), "2024-01-01 00:00", old_hour), Keep::Drop));
-        let merged = merge_cookie("SCF=old; SUB=old; EXTRA=keep", "SUB=new; SUBP=p; ALF=no").unwrap();
+        assert!(matches!(
+            keep("2023-11-14 22:13", Some(old_hour), "", old_hour + 40 * 3600),
+            Keep::Drop
+        ));
+        assert!(matches!(
+            keep("2023-11-14 22:13", Some(old_hour), "", old_hour + 120),
+            Keep::Notify
+        ));
+        assert!(matches!(
+            keep(
+                "2023-11-14 22:13",
+                Some(old_hour),
+                "2024-01-01 00:00",
+                old_hour
+            ),
+            Keep::Drop
+        ));
+        let merged =
+            merge_cookie("SCF=old; SUB=old; EXTRA=keep", "SUB=new; SUBP=p; ALF=no").unwrap();
         assert!(merged.contains("SUB=new"));
         assert!(merged.contains("EXTRA=keep"));
         assert!(merged.contains("SUBP=p"));
@@ -779,24 +901,44 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-weibo-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
         let admin = db.user_by_username("admin").await.unwrap().unwrap();
-        let kol = db.add_kol("weibo", "微博甲", "10001", None, false, false, true).await.unwrap();
+        let kol = db
+            .add_kol("weibo", "微博甲", "10001", None, false, false, true)
+            .await
+            .unwrap();
         db.subscribe(admin.id, true, kol, "post").await.unwrap();
         let targets = db.weibo_kols().await.unwrap();
-        assert_eq!(targets[0].3, true);
+        assert!(targets[0].3);
         let post = parse_mblog(&json!({
             "id": 7,
             "text": "一条微博",
             "created_at": "2024-03-02 09:30:00"
-        })).unwrap();
-        db.save_fetched(kol, &post.external_id, &post.title, &post.content, "", "[]", &post.url, &post.published_at)
+        }))
+        .unwrap();
+        db.save_fetched(
+            kol,
+            &post.external_id,
+            &post.title,
+            &post.content,
+            "",
+            "[]",
+            &post.url,
+            &post.published_at,
+        )
+        .await
+        .unwrap();
+        let page = db
+            .kol_posts(admin.id, true, kol, 10)
             .await
+            .unwrap()
             .unwrap();
-        let page = db.kol_posts(admin.id, true, kol, 10).await.unwrap().unwrap();
         assert_eq!(page[0]["platform"], "weibo");
         assert_eq!(page[0]["content"], "一条微博");
         let _ = std::fs::remove_file(&path);

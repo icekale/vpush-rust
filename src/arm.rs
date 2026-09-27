@@ -9,14 +9,23 @@ use crate::db::Db;
 const HOURS: [i64; 3] = [1, 9, 17];
 
 pub async fn admin_status(db: &Db) -> Result<Value, String> {
-    let finished = db.setting("ima_pure_last_finished_at").await.map_err(|err| err.to_string())?;
+    let finished = db
+        .setting("ima_pure_last_finished_at")
+        .await
+        .map_err(|err| err.to_string())?;
     let result = json_setting(db, "ima_pure_last_result").await?;
     let groups = json_setting(db, "ima_pure_groups").await?;
     let runtime = json_setting(db, "ima_pure_group_runtime").await?;
     let local = json_setting(db, "ima_local_libraries").await?;
-    let (stamp, count) = db.ima_latest_batch("local-cicc-research").await.map_err(|err| err.to_string())?;
+    let (stamp, count) = db
+        .ima_latest_batch("local-cicc-research")
+        .await
+        .map_err(|err| err.to_string())?;
     let mut downloads = Vec::new();
-    if !result["group_results"].as_array().is_some_and(|rows| !rows.is_empty()) {
+    if result["group_results"]
+        .as_array()
+        .is_none_or(|rows| rows.is_empty())
+    {
         for group in groups.as_array().into_iter().flatten() {
             let gid = group["id"].as_str().unwrap_or("");
             if gid.is_empty() || group["enabled"] == false || gid.starts_with("local-") {
@@ -25,16 +34,29 @@ pub async fn admin_status(db: &Db) -> Result<Value, String> {
             let started = runtime[gid]["last_started_at"].as_i64().unwrap_or(0);
             let finished_at = runtime[gid]["last_finished_at"].as_i64().unwrap_or(0);
             let count = if started > 0 && finished_at >= started {
-                db.ima_downloads_between(gid, started, finished_at).await.map_err(|err| err.to_string())?
+                db.ima_downloads_between(gid, started, finished_at)
+                    .await
+                    .map_err(|err| err.to_string())?
             } else {
                 0
             };
             downloads.push(count);
         }
     }
-    Ok(assemble(&finished.unwrap_or_default(), &result, &groups, &runtime, &local, &stamp, count, &downloads, now_secs()))
+    Ok(assemble(
+        &finished.unwrap_or_default(),
+        &result,
+        &groups,
+        &runtime,
+        &local,
+        &stamp,
+        count,
+        &downloads,
+        now_secs(),
+    ))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn assemble(
     finished_raw: &str,
     result: &Value,
@@ -48,7 +70,11 @@ pub fn assemble(
 ) -> Value {
     let finished = finished_raw.trim().parse::<i64>().unwrap_or(0);
     let last_error = clip(
-        result["last_error"].as_str().filter(|text| !text.is_empty()).or_else(|| result["discovery_error"].as_str()).unwrap_or(""),
+        result["last_error"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .or_else(|| result["discovery_error"].as_str())
+            .unwrap_or(""),
         200,
     );
     let mut libraries = libraries(groups, runtime, result, downloads);
@@ -81,7 +107,9 @@ fn pull_for(raw: &str) -> Value {
         Ok((code, body)) if code == 200 && body.starts_with("ok") => {
             json!({"configured": true, "ok": true, "status": body, "circuit_open": false})
         }
-        Ok((code, body)) => json!({"configured": true, "ok": false, "status": if body.is_empty() { code.to_string() } else { body }, "circuit_open": false}),
+        Ok((code, body)) => {
+            json!({"configured": true, "ok": false, "status": if body.is_empty() { code.to_string() } else { body }, "circuit_open": false})
+        }
         Err(err) => json!({"configured": true, "ok": false, "status": err, "circuit_open": false}),
     }
 }
@@ -107,7 +135,7 @@ fn probe(raw: &str) -> Result<(u16, String), String> {
         .build();
     match agent.get(&url).call() {
         Ok(resp) => {
-            let code = resp.status() as u16;
+            let code = resp.status();
             let mut buf = [0u8; 32];
             let n = resp.into_reader().read(&mut buf).unwrap_or(0);
             let body = String::from_utf8_lossy(&buf[..n]).trim().to_string();
@@ -117,24 +145,46 @@ fn probe(raw: &str) -> Result<(u16, String), String> {
             let mut buf = [0u8; 32];
             let n = resp.into_reader().read(&mut buf).unwrap_or(0);
             let body = String::from_utf8_lossy(&buf[..n]).trim().to_string();
-            Ok((code as u16, if body.is_empty() { code.to_string() } else { body }))
+            Ok((
+                code,
+                if body.is_empty() {
+                    code.to_string()
+                } else {
+                    body
+                },
+            ))
         }
         Err(err) => Err(err.to_string()),
     }
 }
 
 fn libraries(groups: &Value, runtime: &Value, result: &Value, downloads: &[i64]) -> Vec<Value> {
-    if let Some(stored) = result["group_results"].as_array().filter(|rows| !rows.is_empty()) {
-        return stored.iter().filter_map(|item| item.as_object().map(|_| library_row(
-            item["id"].as_str().unwrap_or(""),
-            item["name"].as_str().unwrap_or(""),
-            item["downloaded"].as_i64().unwrap_or(0),
-            item["failed"].as_i64().unwrap_or(0),
-            runtime[item["id"].as_str().unwrap_or("")]["last_finished_at"].as_i64().unwrap_or(0),
-            item["error"].as_str().unwrap_or(""),
-        ))).collect();
+    if let Some(stored) = result["group_results"]
+        .as_array()
+        .filter(|rows| !rows.is_empty())
+    {
+        return stored
+            .iter()
+            .filter_map(|item| {
+                item.as_object().map(|_| {
+                    library_row(
+                        item["id"].as_str().unwrap_or(""),
+                        item["name"].as_str().unwrap_or(""),
+                        item["downloaded"].as_i64().unwrap_or(0),
+                        item["failed"].as_i64().unwrap_or(0),
+                        runtime[item["id"].as_str().unwrap_or("")]["last_finished_at"]
+                            .as_i64()
+                            .unwrap_or(0),
+                        item["error"].as_str().unwrap_or(""),
+                    )
+                })
+            })
+            .collect();
     }
-    let failed: Vec<&str> = result["failed_groups"].as_array().map(|rows| rows.iter().filter_map(|item| item.as_str()).collect()).unwrap_or_default();
+    let failed: Vec<&str> = result["failed_groups"]
+        .as_array()
+        .map(|rows| rows.iter().filter_map(|item| item.as_str()).collect())
+        .unwrap_or_default();
     let mut rows = Vec::new();
     let mut seen = 0;
     for group in groups.as_array().into_iter().flatten() {
@@ -157,7 +207,14 @@ fn libraries(groups: &Value, runtime: &Value, result: &Value, downloads: &[i64])
     rows
 }
 
-fn library_row(id: &str, name: &str, downloaded: i64, failed: i64, finished: i64, error: &str) -> Value {
+fn library_row(
+    id: &str,
+    name: &str,
+    downloaded: i64,
+    failed: i64,
+    finished: i64,
+    error: &str,
+) -> Value {
     json!({
         "id": id,
         "name": clip(if name.is_empty() { id } else { name }, 80),
@@ -180,9 +237,15 @@ fn cicc_row(stamp: &str, count: i64, name: &str) -> Value {
 }
 
 fn cicc_name(local: &Value) -> String {
-    local["libraries"].as_array().and_then(|rows| {
-        rows.iter().find(|item| item["slug"] == "cicc-research").and_then(|item| item["name"].as_str()).map(str::to_string)
-    }).unwrap_or_else(|| "中金".into())
+    local["libraries"]
+        .as_array()
+        .and_then(|rows| {
+            rows.iter()
+                .find(|item| item["slug"] == "cicc-research")
+                .and_then(|item| item["name"].as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| "中金".into())
 }
 
 pub(crate) fn iso_utc(ts: i64) -> String {
@@ -190,7 +253,12 @@ pub(crate) fn iso_utc(ts: i64) -> String {
     let days = ts.div_euclid(86400);
     let sod = ts.rem_euclid(86400);
     let (year, month, day) = civil_from_days(days);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+00:00", sod / 3600, sod % 3600 / 60, sod % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+00:00",
+        sod / 3600,
+        sod % 3600 / 60,
+        sod % 60
+    )
 }
 
 fn civil_from_days(z: i64) -> (i32, u32, u32) {
@@ -230,7 +298,12 @@ fn parse_stamp(text: &str) -> i64 {
     let hour: i64 = text[11..13].parse().unwrap_or(0);
     let minute: i64 = text[14..16].parse().unwrap_or(0);
     let second: i64 = text[17..19].parse().unwrap_or(0);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 59 {
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
         return 0;
     }
     let days = days_from_civil(year, month as u32, day as u32);
@@ -246,7 +319,11 @@ fn parse_stamp(text: &str) -> i64 {
     let oh: i64 = rest[1..3].parse().unwrap_or(0);
     let om: i64 = rest[4..6].parse().unwrap_or(0);
     let offset = oh * 3600 + om * 60;
-    if sign == Some(b'+') { utc - offset } else { utc + offset }
+    if sign == Some(b'+') {
+        utc - offset
+    } else {
+        utc + offset
+    }
 }
 
 fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
@@ -264,12 +341,19 @@ fn clip(text: &str, max_chars: usize) -> String {
 }
 
 async fn json_setting(db: &Db, key: &str) -> Result<Value, String> {
-    let raw = db.setting(key).await.map_err(|err| err.to_string())?.unwrap_or_default();
+    let raw = db
+        .setting(key)
+        .await
+        .map_err(|err| err.to_string())?
+        .unwrap_or_default();
     Ok(serde_json::from_str(&raw).unwrap_or(Value::Null))
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -288,7 +372,17 @@ mod tests {
         });
         let runtime = json!({"kb1": {"last_finished_at": 50}});
         let local = json!({"libraries": [{"slug": "cicc-research", "name": "中金研究"}]});
-        let status = assemble("42", &result, &json!([]), &runtime, &local, "2020-01-01T00:00:00+00:00", 4, &[], 1_700_000_000);
+        let status = assemble(
+            "42",
+            &result,
+            &json!([]),
+            &runtime,
+            &local,
+            "2020-01-01T00:00:00+00:00",
+            4,
+            &[],
+            1_700_000_000,
+        );
         assert_eq!(status["pull"]["configured"], false);
         assert_eq!(status["last_finished_at"], 42);
         assert_eq!(status["downloaded"], 3);
@@ -304,7 +398,12 @@ mod tests {
             {"id": "kb3", "name": "停用", "enabled": false}
         ]);
         let fallback = json!({"failed_groups": ["kb2"], "group_errors": {"kb2": "断了"}});
-        let rows = libraries(&groups, &json!({"kb2": {"last_finished_at": 9}}), &fallback, &[2]);
+        let rows = libraries(
+            &groups,
+            &json!({"kb2": {"last_finished_at": 9}}),
+            &fallback,
+            &[2],
+        );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["downloaded"], 2);
         assert_eq!(rows[0]["failed"], 1);
@@ -312,6 +411,9 @@ mod tests {
         assert!(health_url("").is_none());
         assert!(health_url("file:///tmp/x").is_none());
         assert!(health_url("https://user@arm.example/pull").is_none());
-        assert_eq!(health_url("https://arm.example/pull"), Some("https://arm.example/pull"));
+        assert_eq!(
+            health_url("https://arm.example/pull"),
+            Some("https://arm.example/pull")
+        );
     }
 }

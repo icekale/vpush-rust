@@ -40,13 +40,18 @@ pub fn spawn(db: Db) {
 
 async fn poll(db: &Db) -> Result<(), String> {
     let kols = db.kols_to_fetch("truth").await.map_err(|e| e.to_string())?;
-    let Some((id, name, _)) = kols.into_iter().find(|(_, _, external_id)| is_trump(external_id)) else {
+    let Some((id, name, _)) = kols
+        .into_iter()
+        .find(|(_, _, external_id)| is_trump(external_id))
+    else {
         return Ok(());
     };
     let exit = crate::proxy_admin::acquire(db, "truth").await?;
     let proxy = exit.as_ref().map(|item| item.url.clone());
     let proxy_id = exit.map(|item| item.id);
-    let fetched = tokio::task::spawn_blocking(move || fetch_head(proxy.as_deref())).await.map_err(|e| e.to_string())?;
+    let fetched = tokio::task::spawn_blocking(move || fetch_head(proxy.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?;
     let raw = match fetched {
         Ok(raw) => {
             crate::proxy_admin::note(db, proxy_id, true, "").await;
@@ -59,55 +64,91 @@ async fn poll(db: &Db) -> Result<(), String> {
     };
     let entries = parse_archive_head(&raw)?;
     let last = db.max_external_num(id).await.map_err(|e| e.to_string())?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     for entry in entries {
         if entry.id_num <= last {
             continue;
         }
-        let Some(unix) = entry.published_unix else { continue };
+        let Some(unix) = entry.published_unix else {
+            continue;
+        };
         let age = now.saturating_sub(unix);
         if age > 36 * 3600 {
             continue;
         }
-        if db.has_post("truth", &entry.external_id).await.map_err(|e| e.to_string())? {
+        if db
+            .has_post("truth", &entry.external_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             continue;
         }
         let images = serde_json::to_string(&entry.images).unwrap_or_else(|_| "[]".into());
-        db.save_fetched(id, &entry.external_id, &entry.title, &entry.content, "post", &images, &entry.url, &entry.published_at)
-            .await
-            .map_err(|e| e.to_string())?;
-        if age > 60 * 60 || !db.should_push(id, "post").await.map_err(|e| e.to_string())? {
+        db.save_fetched(
+            id,
+            &entry.external_id,
+            &entry.title,
+            &entry.content,
+            "post",
+            &images,
+            &entry.url,
+            &entry.published_at,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if age > 60 * 60
+            || !db
+                .should_push(id, "post")
+                .await
+                .map_err(|e| e.to_string())?
+        {
             continue;
         }
-        crate::push::deliver(db, id, &crate::feishu::Note {
-            kol_name: &name,
-            platform: "truth",
-            post_type: "post",
-            title: &entry.title,
-            content: &entry.content,
-            url: &entry.url,
-            published_at: &entry.published_at,
-        }).await;
+        crate::push::deliver(
+            db,
+            id,
+            &crate::feishu::Note {
+                kol_name: &name,
+                platform: "truth",
+                post_type: "post",
+                title: &entry.title,
+                content: &entry.content,
+                url: &entry.url,
+                published_at: &entry.published_at,
+            },
+        )
+        .await;
     }
     Ok(())
 }
 
 fn is_trump(external_id: &str) -> bool {
-    let id = external_id.trim().trim_start_matches('@').to_ascii_lowercase();
+    let id = external_id
+        .trim()
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
     id.is_empty() || id == TRUMP
 }
 
 fn fetch_head(proxy: Option<&str>) -> Result<String, String> {
-    let agent = crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(30))?;
+    let agent =
+        crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(30))?;
     let response = agent
         .get(ARCHIVE)
         .set("Accept-Encoding", "identity")
         .set("Range", "bytes=0-524287")
         .call();
     match response {
-        Ok(resp) if resp.status() == 200 || resp.status() == 206 => resp.into_string().map_err(|e| e.to_string()),
+        Ok(resp) if resp.status() == 200 || resp.status() == 206 => {
+            resp.into_string().map_err(|e| e.to_string())
+        }
         Ok(resp) => Err(format!("Truth 存档 HTTP {}", resp.status())),
-        Err(ureq::Error::Status(code, resp)) if code == 200 || code == 206 => resp.into_string().map_err(|e| e.to_string()),
+        Err(ureq::Error::Status(code, resp)) if code == 200 || code == 206 => {
+            resp.into_string().map_err(|e| e.to_string())
+        }
         Err(ureq::Error::Status(code, _)) => Err(format!("Truth 存档 HTTP {code}")),
         Err(err) => Err(err.to_string()),
     }
@@ -119,7 +160,8 @@ fn parse_archive_head(raw: &str) -> Result<Vec<Entry>, String> {
         return Err("存档窗口内没有完整条目".into());
     }
     let text = format!("{}]", &raw[..=cut]);
-    let rows: Vec<Value> = serde_json::from_str(&text).map_err(|_| "存档头部不是完整 JSON".to_string())?;
+    let rows: Vec<Value> =
+        serde_json::from_str(&text).map_err(|_| "存档头部不是完整 JSON".to_string())?;
     Ok(rows.into_iter().filter_map(entry_from).collect())
 }
 
@@ -142,18 +184,48 @@ fn entry_from(row: Value) -> Option<Entry> {
         format!("https://truthsocial.com/@realDonaldTrump/{external_id}")
     };
     let (published_at, published_unix) = published(&field(&row, "created_at"));
-    let title = content.lines().next().unwrap_or("").chars().take(80).collect::<String>();
-    let title = if title.is_empty() { "图片".into() } else { title };
-    Some(Entry { external_id, id_num, title, content: if content.is_empty() { "图片".into() } else { content }, url, images, published_at, published_unix })
+    let title = content
+        .lines()
+        .next()
+        .unwrap_or("")
+        .chars()
+        .take(80)
+        .collect::<String>();
+    let title = if title.is_empty() {
+        "图片".into()
+    } else {
+        title
+    };
+    Some(Entry {
+        external_id,
+        id_num,
+        title,
+        content: if content.is_empty() {
+            "图片".into()
+        } else {
+            content
+        },
+        url,
+        images,
+        published_at,
+        published_unix,
+    })
 }
 
 fn images(row: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(media) = row.get("media").and_then(Value::as_array) else { return out };
+    let Some(media) = row.get("media").and_then(Value::as_array) else {
+        return out;
+    };
     for item in media {
         let url = item.as_str().unwrap_or("").trim();
         let path = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
-        if url.starts_with("https://") && [".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"].iter().any(|ext| path.ends_with(ext)) && out.len() < 4 {
+        if url.starts_with("https://")
+            && [".jpg", ".jpeg", ".png", ".webp", ".gif", ".mp4"]
+                .iter()
+                .any(|ext| path.ends_with(ext))
+            && out.len() < 4
+        {
             out.push(url.to_string());
         }
     }
@@ -178,7 +250,11 @@ fn published(raw: &str) -> (String, Option<i64>) {
         let days = beijing.div_euclid(86400);
         let sod = beijing.rem_euclid(86400);
         let (y, m, d) = civil_from_days(days);
-        let text = format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", sod / 3600, (sod % 3600) / 60);
+        let text = format!(
+            "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+            sod / 3600,
+            (sod % 3600) / 60
+        );
         Some((text, unix))
     })();
     match parsed {
@@ -192,14 +268,20 @@ fn offset_secs(raw: &str) -> i64 {
         return 0;
     }
     let bytes = raw.as_bytes();
-    let Some(pos) = bytes.iter().rposition(|b| *b == b'+' || *b == b'-') else { return 0 };
+    let Some(pos) = bytes.iter().rposition(|b| *b == b'+' || *b == b'-') else {
+        return 0;
+    };
     if pos < 19 {
         return 0;
     }
     let sign = if bytes[pos] == b'-' { -1 } else { 1 };
     let rest = &raw[pos + 1..];
     let hour: i64 = rest.get(0..2).and_then(|s| s.parse().ok()).unwrap_or(0);
-    let minute: i64 = rest.get(3..5).or_else(|| rest.get(2..4)).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let minute: i64 = rest
+        .get(3..5)
+        .or_else(|| rest.get(2..4))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
     sign * (hour * 3600 + minute * 60)
 }
 
@@ -208,14 +290,25 @@ fn strip(input: &str) -> String {
     let mut rest = input;
     while let Some(start) = rest.find('<') {
         out.push_str(&rest[..start]);
-        let end = rest[start..].find('>').map(|n| start + n).unwrap_or(rest.len() - 1);
+        let end = rest[start..]
+            .find('>')
+            .map(|n| start + n)
+            .unwrap_or(rest.len() - 1);
         if rest[start..=end].to_ascii_lowercase().starts_with("</p") {
             out.push('\n');
         }
-        rest = if end + 1 < rest.len() { &rest[end + 1..] } else { "" };
+        rest = if end + 1 < rest.len() {
+            &rest[end + 1..]
+        } else {
+            ""
+        };
     }
     out.push_str(rest);
-    out.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").trim().to_string()
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .trim()
+        .to_string()
 }
 
 fn field(value: &Value, key: &str) -> String {
@@ -282,26 +375,42 @@ where
             Err(_) => continue,
         };
         let translated = translated.trim().to_string();
-        if translated.is_empty() || collapsed(&translated, &content) || translated == content.trim() {
+        if translated.is_empty() || collapsed(&translated, &content) || translated == content.trim()
+        {
             store_translation(db, id, &title, &content, &title, &content).await?;
             continue;
         }
-        let title_zh: String = translated.lines().next().unwrap_or("").chars().take(80).collect();
+        let title_zh: String = translated
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(80)
+            .collect();
         store_translation(db, id, &title_zh, &translated, &title, &content).await?;
         done += 1;
     }
     Ok(done)
 }
 
-async fn store_translation(db: &Db, id: i64, title: &str, content: &str, title_src: &str, content_src: &str) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE posts SET title = ?, content = ?, title_src = ?, content_src = ? WHERE id = ?")
-        .bind(title)
-        .bind(content)
-        .bind(title_src)
-        .bind(content_src)
-        .bind(id)
-        .execute(db.pool())
-        .await?;
+async fn store_translation(
+    db: &Db,
+    id: i64,
+    title: &str,
+    content: &str,
+    title_src: &str,
+    content_src: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE posts SET title = ?, content = ?, title_src = ?, content_src = ? WHERE id = ?",
+    )
+    .bind(title)
+    .bind(content)
+    .bind(title_src)
+    .bind(content_src)
+    .bind(id)
+    .execute(db.pool())
+    .await?;
     Ok(())
 }
 
@@ -318,11 +427,17 @@ fn backfill_candidate(text: &str) -> bool {
 }
 
 fn already_chinese(text: &str) -> bool {
-    let cjk = text.chars().filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch)).count();
+    let cjk = text
+        .chars()
+        .filter(|ch| ('\u{4e00}'..='\u{9fff}').contains(ch))
+        .count();
     if cjk < 4 {
         return false;
     }
-    let foreign = strip_links(text).chars().filter(|ch| ch.is_ascii_alphabetic()).count();
+    let foreign = strip_links(text)
+        .chars()
+        .filter(|ch| ch.is_ascii_alphabetic())
+        .count();
     cjk * 4 >= foreign * 3
 }
 
@@ -356,7 +471,10 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content, "你好\n世界");
         assert_eq!(entries[0].published_at, "2026-09-26 12:30");
-        assert_eq!(entries[0].images, vec!["https://cdn.example/a.jpg".to_string()]);
+        assert_eq!(
+            entries[0].images,
+            vec!["https://cdn.example/a.jpg".to_string()]
+        );
         assert!(is_trump("realDonaldTrump"));
         assert!(!is_trump("someone"));
     }
@@ -366,7 +484,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-truth-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         sqlx::query(
@@ -384,25 +505,51 @@ mod tests {
         let mut calls = 0;
         let done = backfill(&db, 2, |text| {
             calls += 1;
-            async move { Ok(format!("中文：{}", text.chars().take(10).collect::<String>())) }
+            async move {
+                Ok(format!(
+                    "中文：{}",
+                    text.chars().take(10).collect::<String>()
+                ))
+            }
         })
         .await
         .unwrap();
         assert_eq!(done, 2);
         assert_eq!(calls, 2);
-        let translated: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE content LIKE '中文：%'").fetch_one(db.pool()).await.unwrap();
+        let translated: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE content LIKE '中文：%'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert_eq!(translated, 2);
-        let marked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts WHERE external_id IN ('link', 'zh') AND content_src != ''").fetch_one(db.pool()).await.unwrap();
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM posts WHERE external_id IN ('link', 'zh') AND content_src != ''",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(marked, 2);
-        let old: String = sqlx::query_scalar("SELECT content_src FROM posts WHERE external_id = 'old'").fetch_one(db.pool()).await.unwrap();
+        let old: String =
+            sqlx::query_scalar("SELECT content_src FROM posts WHERE external_id = 'old'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert!(old.is_empty());
         let again = backfill(&db, 3, |text| async move {
-            if text.contains("three") { Ok(text) } else { Ok("中文新译文".into()) }
+            if text.contains("three") {
+                Ok(text)
+            } else {
+                Ok("中文新译文".into())
+            }
         })
         .await
         .unwrap();
         assert_eq!(again, 1);
-        let same: String = sqlx::query_scalar("SELECT content_src FROM posts WHERE external_id = 'c'").fetch_one(db.pool()).await.unwrap();
+        let same: String =
+            sqlx::query_scalar("SELECT content_src FROM posts WHERE external_id = 'c'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
         assert!(same.starts_with("This is"));
         let _ = std::fs::remove_file(&path);
     }

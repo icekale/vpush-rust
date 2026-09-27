@@ -43,6 +43,7 @@ pub fn normalize_format(value: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn runtime(
     base: Option<&str>,
     key: Option<&str>,
@@ -64,7 +65,13 @@ pub fn runtime(
     }
     let model = model.unwrap_or(saved_model).trim().to_string();
     let format = normalize_format(format.unwrap_or(saved_format));
-    Ok(Config { base, key, model, format, user_supplied: !is_admin })
+    Ok(Config {
+        base,
+        key,
+        model,
+        format,
+        user_supplied: !is_admin,
+    })
 }
 
 pub fn prepare(
@@ -74,7 +81,11 @@ pub fn prepare(
     body: Option<Vec<u8>>,
     resolve: impl Fn(&str) -> Vec<IpAddr>,
 ) -> Result<Exchange, LlmError> {
-    let url = format!("{}/{}", cfg.base.trim_end_matches('/'), suffix.trim_start_matches('/'));
+    let url = format!(
+        "{}/{}",
+        cfg.base.trim_end_matches('/'),
+        suffix.trim_start_matches('/')
+    );
     let parts = parse_base(&url)?;
     if cfg.user_supplied {
         let pin = if let Ok(ip) = parts.host.parse::<IpAddr>() {
@@ -90,9 +101,21 @@ pub fn prepare(
             ips.sort_by_key(|ip| ip.to_string());
             Some(ips[0])
         };
-        Ok(Exchange { method, url, host: parts.host, pin, body })
+        Ok(Exchange {
+            method,
+            url,
+            host: parts.host,
+            pin,
+            body,
+        })
     } else {
-        Ok(Exchange { method, url, host: parts.host, pin: None, body })
+        Ok(Exchange {
+            method,
+            url,
+            host: parts.host,
+            pin: None,
+            body,
+        })
     }
 }
 
@@ -110,7 +133,11 @@ pub fn models_from(reply: &Reply) -> Result<Vec<String>, LlmError> {
         let item = if let Some(text) = row.as_str() {
             text.trim().to_string()
         } else {
-            row.get("id").and_then(Value::as_str).unwrap_or("").trim().to_string()
+            row.get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string()
         };
         if !item.is_empty() {
             seen.insert(item);
@@ -120,7 +147,11 @@ pub fn models_from(reply: &Reply) -> Result<Vec<String>, LlmError> {
 }
 
 pub fn probe_body(cfg: &Config) -> Vec<u8> {
-    let model = if cfg.model.is_empty() { "gpt-4o-mini" } else { cfg.model.as_str() };
+    let model = if cfg.model.is_empty() {
+        "gpt-4o-mini"
+    } else {
+        cfg.model.as_str()
+    };
     let payload = if cfg.format == "responses" {
         json!({
             "model": model,
@@ -140,25 +171,41 @@ pub fn probe_body(cfg: &Config) -> Vec<u8> {
 }
 
 pub async fn complete(cfg: &Config, prompt: &str) -> Result<String, String> {
-    let model = if cfg.model.is_empty() { "gpt-4o-mini" } else { cfg.model.as_str() };
+    let model = if cfg.model.is_empty() {
+        "gpt-4o-mini"
+    } else {
+        cfg.model.as_str()
+    };
     let payload = if cfg.format == "responses" {
         json!({"model": model, "input": [{"role": "user", "content": prompt}], "temperature": 0})
     } else {
         json!({"model": model, "messages": [{"role": "user", "content": prompt}], "temperature": 0})
     };
     let body = serde_json::to_vec(&payload).map_err(|_| "请求失败".to_string())?;
-    let exchange = prepare(cfg, probe_suffix(cfg), "POST", Some(body), resolve_host).map_err(|_| "LLM 地址不可用".to_string())?;
-    let reply = send(&exchange, &cfg.key).await.map_err(|_| "LLM 无响应".to_string())?;
+    let exchange = prepare(cfg, probe_suffix(cfg), "POST", Some(body), resolve_host)
+        .map_err(|_| "LLM 地址不可用".to_string())?;
+    let reply = send(&exchange, &cfg.key)
+        .await
+        .map_err(|_| "LLM 无响应".to_string())?;
     if !(200..300).contains(&reply.status) {
         return Err("LLM 无响应".into());
     }
-    let payload = serde_json::from_slice::<Value>(&reply.body).map_err(|_| "LLM 无响应".to_string())?;
+    let payload =
+        serde_json::from_slice::<Value>(&reply.body).map_err(|_| "LLM 无响应".to_string())?;
     let text = completion_text(&payload, &cfg.format);
-    if text.trim().is_empty() { Err("LLM 无响应".into()) } else { Ok(text) }
+    if text.trim().is_empty() {
+        Err("LLM 无响应".into())
+    } else {
+        Ok(text)
+    }
 }
 
 pub fn probe_suffix(cfg: &Config) -> &'static str {
-    if cfg.format == "responses" { "responses" } else { "chat/completions" }
+    if cfg.format == "responses" {
+        "responses"
+    } else {
+        "chat/completions"
+    }
 }
 
 pub fn probe_result(reply: &Reply, cfg: &Config, latency_ms: u128) -> Value {
@@ -201,12 +248,18 @@ pub async fn send(exchange: &Exchange, key: &str) -> Result<Reply, LlmError> {
         builder = builder.resolve(&exchange.host, SocketAddr::new(ip, 0));
     }
     let client = builder.build().map_err(|_| LlmError::Failed)?;
-    let method = if exchange.method == "POST" { wreq::Method::POST } else { wreq::Method::GET };
+    let method = if exchange.method == "POST" {
+        wreq::Method::POST
+    } else {
+        wreq::Method::GET
+    };
     let mut request = client
         .request(method, &exchange.url)
         .header("Authorization", format!("Bearer {key}"));
     if let Some(body) = &exchange.body {
-        request = request.header("Content-Type", "application/json").body(body.clone());
+        request = request
+            .header("Content-Type", "application/json")
+            .body(body.clone());
     }
     let mut response = request.send().await.map_err(|_| LlmError::Failed)?;
     let status = response.status().as_u16();
@@ -242,7 +295,10 @@ fn parse_base(url: &str) -> Result<Parts, LlmError> {
         return Err(bad);
     }
     let lower = url.to_ascii_lowercase();
-    let rest = if let Some(rest) = lower.strip_prefix("https://").and_then(|_| Some(&url["https://".len()..])) {
+    let rest = if let Some(rest) = lower
+        .strip_prefix("https://")
+        .map(|_| &url["https://".len()..])
+    {
         rest
     } else if lower.starts_with("http://") {
         &url["http://".len()..]
@@ -252,7 +308,10 @@ fn parse_base(url: &str) -> Result<Parts, LlmError> {
     if rest.contains('@') || rest.is_empty() {
         return Err(bad);
     }
-    let authority = rest.split_once(['/', '?', '#']).map(|(host, _)| host).unwrap_or(rest);
+    let authority = rest
+        .split_once(['/', '?', '#'])
+        .map(|(host, _)| host)
+        .unwrap_or(rest);
     let host = if let Some(rest) = authority.strip_prefix('[') {
         let Some((host, _)) = rest.split_once(']') else {
             return Err(bad);
@@ -273,15 +332,28 @@ fn parse_base(url: &str) -> Result<Parts, LlmError> {
 
 fn completion_text(payload: &Value, format: &str) -> String {
     if format == "responses" {
-        let direct = payload.get("output_text").and_then(Value::as_str).unwrap_or("").trim();
+        let direct = payload
+            .get("output_text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
         if !direct.is_empty() {
             return direct.to_string();
         }
-        for item in payload.get("output").and_then(Value::as_array).into_iter().flatten() {
+        for item in payload
+            .get("output")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
             let content = item.get("content");
             if let Some(blocks) = content.and_then(Value::as_array) {
                 for block in blocks {
-                    let text = block.get("text").and_then(Value::as_str).unwrap_or("").trim();
+                    let text = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim();
                     if !text.is_empty() {
                         return text.to_string();
                     }
@@ -305,7 +377,11 @@ fn completion_text(payload: &Value, format: &str) -> String {
                 if let Some(text) = block.as_str() {
                     text.to_string()
                 } else {
-                    block.get("text").and_then(Value::as_str).unwrap_or("").to_string()
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string()
                 }
             })
             .collect::<String>()
@@ -316,7 +392,12 @@ fn completion_text(payload: &Value, format: &str) -> String {
     if !text.is_empty() {
         return text.to_string();
     }
-    message.get("reasoning_content").and_then(Value::as_str).unwrap_or("").trim().to_string()
+    message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 fn usage_total(payload: &Value) -> Option<i64> {
@@ -326,10 +407,22 @@ fn usage_total(payload: &Value) -> Option<i64> {
             return Some(value);
         }
     }
-    let input = usage.get("input_tokens").or_else(|| usage.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0);
-    let output = usage.get("output_tokens").or_else(|| usage.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0);
+    let input = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let output = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
     let total = input + output;
-    if total == 0 { None } else { Some(total) }
+    if total == 0 {
+        None
+    } else {
+        Some(total)
+    }
 }
 
 #[cfg(test)]
@@ -349,37 +442,89 @@ mod tests {
 
     #[test]
     fn users_cannot_point_llm_at_a_private_host() {
-        let err = prepare(&cfg("http://127.0.0.1:11434/v1", false), "models", "GET", None, |_| vec![]).unwrap_err();
+        let err = prepare(
+            &cfg("http://127.0.0.1:11434/v1", false),
+            "models",
+            "GET",
+            None,
+            |_| vec![],
+        )
+        .unwrap_err();
         assert!(matches!(err, LlmError::Bad("LLM 地址须为 http(s) URL")));
-        assert!(prepare(&cfg("https://user:pass@api.openai.com/v1", false), "models", "GET", None, |_| vec![]).is_err());
-        assert!(prepare(&cfg("https://evil.example/v1", false), "models", "GET", None, |_| {
-            vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]
-        }).is_err());
-        let exchange = prepare(&cfg("https://api.openai.com/v1", false), "models", "GET", None, |_| {
-            vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]
-        }).unwrap();
+        assert!(prepare(
+            &cfg("https://user:pass@api.openai.com/v1", false),
+            "models",
+            "GET",
+            None,
+            |_| vec![]
+        )
+        .is_err());
+        assert!(prepare(
+            &cfg("https://evil.example/v1", false),
+            "models",
+            "GET",
+            None,
+            |_| { vec![IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))] }
+        )
+        .is_err());
+        let exchange = prepare(
+            &cfg("https://api.openai.com/v1", false),
+            "models",
+            "GET",
+            None,
+            |_| vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))],
+        )
+        .unwrap();
         assert_eq!(exchange.url, "https://api.openai.com/v1/models");
         assert_eq!(exchange.host, "api.openai.com");
-        assert_eq!(exchange.pin, Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
-        let admin = prepare(&cfg("http://127.0.0.1:11434/v1", true), "models", "GET", None, |_| panic!("admin does not resolve")).unwrap();
+        assert_eq!(
+            exchange.pin,
+            Some(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34)))
+        );
+        let admin = prepare(
+            &cfg("http://127.0.0.1:11434/v1", true),
+            "models",
+            "GET",
+            None,
+            |_| panic!("admin does not resolve"),
+        )
+        .unwrap();
         assert!(admin.pin.is_none());
         assert_eq!(admin.url, "http://127.0.0.1:11434/v1/models");
     }
 
     #[test]
     fn lists_ids_and_reads_probe_usage() {
-        assert!(matches!(runtime(Some(""), Some(""), "", "", None, "", None, "", false), Err(LlmError::Bad("请先填写 API 地址和 Key"))));
-        let cfg = runtime(Some("https://api.openai.com/v1"), Some("sk-……cret"), "https://saved", "sk-saved", Some("gpt-test"), "", Some("openai-responses"), "", false).unwrap();
+        assert!(matches!(
+            runtime(Some(""), Some(""), "", "", None, "", None, "", false),
+            Err(LlmError::Bad("请先填写 API 地址和 Key"))
+        ));
+        let cfg = runtime(
+            Some("https://api.openai.com/v1"),
+            Some("sk-……cret"),
+            "https://saved",
+            "sk-saved",
+            Some("gpt-test"),
+            "",
+            Some("openai-responses"),
+            "",
+            false,
+        )
+        .unwrap();
         assert_eq!(cfg.key, "sk-saved");
         assert_eq!(cfg.format, "responses");
         let reply = Reply {
             status: 200,
             body: br#"{"data":[{"id":"gpt-4o"},{"id":"gpt-4o"},"gpt-4o-mini"]}"#.to_vec(),
         };
-        assert_eq!(models_from(&reply).unwrap(), vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]);
+        assert_eq!(
+            models_from(&reply).unwrap(),
+            vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()]
+        );
         let probe = Reply {
             status: 200,
-            body: br#"{"output_text":"PONG","usage":{"input_tokens":4,"output_tokens":5}}"#.to_vec(),
+            body: br#"{"output_text":"PONG","usage":{"input_tokens":4,"output_tokens":5}}"#
+                .to_vec(),
         };
         let result = probe_result(&probe, &cfg, 12);
         assert_eq!(result["ok"], true);
@@ -397,23 +542,43 @@ mod tests {
             let mut request = Vec::new();
             let mut buf = [0u8; 1024];
             while !request.windows(4).any(|item| item == b"\r\n\r\n") {
-                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf).await.unwrap();
+                let n = tokio::io::AsyncReadExt::read(&mut sock, &mut buf)
+                    .await
+                    .unwrap();
                 if n == 0 {
                     break;
                 }
                 request.extend_from_slice(&buf[..n]);
             }
             let request = String::from_utf8_lossy(&request);
-            assert!(request.to_ascii_lowercase().contains("authorization: bearer sk-local"), "{request}");
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer sk-local"),
+                "{request}"
+            );
             let body = br#"{"data":[{"id":"local-model"}]}"#;
-            let header = format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len());
-            tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes()).await.unwrap();
-            tokio::io::AsyncWriteExt::write_all(&mut sock, body).await.unwrap();
+            let header = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            tokio::io::AsyncWriteExt::write_all(&mut sock, header.as_bytes())
+                .await
+                .unwrap();
+            tokio::io::AsyncWriteExt::write_all(&mut sock, body)
+                .await
+                .unwrap();
         });
         let cfg = cfg(&format!("http://127.0.0.1:{port}/v1"), true);
-        let exchange = prepare(&cfg, "models", "GET", None, |_| panic!("admin does not resolve")).unwrap();
+        let exchange = prepare(&cfg, "models", "GET", None, |_| {
+            panic!("admin does not resolve")
+        })
+        .unwrap();
         let reply = send(&exchange, "sk-local").await.unwrap();
-        assert_eq!(models_from(&reply).unwrap(), vec!["local-model".to_string()]);
+        assert_eq!(
+            models_from(&reply).unwrap(),
+            vec!["local-model".to_string()]
+        );
         server.await.unwrap();
     }
 }

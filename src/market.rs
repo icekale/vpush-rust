@@ -76,7 +76,11 @@ enum Start {
 
 pub async fn snapshot(group: &str) -> Value {
     let now = now_unix();
-    let group = if group == "auto" { default_group(now) } else { group };
+    let group = if group == "auto" {
+        default_group(now)
+    } else {
+        group
+    };
     let (start, previous) = begin(group);
     match start {
         Start::Cold => {
@@ -122,7 +126,10 @@ fn begin(group: &str) -> (Start, Vec<Item>) {
         Start::Idle
     } else if slot.at.is_none() {
         Start::Cold
-    } else if slot.at.is_some_and(|at| at.elapsed() >= Duration::from_secs(30)) {
+    } else if slot
+        .at
+        .is_some_and(|at| at.elapsed() >= Duration::from_secs(30))
+    {
         Start::Warm
     } else {
         Start::Idle
@@ -161,7 +168,10 @@ fn mark_stale(group: &str) {
 
 fn current(group: &str) -> Vec<Item> {
     let slots = slots().lock().unwrap_or_else(|err| err.into_inner());
-    slots.get(group).map(|slot| slot.items.clone()).unwrap_or_else(|| placeholders(group))
+    slots
+        .get(group)
+        .map(|slot| slot.items.clone())
+        .unwrap_or_else(|| placeholders(group))
 }
 
 fn slots() -> &'static Mutex<HashMap<String, Slot>> {
@@ -191,7 +201,11 @@ fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
     let names = symbols(group);
     let url = format!(
         "{QUOTE_URL}{}",
-        names.iter().map(|(symbol, _)| *symbol).collect::<Vec<_>>().join(",")
+        names
+            .iter()
+            .map(|(symbol, _)| *symbol)
+            .collect::<Vec<_>>()
+            .join(",")
     );
     let fresh = http_text(&url).and_then(|text| parse_quotes(&text, group).ok());
     let mut items = Vec::new();
@@ -202,7 +216,10 @@ fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
             .cloned()
             .unwrap_or_else(|| placeholder(symbol, name));
         item.name = (*name).to_string();
-        if let Some(quote) = fresh.as_ref().and_then(|rows| rows.iter().find(|row| row.symbol == *symbol)) {
+        if let Some(quote) = fresh
+            .as_ref()
+            .and_then(|rows| rows.iter().find(|row| row.symbol == *symbol))
+        {
             item.price = Some(quote.price);
             item.previous_close = Some(quote.previous_close);
             item.change = Some(quote.change);
@@ -217,26 +234,46 @@ fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
     let Some(fresh) = fresh else {
         return items;
     };
-    let symbols = fresh.iter().map(|row| row.symbol.clone()).collect::<Vec<_>>();
+    let symbols = fresh
+        .iter()
+        .map(|row| row.symbol.clone())
+        .collect::<Vec<_>>();
     let intradays = std::thread::scope(|scope| {
         let mut jobs = Vec::new();
         for symbol in &symbols {
             jobs.push(scope.spawn(|| {
-                let payload = http_text(&minute_url(symbol)).and_then(|text| serde_json::from_str(&text).ok());
-                (symbol.clone(), payload.and_then(|value| parse_intraday(&value, symbol)))
+                let payload = http_text(&minute_url(symbol))
+                    .and_then(|text| serde_json::from_str(&text).ok());
+                (
+                    symbol.clone(),
+                    payload.and_then(|value| parse_intraday(&value, symbol)),
+                )
             }));
         }
-        jobs.into_iter().map(|job| job.join().unwrap_or_else(|_| (String::new(), None))).collect::<Vec<_>>()
+        jobs.into_iter()
+            .map(|job| job.join().unwrap_or_else(|_| (String::new(), None)))
+            .collect::<Vec<_>>()
     });
     for (symbol, intraday) in intradays {
         let Some(item) = items.iter_mut().find(|item| item.symbol == symbol) else {
             continue;
         };
-        let quote_date = item.quoted_at.as_deref().unwrap_or("").get(..10).unwrap_or("");
-        let valid = intraday.as_ref().is_some_and(|series| series.date == quote_date);
+        let quote_date = item
+            .quoted_at
+            .as_deref()
+            .unwrap_or("")
+            .get(..10)
+            .unwrap_or("");
+        let valid = intraday
+            .as_ref()
+            .is_some_and(|series| series.date == quote_date);
         if valid {
             item.intraday = intraday;
-        } else if item.intraday.as_ref().is_some_and(|series| series.date != quote_date) {
+        } else if item
+            .intraday
+            .as_ref()
+            .is_some_and(|series| series.date != quote_date)
+        {
             item.intraday = None;
         }
         item.intraday_stale = !valid;
@@ -260,8 +297,15 @@ fn placeholder(symbol: &str, name: &str) -> Item {
 }
 
 fn minute_url(symbol: &str) -> String {
-    let market = if symbol.starts_with("us") { "UsMinute" } else { "minute" };
-    format!("https://web.ifzq.gtimg.cn/appstock/app/{market}/query?code={}", minute_code(symbol))
+    let market = if symbol.starts_with("us") {
+        "UsMinute"
+    } else {
+        "minute"
+    };
+    format!(
+        "https://web.ifzq.gtimg.cn/appstock/app/{market}/query?code={}",
+        minute_code(symbol)
+    )
 }
 
 fn minute_code(symbol: &str) -> &'static str {
@@ -313,10 +357,18 @@ fn parse_quotes(text: &str, group: &str) -> Result<Vec<Quote>, ()> {
         if parts.len() < 33 || parts[2] != expected_code(symbol) {
             continue;
         }
-        let Some(price) = finite(parts[3]) else { continue };
-        let Some(previous) = finite(parts[4]) else { continue };
-        let Some(change) = finite(parts[31]) else { continue };
-        let Some(percent) = finite(parts[32]) else { continue };
+        let Some(price) = finite(parts[3]) else {
+            continue;
+        };
+        let Some(previous) = finite(parts[4]) else {
+            continue;
+        };
+        let Some(change) = finite(parts[31]) else {
+            continue;
+        };
+        let Some(percent) = finite(parts[32]) else {
+            continue;
+        };
         if price.min(previous) <= 0.0 {
             continue;
         }
@@ -332,7 +384,11 @@ fn parse_quotes(text: &str, group: &str) -> Result<Vec<Quote>, ()> {
             quoted_at,
         });
     }
-    if items.is_empty() { Err(()) } else { Ok(items) }
+    if items.is_empty() {
+        Err(())
+    } else {
+        Ok(items)
+    }
 }
 
 fn quote_records(text: &str) -> HashMap<&str, &str> {
@@ -368,7 +424,11 @@ fn exchange_time(symbol: &str, raw: &str) -> Option<String> {
     } else {
         parse_compact(raw)?
     };
-    let offset = if symbol.starts_with("us") { ny_offset_wall(&civil) } else { 8 * 60 };
+    let offset = if symbol.starts_with("us") {
+        ny_offset_wall(&civil)
+    } else {
+        8 * 60
+    };
     Some(format_iso(&civil, offset))
 }
 
@@ -424,10 +484,16 @@ fn parse_intraday(payload: &Value, symbol: &str) -> Option<Intraday> {
         if clock.len() != 4 || !clock.bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        let Ok(hour) = clock[0..2].parse::<i64>() else { continue };
-        let Ok(minute_part) = clock[2..4].parse::<i64>() else { continue };
+        let Ok(hour) = clock[0..2].parse::<i64>() else {
+            continue;
+        };
+        let Ok(minute_part) = clock[2..4].parse::<i64>() else {
+            continue;
+        };
         let minute = hour * 60 + minute_part;
-        let Some(price) = finite(fields[1]) else { continue };
+        let Some(price) = finite(fields[1]) else {
+            continue;
+        };
         if price <= 0.0 || !(570..=end).contains(&minute) {
             continue;
         }
@@ -436,15 +502,33 @@ fn parse_intraday(payload: &Value, symbol: &str) -> Option<Intraday> {
         }
         let offset = minute - 570 - if !us && minute >= 780 { 780 - lunch } else { 0 };
         let time = format!("{:02}:{:02}", hour, minute_part);
-        by_time.insert(time.clone(), Point { time, minute: offset, price });
+        by_time.insert(
+            time.clone(),
+            Point {
+                time,
+                minute: offset,
+                price,
+            },
+        );
     }
     let mut points = by_time.into_values().collect::<Vec<_>>();
     points.sort_by(|a, b| a.time.cmp(&b.time));
-    if points.is_empty() { None } else { Some(Intraday { date, duration, points }) }
+    if points.is_empty() {
+        None
+    } else {
+        Some(Intraday {
+            date,
+            duration,
+            points,
+        })
+    }
 }
 
 fn render(group: &str, items: &[Item], now: i64) -> Value {
-    let rows = items.iter().map(|item| item_json(item, now)).collect::<Vec<_>>();
+    let rows = items
+        .iter()
+        .map(|item| item_json(item, now))
+        .collect::<Vec<_>>();
     json!({
         "group": group,
         "items": rows,
@@ -458,8 +542,15 @@ fn item_json(item: &Item, now: i64) -> Value {
     if status == "trading" {
         if let (Some(quoted), Some(series)) = (&item.quoted_at, &item.intraday) {
             if let Some(last) = series.points.last() {
-                let point = format!("{}T{}:00{}", series.date, last.time, quoted.get(19..).unwrap_or("+08:00"));
-                if let (Some(quoted_at), Some(last_at)) = (parse_iso_unix(quoted), parse_iso_unix(&point)) {
+                let point = format!(
+                    "{}T{}:00{}",
+                    series.date,
+                    last.time,
+                    quoted.get(19..).unwrap_or("+08:00")
+                );
+                if let (Some(quoted_at), Some(last_at)) =
+                    (parse_iso_unix(quoted), parse_iso_unix(&point))
+                {
                     lagging = quoted_at - last_at > 180;
                 }
             }
@@ -491,7 +582,10 @@ fn item_json(item: &Item, now: i64) -> Value {
             }),
         );
     }
-    row.insert("intraday_stale".into(), json!(item.intraday_stale || item.stale || lagging));
+    row.insert(
+        "intraday_stale".into(),
+        json!(item.intraday_stale || item.stale || lagging),
+    );
     Value::Object(row)
 }
 
@@ -499,7 +593,11 @@ fn quote_status(symbol: &str, quoted_at: Option<&str>, now: i64) -> &'static str
     let us = symbol.starts_with("us");
     let local = if us { to_ny(now) } else { to_cn(now) };
     let minute = local.hour * 60 + local.minute;
-    let end = if symbol.starts_with("hk") || us { 960 } else { 900 };
+    let end = if symbol.starts_with("hk") || us {
+        960
+    } else {
+        900
+    };
     let lunch = if symbol.starts_with("hk") { 720 } else { 690 };
     if us && is_us_holiday(local.year, local.month, local.day) {
         return "holiday";
@@ -514,16 +612,28 @@ fn quote_status(symbol: &str, quoted_at: Option<&str>, now: i64) -> &'static str
         return "unavailable";
     };
     let age = now - quoted;
-    if (0..=180).contains(&age) { "trading" } else { "delayed" }
+    if (0..=180).contains(&age) {
+        "trading"
+    } else {
+        "delayed"
+    }
 }
 
 fn default_group(now: i64) -> &'static str {
     let hour = to_cn(now).hour;
-    if (8..20).contains(&hour) { "day" } else { "night" }
+    if (8..20).contains(&hour) {
+        "day"
+    } else {
+        "night"
+    }
 }
 
 fn symbols(group: &str) -> &'static [(&'static str, &'static str)] {
-    if group == "night" { NIGHT } else { DAY }
+    if group == "night" {
+        NIGHT
+    } else {
+        DAY
+    }
 }
 
 fn is_us_holiday(year: i32, month: u32, day: u32) -> bool {
@@ -561,7 +671,11 @@ fn nth_date(year: i32, month: u32, weekday_wanted: u32, occurrence: u32) -> (i32
 }
 
 fn last_date(year: i32, month: u32, weekday_wanted: u32) -> (i32, u32, u32) {
-    let (next_year, next_month) = if month == 12 { (year + 1, 1) } else { (year, month + 1) };
+    let (next_year, next_month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
     let (year, month, day) = shift((next_year, next_month, 1), -1);
     let back = (weekday(year, month, day) + 7 - weekday_wanted) % 7;
     shift((year, month, day), -(back as i32))
@@ -598,7 +712,11 @@ fn to_cn(unix: i64) -> Civil {
 
 fn to_ny(unix: i64) -> Civil {
     let est = from_unix(unix - 5 * 3600);
-    let offset = if dst_from_est(&est) { -4 * 3600 } else { -5 * 3600 };
+    let offset = if dst_from_est(&est) {
+        -4 * 3600
+    } else {
+        -5 * 3600
+    };
     from_unix(unix + offset)
 }
 
@@ -613,7 +731,11 @@ fn ny_offset_wall(civil: &Civil) -> i32 {
     let start = nth_date(civil.year, 3, 6, 2).2;
     let end = nth_date(civil.year, 11, 6, 1).2;
     let key = wall_key(civil.month, civil.day, civil.hour, civil.minute);
-    if key >= wall_key(3, start, 2, 0) && key < wall_key(11, end, 2, 0) { -4 * 60 } else { -5 * 60 }
+    if key >= wall_key(3, start, 2, 0) && key < wall_key(11, end, 2, 0) {
+        -4 * 60
+    } else {
+        -5 * 60
+    }
 }
 
 fn wall_key(month: u32, day: u32, hour: u32, minute: u32) -> u32 {
@@ -624,7 +746,14 @@ fn from_unix(local: i64) -> Civil {
     let days = local.div_euclid(86400);
     let sod = local.rem_euclid(86400) as u32;
     let (year, month, day) = civil_from_days(days);
-    Civil { year, month, day, hour: sod / 3600, minute: (sod % 3600) / 60, second: sod % 60 }
+    Civil {
+        year,
+        month,
+        day,
+        hour: sod / 3600,
+        minute: (sod % 3600) / 60,
+        second: sod % 60,
+    }
 }
 
 fn format_iso(civil: &Civil, offset_min: i32) -> String {
@@ -632,7 +761,14 @@ fn format_iso(civil: &Civil, offset_min: i32) -> String {
     let abs = offset_min.abs();
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
-        civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second, abs / 60, abs % 60
+        civil.year,
+        civil.month,
+        civil.day,
+        civil.hour,
+        civil.minute,
+        civil.second,
+        abs / 60,
+        abs % 60
     )
 }
 
@@ -649,7 +785,11 @@ fn parse_iso_unix(text: &str) -> Option<i64> {
         second: text[17..19].parse().ok()?,
     };
     let offset = if text.len() >= 25 {
-        let sign = if text.as_bytes().get(19) == Some(&b'-') { -1 } else { 1 };
+        let sign = if text.as_bytes().get(19) == Some(&b'-') {
+            -1
+        } else {
+            1
+        };
         let hour: i64 = text[20..22].parse().ok()?;
         let minute: i64 = text[23..25].parse().ok()?;
         sign * (hour * 60 + minute) * 60
@@ -667,7 +807,10 @@ fn civil_unix(civil: &Civil) -> i64 {
 }
 
 fn now_unix() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn days_from_civil(mut year: i32, month: u32, day: u32) -> i64 {
@@ -706,12 +849,20 @@ mod tests {
             fields[2] = expected_code(symbol).to_string();
             fields[3] = price.to_string();
             fields[4] = "3942.09".into();
-            let formatted = if timestamp != "bad-time" && (symbol.starts_with("hk") || symbol.starts_with("us")) {
+            let formatted = if timestamp != "bad-time"
+                && (symbol.starts_with("hk") || symbol.starts_with("us"))
+            {
                 let civil = parse_compact(timestamp).unwrap();
                 if symbol.starts_with("hk") {
-                    format!("{:04}/{:02}/{:02} {:02}:{:02}:{:02}", civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second)
+                    format!(
+                        "{:04}/{:02}/{:02} {:02}:{:02}:{:02}",
+                        civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
+                    )
                 } else {
-                    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second)
+                    format!(
+                        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                        civil.year, civil.month, civil.day, civil.hour, civil.minute, civil.second
+                    )
                 }
             } else {
                 timestamp.to_string()
@@ -731,11 +882,24 @@ mod tests {
     #[test]
     fn quotes_keep_order_exchange_time_and_drop_bad_rows() {
         let items = parse_quotes(&payload("3930.12", "20260904103000", "day"), "day").unwrap();
-        assert_eq!(items.iter().map(|item| item.symbol.as_str()).collect::<Vec<_>>(), symbols("day").iter().map(|row| row.0).collect::<Vec<_>>());
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>(),
+            symbols("day").iter().map(|row| row.0).collect::<Vec<_>>()
+        );
         assert_eq!(items[0].quoted_at, "2026-09-04T10:30:00+08:00");
         assert!((items[0].price - 3930.12).abs() < 1e-9);
         assert!((items[0].percent + 0.30).abs() < 1e-9);
-        for sample in ["", "v_sh000001=\"\";", &payload("NaN", "20260904103000", "day"), &payload("inf", "20260904103000", "day"), &payload("0", "20260904103000", "day"), &payload("1", "bad-time", "day")] {
+        for sample in [
+            "",
+            "v_sh000001=\"\";",
+            &payload("NaN", "20260904103000", "day"),
+            &payload("inf", "20260904103000", "day"),
+            &payload("0", "20260904103000", "day"),
+            &payload("1", "bad-time", "day"),
+        ] {
             assert!(parse_quotes(sample, "day").is_err(), "{sample}");
         }
         let broken = payload("3930.12", "20260904103000", "day").replace("~399001~", "~000001~");
@@ -747,26 +911,136 @@ mod tests {
     #[test]
     fn session_status_holidays_and_us_time() {
         let quoted = "2026-09-04T10:30:00+08:00";
-        assert_eq!(quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T10:31:00")), "trading");
-        assert_eq!(quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T10:34:00")), "delayed");
-        assert_eq!(quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T12:00:00")), "break");
-        assert_eq!(quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T15:00:00")), "closed");
-        assert_eq!(quote_status("sh000001", Some(quoted), cn_unix("2026-09-06T10:00:00")), "closed");
-        assert_eq!(quote_status("sh000001", Some(quoted), cn_unix("2026-09-07T10:00:00")), "delayed");
-        assert_eq!(quote_status("hkHSI", Some("2026-09-04T15:30:00+08:00"), cn_unix("2026-09-04T15:30:00")), "trading");
-        assert_eq!(quote_status("hkHSI", Some("2026-09-04T12:30:00+08:00"), cn_unix("2026-09-04T12:30:00")), "break");
-        assert_eq!(quote_status("us.INX", Some("2026-09-04T21:30:00+08:00"), cn_unix("2026-09-04T21:30:00")), "trading");
-        assert_eq!(quote_status("us.INX", Some("2026-12-04T21:30:00+08:00"), cn_unix("2026-12-04T21:30:00")), "closed");
-        assert_eq!(quote_status("us.INX", Some("2026-12-04T22:30:00+08:00"), cn_unix("2026-12-04T22:30:00")), "trading");
-        assert_eq!(quote_status("us.INX", Some("2026-09-05T02:00:00+08:00"), cn_unix("2026-09-05T02:00:00")), "trading");
+        assert_eq!(
+            quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T10:31:00")),
+            "trading"
+        );
+        assert_eq!(
+            quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T10:34:00")),
+            "delayed"
+        );
+        assert_eq!(
+            quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T12:00:00")),
+            "break"
+        );
+        assert_eq!(
+            quote_status("sh000001", Some(quoted), cn_unix("2026-09-04T15:00:00")),
+            "closed"
+        );
+        assert_eq!(
+            quote_status("sh000001", Some(quoted), cn_unix("2026-09-06T10:00:00")),
+            "closed"
+        );
+        assert_eq!(
+            quote_status("sh000001", Some(quoted), cn_unix("2026-09-07T10:00:00")),
+            "delayed"
+        );
+        assert_eq!(
+            quote_status(
+                "hkHSI",
+                Some("2026-09-04T15:30:00+08:00"),
+                cn_unix("2026-09-04T15:30:00")
+            ),
+            "trading"
+        );
+        assert_eq!(
+            quote_status(
+                "hkHSI",
+                Some("2026-09-04T12:30:00+08:00"),
+                cn_unix("2026-09-04T12:30:00")
+            ),
+            "break"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-09-04T21:30:00+08:00"),
+                cn_unix("2026-09-04T21:30:00")
+            ),
+            "trading"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-12-04T21:30:00+08:00"),
+                cn_unix("2026-12-04T21:30:00")
+            ),
+            "closed"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-12-04T22:30:00+08:00"),
+                cn_unix("2026-12-04T22:30:00")
+            ),
+            "trading"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-09-05T02:00:00+08:00"),
+                cn_unix("2026-09-05T02:00:00")
+            ),
+            "trading"
+        );
         let ny = |text: &str| parse_iso_unix(text).unwrap();
-        assert_eq!(quote_status("us.INX", Some("2026-09-04T16:00:00-04:00"), ny("2026-09-07T15:00:00-04:00")), "holiday");
-        assert_eq!(quote_status("us.INX", Some("2026-09-04T16:00:00-04:00"), ny("2026-09-08T15:00:00-04:00")), "delayed");
-        assert_eq!(quote_status("us.INX", Some("2021-12-30T16:00:00-05:00"), ny("2021-12-31T15:00:00-05:00")), "holiday");
-        assert_eq!(quote_status("us.INX", Some("2026-05-22T16:00:00-04:00"), ny("2026-05-25T15:00:00-04:00")), "holiday");
-        assert_eq!(quote_status("us.INX", Some("2021-06-17T16:00:00-04:00"), ny("2021-06-18T15:00:00-04:00")), "delayed");
-        assert_eq!(quote_status("us.INX", Some("2022-06-17T16:00:00-04:00"), ny("2022-06-20T15:00:00-04:00")), "holiday");
-        for day in ["2026-04-03", "2026-02-16", "2026-05-25", "2021-07-05", "2026-09-07", "2026-11-26", "2021-12-24"] {
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-09-04T16:00:00-04:00"),
+                ny("2026-09-07T15:00:00-04:00")
+            ),
+            "holiday"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-09-04T16:00:00-04:00"),
+                ny("2026-09-08T15:00:00-04:00")
+            ),
+            "delayed"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2021-12-30T16:00:00-05:00"),
+                ny("2021-12-31T15:00:00-05:00")
+            ),
+            "holiday"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2026-05-22T16:00:00-04:00"),
+                ny("2026-05-25T15:00:00-04:00")
+            ),
+            "holiday"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2021-06-17T16:00:00-04:00"),
+                ny("2021-06-18T15:00:00-04:00")
+            ),
+            "delayed"
+        );
+        assert_eq!(
+            quote_status(
+                "us.INX",
+                Some("2022-06-17T16:00:00-04:00"),
+                ny("2022-06-20T15:00:00-04:00")
+            ),
+            "holiday"
+        );
+        for day in [
+            "2026-04-03",
+            "2026-02-16",
+            "2026-05-25",
+            "2021-07-05",
+            "2026-09-07",
+            "2026-11-26",
+            "2021-12-24",
+        ] {
             let civil = parse_compact(&format!("{}000000", day.replace('-', ""))).unwrap();
             assert!(is_us_holiday(civil.year, civil.month, civil.day), "{day}");
         }
@@ -779,7 +1053,13 @@ mod tests {
         let winter = parse_quotes(&payload("3930.12", "20261204103000", "night"), "night").unwrap();
         assert!(winter.iter().all(|item| item.quoted_at.ends_with("-05:00")));
         assert_eq!(night[4].symbol, "usSOXX");
-        for (hour, group) in [(7, "night"), (8, "day"), (19, "day"), (20, "night"), (0, "night")] {
+        for (hour, group) in [
+            (7, "night"),
+            (8, "day"),
+            (19, "day"),
+            (20, "night"),
+            (0, "night"),
+        ] {
             let text = format!("2026-09-04T{hour:02}:00:00");
             assert_eq!(default_group(cn_unix(&text)), group, "{hour}");
         }
@@ -787,19 +1067,41 @@ mod tests {
 
     #[test]
     fn intraday_keeps_exchange_session_points() {
-        for (symbol, duration, afternoon, count) in [("sh000001", 240, 120, 2), ("hkHSI", 330, 150, 2), ("usSOXX", 390, 210, 3)] {
+        for (symbol, duration, afternoon, count) in [
+            ("sh000001", 240, 120, 2),
+            ("hkHSI", 330, 150, 2),
+            ("usSOXX", 390, 210, 3),
+        ] {
             let data = parse_intraday(&json!({"data": {minute_code(symbol): {"data": {"date": "20260904", "data": [
                 "1300 105.25 99999 12345", "0930 100 88888", "0931 NaN 1", "0932 -1 2", "0933 inf 1",
                 "bad", "2500 102 1", "0800 103 1", "1831 107 1", "0930 101 88888", "1230 104 1"
             ]}}}}), symbol).unwrap();
             assert_eq!(data.date, "2026-09-04");
             assert_eq!(data.duration, duration);
-            assert_eq!((data.points[0].time.as_str(), data.points[0].minute, data.points[0].price), ("09:30", 0, 101.0));
+            assert_eq!(
+                (
+                    data.points[0].time.as_str(),
+                    data.points[0].minute,
+                    data.points[0].price
+                ),
+                ("09:30", 0, 101.0)
+            );
             let last = data.points.last().unwrap();
-            assert_eq!((last.time.as_str(), last.minute, last.price), ("13:00", afternoon, 105.25));
+            assert_eq!(
+                (last.time.as_str(), last.minute, last.price),
+                ("13:00", afternoon, 105.25)
+            );
             assert_eq!(data.points.len(), count);
         }
-        assert!(parse_intraday(&json!({"data": {"hkHSI": {"day": [["2026-09-04", "100"]]}}}), "hkHSI").is_none());
-        assert!(parse_intraday(&json!({"data": {"hkHSI": {"data": {"date": "bad", "data": ["0930 100"]}}}}), "hkHSI").is_none());
+        assert!(parse_intraday(
+            &json!({"data": {"hkHSI": {"day": [["2026-09-04", "100"]]}}}),
+            "hkHSI"
+        )
+        .is_none());
+        assert!(parse_intraday(
+            &json!({"data": {"hkHSI": {"data": {"date": "bad", "data": ["0930 100"]}}}}),
+            "hkHSI"
+        )
+        .is_none());
     }
 }

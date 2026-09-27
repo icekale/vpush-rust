@@ -46,7 +46,10 @@ impl RngCore for SysRng {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         getrandom::getrandom(dest).expect("系统随机数不可用");
     }
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), p256::elliptic_curve::rand_core::Error> {
+    fn try_fill_bytes(
+        &mut self,
+        dest: &mut [u8],
+    ) -> Result<(), p256::elliptic_curve::rand_core::Error> {
         getrandom::getrandom(dest).map_err(|_| p256::elliptic_curve::rand_core::Error::new("rng"))
     }
 }
@@ -77,13 +80,32 @@ pub fn keys_ok(p256dh: &str, auth: &str) -> bool {
 
 pub async fn profile(db: &Db, user_id: i64) -> Result<(String, i64), String> {
     let keys = vapid_keys(db).await?;
-    let count = db.webpush_count(user_id).await.map_err(|err| err.to_string())?;
+    let count = db
+        .webpush_count(user_id)
+        .await
+        .map_err(|err| err.to_string())?;
     Ok((keys.public_b64, count))
 }
 
-pub async fn notify_note(db: &Db, user_id: i64, note: &Note<'_>, favorite: bool) -> Result<(), String> {
-    let kind = if note.post_type == "reply" { " · 回复" } else { "" };
-    let title = clip(&format!("{} · {}{kind}", note.kol_name, crate::push::platform_label(note.platform)), 60);
+pub async fn notify_note(
+    db: &Db,
+    user_id: i64,
+    note: &Note<'_>,
+    favorite: bool,
+) -> Result<(), String> {
+    let kind = if note.post_type == "reply" {
+        " · 回复"
+    } else {
+        ""
+    };
+    let title = clip(
+        &format!(
+            "{} · {}{kind}",
+            note.kol_name,
+            crate::push::platform_label(note.platform)
+        ),
+        60,
+    );
     let raw = if !note.content.trim().is_empty() {
         note.content
     } else if !note.title.trim().is_empty() {
@@ -107,8 +129,15 @@ pub async fn notify_note(db: &Db, user_id: i64, note: &Note<'_>, favorite: bool)
 pub async fn send_text(db: &Db, user_id: i64, text: &str) -> Result<(), String> {
     let lines: Vec<&str> = text.trim().lines().collect();
     let title = clip(lines.first().copied().unwrap_or("V Push"), 60);
-    let body = lines.get(1..).map(|rest| rest.join("\n")).unwrap_or_default();
-    let body = if body.trim().is_empty() { title.clone() } else { body };
+    let body = lines
+        .get(1..)
+        .map(|rest| rest.join("\n"))
+        .unwrap_or_default();
+    let body = if body.trim().is_empty() {
+        title.clone()
+    } else {
+        body
+    };
     let payload = json!({
         "title": title,
         "body": clip(body.trim(), 180),
@@ -119,12 +148,18 @@ pub async fn send_text(db: &Db, user_id: i64, text: &str) -> Result<(), String> 
 }
 
 async fn send_payload(db: &Db, user_id: i64, payload: &Value) -> Result<(), String> {
-    let subs = db.webpush_subs(user_id).await.map_err(|err| err.to_string())?;
+    let subs = db
+        .webpush_subs(user_id)
+        .await
+        .map_err(|err| err.to_string())?;
     if subs.is_empty() {
         return Err("用户未绑定浏览器通知".into());
     }
     let keys = vapid_keys(db).await?;
-    let mailto = std::env::var("VAPID_MAILTO").ok().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| DEFAULT_MAILTO.into());
+    let mailto = std::env::var("VAPID_MAILTO")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_MAILTO.into());
     let body = serde_json::to_vec(payload).map_err(|err| err.to_string())?;
     let mut sent = 0;
     let mut last = String::new();
@@ -140,7 +175,12 @@ async fn send_payload(db: &Db, user_id: i64, payload: &Value) -> Result<(), Stri
                 continue;
             }
         };
-        let auth = match vapid_header(&sub.endpoint, &keys.private_pem, &keys.public_b64, mailto.trim()) {
+        let auth = match vapid_header(
+            &sub.endpoint,
+            &keys.private_pem,
+            &keys.public_b64,
+            mailto.trim(),
+        ) {
             Ok(value) => value,
             Err(err) => {
                 last = err;
@@ -148,9 +188,10 @@ async fn send_payload(db: &Db, user_id: i64, payload: &Value) -> Result<(), Stri
             }
         };
         let endpoint = sub.endpoint.clone();
-        let posted = tokio::task::spawn_blocking(move || post_encrypted(&endpoint, encrypted, auth))
-            .await
-            .map_err(|err| err.to_string())?;
+        let posted =
+            tokio::task::spawn_blocking(move || post_encrypted(&endpoint, encrypted, auth))
+                .await
+                .map_err(|err| err.to_string())?;
         match posted {
             Ok(code) if (200..300).contains(&code) => sent += 1,
             Ok(404 | 410) => {
@@ -161,7 +202,11 @@ async fn send_payload(db: &Db, user_id: i64, payload: &Value) -> Result<(), Stri
         }
     }
     if sent == 0 {
-        Err(if last.is_empty() { "浏览器推送订阅已全部失效".into() } else { last })
+        Err(if last.is_empty() {
+            "浏览器推送订阅已全部失效".into()
+        } else {
+            last
+        })
     } else {
         Ok(())
     }
@@ -177,29 +222,63 @@ async fn vapid_keys(db: &Db) -> Result<Vapid, String> {
     let env_priv = normalize_pem(env_priv.trim());
     if !env_priv.is_empty() {
         let public = std::env::var("VAPID_PUBLIC_KEY").unwrap_or_default();
-        let public = if public.trim().is_empty() { public_from_pem(&env_priv)? } else { public.trim().to_string() };
-        return Ok(Vapid { private_pem: env_priv, public_b64: public });
+        let public = if public.trim().is_empty() {
+            public_from_pem(&env_priv)?
+        } else {
+            public.trim().to_string()
+        };
+        return Ok(Vapid {
+            private_pem: env_priv,
+            public_b64: public,
+        });
     }
-    let stored_priv = db.setting(PRIV_KEY).await.map_err(|err| err.to_string())?.unwrap_or_default();
-    let stored_pub = db.setting(PUB_KEY).await.map_err(|err| err.to_string())?.unwrap_or_default();
+    let stored_priv = db
+        .setting(PRIV_KEY)
+        .await
+        .map_err(|err| err.to_string())?
+        .unwrap_or_default();
+    let stored_pub = db
+        .setting(PUB_KEY)
+        .await
+        .map_err(|err| err.to_string())?
+        .unwrap_or_default();
     if !stored_priv.trim().is_empty() {
         let missing_pub = stored_pub.trim().is_empty();
-        let public = if missing_pub { public_from_pem(stored_priv.trim())? } else { stored_pub };
+        let public = if missing_pub {
+            public_from_pem(stored_priv.trim())?
+        } else {
+            stored_pub
+        };
         if missing_pub {
-            db.set_setting(PUB_KEY, &public).await.map_err(|err| err.to_string())?;
+            db.set_setting(PUB_KEY, &public)
+                .await
+                .map_err(|err| err.to_string())?;
         }
-        return Ok(Vapid { private_pem: stored_priv, public_b64: public });
+        return Ok(Vapid {
+            private_pem: stored_priv,
+            public_b64: public,
+        });
     }
     let pair = generate_vapid()?;
-    db.set_setting(PRIV_KEY, &pair.private_pem).await.map_err(|err| err.to_string())?;
-    db.set_setting(PUB_KEY, &pair.public_b64).await.map_err(|err| err.to_string())?;
+    db.set_setting(PRIV_KEY, &pair.private_pem)
+        .await
+        .map_err(|err| err.to_string())?;
+    db.set_setting(PUB_KEY, &pair.public_b64)
+        .await
+        .map_err(|err| err.to_string())?;
     Ok(pair)
 }
 
 fn generate_vapid() -> Result<Vapid, String> {
     let signing = SigningKey::random(&mut SysRng);
-    let private_pem = signing.to_pkcs8_pem(LineEnding::LF).map_err(|err| err.to_string())?.to_string();
-    Ok(Vapid { public_b64: public_of(&signing), private_pem })
+    let private_pem = signing
+        .to_pkcs8_pem(LineEnding::LF)
+        .map_err(|err| err.to_string())?
+        .to_string();
+    Ok(Vapid {
+        public_b64: public_of(&signing),
+        private_pem,
+    })
 }
 
 fn public_from_pem(pem: &str) -> Result<String, String> {
@@ -226,7 +305,9 @@ fn encrypt(plaintext: &[u8], p256dh: &str, auth: &str) -> Result<Vec<u8>, String
     let cipher = Aes128Gcm::new_from_slice(&cek).map_err(|_| "加密密钥无效")?;
     let mut record = plaintext.to_vec();
     record.push(2);
-    let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), record.as_ref()).map_err(|_| "加密失败")?;
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), record.as_ref())
+        .map_err(|_| "加密失败")?;
     let mut out = Vec::with_capacity(16 + 4 + 1 + 65 + ciphertext.len());
     out.extend(salt);
     out.extend(4096u32.to_be_bytes());
@@ -236,15 +317,27 @@ fn encrypt(plaintext: &[u8], p256dh: &str, auth: &str) -> Result<Vec<u8>, String
     Ok(out)
 }
 
-fn vapid_header(endpoint: &str, pem: &str, public_b64: &str, mailto: &str) -> Result<String, String> {
+fn vapid_header(
+    endpoint: &str,
+    pem: &str,
+    public_b64: &str,
+    mailto: &str,
+) -> Result<String, String> {
     let host = endpoint[8..].split(['/', '?', '#']).next().unwrap_or("");
     let header = b64url(br#"{"typ":"JWT","alg":"ES256"}"#);
-    let exp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) + 12 * 3600;
+    let exp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+        + 12 * 3600;
     let claims = format!(r#"{{"aud":"https://{host}","exp":{exp},"sub":"{mailto}"}}"#);
     let input = format!("{header}.{}", b64url(claims.as_bytes()));
     let signing = SigningKey::from_pkcs8_pem(pem).map_err(|_| "VAPID 私钥无效")?;
     let sig: p256::ecdsa::Signature = signing.sign(input.as_bytes());
-    Ok(format!("vapid t={input}.{}, k={public_b64}", b64url(&sig.to_bytes())))
+    Ok(format!(
+        "vapid t={input}.{}, k={public_b64}",
+        b64url(&sig.to_bytes())
+    ))
 }
 
 fn post_encrypted(url: &str, body: Vec<u8>, auth: String) -> Result<u16, String> {
@@ -261,15 +354,17 @@ fn post_encrypted(url: &str, body: Vec<u8>, auth: String) -> Result<u16, String>
         .set("Authorization", &auth)
         .send_bytes(&body)
     {
-        Ok(resp) => Ok(resp.status() as u16),
-        Err(ureq::Error::Status(code, _)) => Ok(code as u16),
+        Ok(resp) => Ok(resp.status()),
+        Err(ureq::Error::Status(code, _)) => Ok(code),
         Err(err) => Err(err.to_string()),
     }
 }
 
 fn hkdf(salt: &[u8], ikm: &[u8], info: &[u8], len: usize) -> Result<Vec<u8>, String> {
     let mut out = vec![0u8; len];
-    Hkdf::<Sha256>::new(Some(salt), ikm).expand(info, &mut out).map_err(|_| "密钥派生失败")?;
+    Hkdf::<Sha256>::new(Some(salt), ikm)
+        .expand(info, &mut out)
+        .map_err(|_| "密钥派生失败")?;
     Ok(out)
 }
 
@@ -296,7 +391,11 @@ fn b64url_decode(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
 }
 
 fn normalize_pem(raw: &str) -> String {
-    if raw.contains('\n') { raw.to_string() } else { raw.replace("\\n", "\n") }
+    if raw.contains('\n') {
+        raw.to_string()
+    } else {
+        raw.replace("\\n", "\n")
+    }
 }
 
 fn clip(text: &str, max_chars: usize) -> String {
@@ -310,7 +409,9 @@ fn clip(text: &str, max_chars: usize) -> String {
 fn click_url(text: &str) -> Option<String> {
     let start = text.find("https://").or_else(|| text.find("http://"))?;
     let rest = &text[start..];
-    let end = rest.find(|c: char| c.is_whitespace() || "。，、；：）)】」》\"'".contains(c)).unwrap_or(rest.len());
+    let end = rest
+        .find(|c: char| c.is_whitespace() || "。，、；：）)】」》\"'".contains(c))
+        .unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
 
@@ -334,7 +435,15 @@ mod tests {
         let cek = hkdf(salt, &ikm, b"Content-Encoding: aes128gcm\0", 16).unwrap();
         let nonce = hkdf(salt, &ikm, b"Content-Encoding: nonce\0", 12).unwrap();
         let cipher = Aes128Gcm::new_from_slice(&cek).unwrap();
-        let plain = cipher.decrypt(Nonce::from_slice(&nonce), Payload { msg: ciphertext, aad: b"" }).unwrap();
+        let plain = cipher
+            .decrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: ciphertext,
+                    aad: b"",
+                },
+            )
+            .unwrap();
         assert_eq!(*plain.last().unwrap(), 2);
         plain[..plain.len() - 1].to_vec()
     }
@@ -352,11 +461,21 @@ mod tests {
         assert_eq!(decrypt(&sealed, &ua, &auth), message);
         let vapid = generate_vapid().unwrap();
         assert!(keys_ok(&vapid.public_b64, &auth_b64));
-        let header = vapid_header("https://fcm.googleapis.com/fcm/send/abc", &vapid.private_pem, &vapid.public_b64, DEFAULT_MAILTO).unwrap();
-        assert!(header.starts_with("vapid t=") && header.contains(&format!("k={}", vapid.public_b64)));
+        let header = vapid_header(
+            "https://fcm.googleapis.com/fcm/send/abc",
+            &vapid.private_pem,
+            &vapid.public_b64,
+            DEFAULT_MAILTO,
+        )
+        .unwrap();
+        assert!(
+            header.starts_with("vapid t=") && header.contains(&format!("k={}", vapid.public_b64))
+        );
         assert_eq!(header.matches('.').count(), 2);
         assert!(endpoint_ok("https://fcm.googleapis.com/fcm/send/abc"));
-        assert!(endpoint_ok("https://updates.push.services.mozilla.com/wpush/v2/abc"));
+        assert!(endpoint_ok(
+            "https://updates.push.services.mozilla.com/wpush/v2/abc"
+        ));
         assert!(endpoint_ok("https://web.push.apple.com/Q"));
         assert!(endpoint_ok("https://wns.example.notify.windows.com/a"));
         assert!(!endpoint_ok("http://fcm.googleapis.com/x"));

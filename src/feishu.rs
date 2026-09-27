@@ -45,14 +45,26 @@ pub async fn notify(db: &Db, note: Note<'_>) -> Result<(), String> {
 }
 
 pub fn card(note: &Note<'_>) -> Value {
-    let platform = if note.platform == "xueqiu" { "雪球" } else { note.platform };
+    let platform = if note.platform == "xueqiu" {
+        "雪球"
+    } else {
+        note.platform
+    };
     let mut title = format!("📌 {} · {platform}", note.kol_name);
     if note.post_type == "reply" {
         title.push_str(" · 回复");
     }
     let content = {
-        let text = if note.content.is_empty() { note.title } else { note.content };
-        let text = if text.is_empty() { "（无正文）" } else { text };
+        let text = if note.content.is_empty() {
+            note.title
+        } else {
+            note.content
+        };
+        let text = if text.is_empty() {
+            "（无正文）"
+        } else {
+            text
+        };
         truncate(text, 2000)
     };
     let mut elements = vec![
@@ -85,7 +97,10 @@ async fn webhook(db: &Db) -> Result<Option<String>, String> {
             return Ok(Some(value.to_string()));
         }
     }
-    let saved = db.setting("feishu_webhook").await.map_err(|e| e.to_string())?;
+    let saved = db
+        .setting("feishu_webhook")
+        .await
+        .map_err(|e| e.to_string())?;
     Ok(saved.filter(|value| !value.trim().is_empty()))
 }
 
@@ -102,7 +117,11 @@ fn post(url: &str, body: &str) -> Result<(), String> {
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(15))
         .build();
-    let (status, text) = match agent.post(url).set("Content-Type", "application/json").send_string(body) {
+    let (status, text) = match agent
+        .post(url)
+        .set("Content-Type", "application/json")
+        .send_string(body)
+    {
         Ok(resp) => {
             let status = resp.status();
             let text = resp.into_string().unwrap_or_default();
@@ -149,9 +168,18 @@ mod tests {
         };
         let card = card(&note);
         assert_eq!(card["msg_type"], "interactive");
-        assert_eq!(card["card"]["header"]["title"]["content"], "📌 甲 · 雪球 · 回复");
-        assert_eq!(card["card"]["body"]["elements"][0]["text"]["content"], "回复一下");
-        assert_eq!(card["card"]["body"]["elements"][3]["behaviors"][0]["default_url"], note.url);
+        assert_eq!(
+            card["card"]["header"]["title"]["content"],
+            "📌 甲 · 雪球 · 回复"
+        );
+        assert_eq!(
+            card["card"]["body"]["elements"][0]["text"]["content"],
+            "回复一下"
+        );
+        assert_eq!(
+            card["card"]["body"]["elements"][3]["behaviors"][0]["default_url"],
+            note.url
+        );
         assert!(allowed("https://open.feishu.cn/open-apis/bot/v2/hook/abc"));
         assert!(!allowed("http://open.feishu.cn/hook"));
         assert!(!allowed("https://example.com/hook"));

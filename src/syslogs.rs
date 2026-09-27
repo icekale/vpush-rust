@@ -27,7 +27,11 @@ impl<S: Subscriber> Layer<S> for SysLayer {
         let mut message = String::new();
         event.record(&mut MessageVisitor(&mut message));
         let meta = event.metadata();
-        record(&format_line(level_name(meta.level()), meta.target(), &message));
+        record(&format_line(
+            level_name(meta.level()),
+            meta.target(),
+            &message,
+        ));
     }
 }
 
@@ -74,11 +78,18 @@ pub fn recent(limit: i64, level: &str, q: &str) -> Result<Vec<String>, &'static 
         "CRITICAL" => Some(50),
         _ => return Err("level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL"),
     };
-    let lines = ring().lock().unwrap_or_else(|err| err.into_inner()).iter().cloned().collect::<Vec<_>>();
+    let lines = ring()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
     let mut matched = Vec::new();
     for line in lines {
         if let Some(minimum) = minimum {
-            let Some(rank) = line_rank(&line) else { continue };
+            let Some(rank) = line_rank(&line) else {
+                continue;
+            };
             if want == "DEBUG" {
                 if rank != 10 {
                     continue;
@@ -124,7 +135,9 @@ fn format_line(level: &str, target: &str, message: &str) -> String {
 }
 
 fn timestamp() -> String {
-    let elapsed = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let days = elapsed.as_secs() / 86_400;
     let seconds = elapsed.as_secs() % 86_400;
     let (year, month, day) = civil_date(days);
@@ -141,11 +154,16 @@ fn civil_date(days_since_epoch: u64) -> (i32, u32, u32) {
     let z = days_since_epoch as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let day_of_era = z.rem_euclid(146_097) as u64;
-    let year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
     let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
     let month_part = (5 * day_of_year + 2) / 153;
     let day = day_of_year - (153 * month_part + 2) / 5 + 1;
-    let month = if month_part < 10 { month_part + 3 } else { month_part - 9 };
+    let month = if month_part < 10 {
+        month_part + 3
+    } else {
+        month_part - 9
+    };
     let year = year_of_era as i64 + era * 400 + i64::from(month <= 2);
     (year as i32, month as u32, day as u32)
 }
@@ -156,17 +174,36 @@ mod tests {
 
     #[test]
     fn debug_is_exact_and_newer_lines_come_first() {
-        let marker = format!("syslog-unit-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
-        for (level, text) in [("DEBUG", "debug line"), ("INFO", "info line"), ("WARNING", "warn line"), ("ERROR", "error line")] {
-            record(&format!("2026-08-11 10:00:00.000 {level} app.t [t] {text} {marker}"));
+        let marker = format!(
+            "syslog-unit-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        for (level, text) in [
+            ("DEBUG", "debug line"),
+            ("INFO", "info line"),
+            ("WARNING", "warn line"),
+            ("ERROR", "error line"),
+        ] {
+            record(&format!(
+                "2026-08-11 10:00:00.000 {level} app.t [t] {text} {marker}"
+            ));
         }
         assert_eq!(recent(200, "DEBUG", &marker).unwrap().len(), 1);
         assert_eq!(recent(200, "INFO", &marker).unwrap().len(), 3);
         assert_eq!(recent(200, "WARNING", &marker).unwrap().len(), 2);
         assert_eq!(recent(200, "ERROR", &marker).unwrap().len(), 1);
-        assert_eq!(recent(200, "BOGUS", &marker).unwrap_err(), "level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL");
+        assert_eq!(
+            recent(200, "BOGUS", &marker).unwrap_err(),
+            "level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL"
+        );
         let found = recent(200, "ERROR", &marker).unwrap();
         assert!(found[0].contains("error line"));
-        assert!(recent(200, "", "missing-marker-not-written").unwrap().is_empty());
+        assert!(recent(200, "", "missing-marker-not-written")
+            .unwrap()
+            .is_empty());
     }
 }

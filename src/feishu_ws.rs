@@ -47,7 +47,11 @@ pub async fn resume(db: Db) {
 
 async fn run(db: &Db, session_id: &str) -> Result<(), String> {
     loop {
-        let Some(session) = db.feishu_session(session_id).await.map_err(|err| err.to_string())? else {
+        let Some(session) = db
+            .feishu_session(session_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
             return Ok(());
         };
         if session.status != "awaiting_bind" {
@@ -55,16 +59,26 @@ async fn run(db: &Db, session_id: &str) -> Result<(), String> {
         }
         let now = now_secs();
         if session.session_expires_at < now {
-            db.set_feishu_status(session_id, "expired", "").await.map_err(|err| err.to_string())?;
+            db.set_feishu_status(session_id, "expired", "")
+                .await
+                .map_err(|err| err.to_string())?;
             return Ok(());
         }
-        let Some(key) = std::env::var("FEISHU_CREDENTIAL_KEY").ok().filter(|value| !value.trim().is_empty()) else {
+        let Some(key) = std::env::var("FEISHU_CREDENTIAL_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
             return Err("未配置 FEISHU_CREDENTIAL_KEY".into());
         };
-        let secret = feishu_personal::open_app_secret(&key, &session.candidate_app_secret_ciphertext)?;
+        let secret =
+            feishu_personal::open_app_secret(&key, &session.candidate_app_secret_ciphertext)?;
         let brand = session.candidate_tenant_brand.clone();
         let app_id = session.candidate_app_id.clone();
-        let domain = if brand == "lark" { "https://open.larksuite.com" } else { "https://open.feishu.cn" };
+        let domain = if brand == "lark" {
+            "https://open.larksuite.com"
+        } else {
+            "https://open.feishu.cn"
+        };
         let endpoint = fetch_endpoint(domain, &app_id, &secret)?;
         match serve(db, session_id, &endpoint, &app_id, &secret, &brand).await {
             Ok(()) => return Ok(()),
@@ -76,13 +90,31 @@ async fn run(db: &Db, session_id: &str) -> Result<(), String> {
     }
 }
 
-async fn serve(db: &Db, session_id: &str, endpoint: &Endpoint, app_id: &str, secret: &str, brand: &str) -> Result<(), String> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(&endpoint.url).await.map_err(|err| err.to_string())?;
+async fn serve(
+    db: &Db,
+    session_id: &str,
+    endpoint: &Endpoint,
+    app_id: &str,
+    secret: &str,
+    brand: &str,
+) -> Result<(), String> {
+    let (mut socket, _) = tokio_tungstenite::connect_async(&endpoint.url)
+        .await
+        .map_err(|err| err.to_string())?;
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
-    socket.send(Message::Binary(encode_frame(&ping_frame(endpoint.service)).into())).await.map_err(|err| err.to_string())?;
+    socket
+        .send(Message::Binary(
+            encode_frame(&ping_frame(endpoint.service)).into(),
+        ))
+        .await
+        .map_err(|err| err.to_string())?;
     loop {
-        let Some(session) = db.feishu_session(session_id).await.map_err(|err| err.to_string())? else {
+        let Some(session) = db
+            .feishu_session(session_id)
+            .await
+            .map_err(|err| err.to_string())?
+        else {
             return Ok(());
         };
         if session.status != "awaiting_bind" {
@@ -91,7 +123,12 @@ async fn serve(db: &Db, session_id: &str, endpoint: &Endpoint, app_id: &str, sec
         let message = tokio::time::timeout(Duration::from_secs(20), socket.next()).await;
         let message = match message {
             Err(_) => {
-                socket.send(Message::Binary(encode_frame(&ping_frame(endpoint.service)).into())).await.map_err(|err| err.to_string())?;
+                socket
+                    .send(Message::Binary(
+                        encode_frame(&ping_frame(endpoint.service)).into(),
+                    ))
+                    .await
+                    .map_err(|err| err.to_string())?;
                 continue;
             }
             Ok(Some(Ok(message))) => message,
@@ -106,16 +143,31 @@ async fn serve(db: &Db, session_id: &str, endpoint: &Endpoint, app_id: &str, sec
         let app_id = app_id.to_string();
         let secret = secret.to_string();
         let brand = brand.to_string();
-        let reply = handle_frame(db, session_id, &bytes, now_secs(), move |_, _, chat, host| {
-            send_notice(&app_id, &secret, chat, host, &brand)
-        }).await.map_err(|err| err.to_string())?;
+        let reply = handle_frame(
+            db,
+            session_id,
+            &bytes,
+            now_secs(),
+            move |_, _, chat, host| send_notice(&app_id, &secret, chat, host, &brand),
+        )
+        .await
+        .map_err(|err| err.to_string())?;
         if let Some(reply) = reply {
-            socket.send(Message::Binary(reply.into())).await.map_err(|err| err.to_string())?;
+            socket
+                .send(Message::Binary(reply.into()))
+                .await
+                .map_err(|err| err.to_string())?;
         }
     }
 }
 
-pub async fn handle_frame<F>(db: &Db, session_id: &str, bytes: &[u8], now: i64, send_test: F) -> Result<Option<Vec<u8>>, String>
+pub async fn handle_frame<F>(
+    db: &Db,
+    session_id: &str,
+    bytes: &[u8],
+    now: i64,
+    send_test: F,
+) -> Result<Option<Vec<u8>>, String>
 where
     F: FnOnce(&str, &str, &str, &str) -> Result<(), String>,
 {
@@ -124,21 +176,49 @@ where
         return Ok(None);
     }
     if let Ok(payload) = serde_json::from_slice::<Value>(&frame.payload) {
-        if payload.pointer("/header/event_type").and_then(Value::as_str) == Some("im.message.receive_v1") {
-            let message_type = payload.pointer("/event/message/message_type").and_then(Value::as_str).unwrap_or("");
+        if payload
+            .pointer("/header/event_type")
+            .and_then(Value::as_str)
+            == Some("im.message.receive_v1")
+        {
+            let message_type = payload
+                .pointer("/event/message/message_type")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             if message_type == "text" {
-                let content = payload.pointer("/event/message/content").and_then(Value::as_str).unwrap_or("");
-                let text = serde_json::from_str::<Value>(content).ok().and_then(|item| item.get("text").and_then(Value::as_str).map(str::to_string)).unwrap_or_default();
-                let text = text.split_whitespace().filter(|part| !part.starts_with('@')).collect::<Vec<_>>().join(" ");
-                let chat_id = payload.pointer("/event/message/chat_id").and_then(Value::as_str).unwrap_or("");
-                let sender = payload.pointer("/event/sender/sender_id/open_id").and_then(Value::as_str).unwrap_or("");
+                let content = payload
+                    .pointer("/event/message/content")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let text = serde_json::from_str::<Value>(content)
+                    .ok()
+                    .and_then(|item| item.get("text").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default();
+                let text = text
+                    .split_whitespace()
+                    .filter(|part| !part.starts_with('@'))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let chat_id = payload
+                    .pointer("/event/message/chat_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let sender = payload
+                    .pointer("/event/sender/sender_id/open_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if let Some(code) = feishu_personal::parse_bind_code(&text) {
-                    accept_bind(db, session_id, code, sender, chat_id, now, send_test).await.map_err(|err| format!("{err:?}"))?;
+                    accept_bind(db, session_id, code, sender, chat_id, now, send_test)
+                        .await
+                        .map_err(|err| format!("{err:?}"))?;
                 }
             }
         }
     }
-    frame.headers.push(Header { key: "biz_rt".into(), value: "1".into() });
+    frame.headers.push(Header {
+        key: "biz_rt".into(),
+        value: "1".into(),
+    });
     frame.payload = br#"{"code":200}"#.to_vec();
     Ok(Some(encode_frame(&frame)))
 }
@@ -163,13 +243,17 @@ fn fetch_endpoint(domain: &str, app_id: &str, secret: &str) -> Result<Endpoint, 
     endpoint_from(&body)
 }
 
+#[allow(dead_code)]
 pub fn event_frame(payload: &[u8]) -> Vec<u8> {
     encode_frame(&Frame {
         seq_id: 9,
         log_id: 8,
         service: 7,
         method: 1,
-        headers: vec![Header { key: "type".into(), value: "event".into() }],
+        headers: vec![Header {
+            key: "type".into(),
+            value: "event".into(),
+        }],
         payload: payload.to_vec(),
     })
 }
@@ -177,45 +261,99 @@ pub fn event_frame(payload: &[u8]) -> Vec<u8> {
 fn endpoint_from(body: &Value) -> Result<Endpoint, String> {
     let code = body.get("code").and_then(Value::as_i64).unwrap_or(-1);
     if code != 0 {
-        return Err(body.get("msg").and_then(Value::as_str).unwrap_or("飞书长连接地址获取失败").to_string());
+        return Err(body
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("飞书长连接地址获取失败")
+            .to_string());
     }
-    let url = body.pointer("/data/URL").or_else(|| body.pointer("/data/url")).and_then(Value::as_str).unwrap_or("");
+    let url = body
+        .pointer("/data/URL")
+        .or_else(|| body.pointer("/data/url"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if !url.starts_with("wss://") {
         return Err("飞书长连接地址无效".into());
     }
-    let service = url.split('?').nth(1).unwrap_or("").split('&').find_map(|item| {
-        let (key, value) = item.split_once('=')?;
-        if key == "service_id" { value.parse::<i32>().ok() } else { None }
-    }).ok_or("飞书长连接缺少 service_id")?;
-    Ok(Endpoint { url: url.to_string(), service })
+    let service = url
+        .split('?')
+        .nth(1)
+        .unwrap_or("")
+        .split('&')
+        .find_map(|item| {
+            let (key, value) = item.split_once('=')?;
+            if key == "service_id" {
+                value.parse::<i32>().ok()
+            } else {
+                None
+            }
+        })
+        .ok_or("飞书长连接缺少 service_id")?;
+    Ok(Endpoint {
+        url: url.to_string(),
+        service,
+    })
 }
 
-fn send_notice(app_id: &str, secret: &str, chat_id: &str, host: &str, brand: &str) -> Result<(), String> {
-    let host = if brand == "lark" { "open.larksuite.com" } else { host };
-    let token_text = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0).build()
-        .post(&format!("https://{host}/open-apis/auth/v3/tenant_access_token/internal"))
+fn send_notice(
+    app_id: &str,
+    secret: &str,
+    chat_id: &str,
+    host: &str,
+    brand: &str,
+) -> Result<(), String> {
+    let host = if brand == "lark" {
+        "open.larksuite.com"
+    } else {
+        host
+    };
+    let token_text = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .redirects(0)
+        .build()
+        .post(&format!(
+            "https://{host}/open-apis/auth/v3/tenant_access_token/internal"
+        ))
         .set("Content-Type", "application/json")
         .send_string(&json!({"app_id": app_id, "app_secret": secret}).to_string())
         .map_err(|err| err.to_string())?
         .into_string()
         .map_err(|err| err.to_string())?;
     let token_body: Value = serde_json::from_str(&token_text).map_err(|err| err.to_string())?;
-    let token = token_body.get("tenant_access_token").and_then(Value::as_str).unwrap_or("");
+    let token = token_body
+        .get("tenant_access_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     if token.is_empty() {
-        return Err(token_body.get("msg").and_then(Value::as_str).unwrap_or("获取飞书令牌失败").into());
+        return Err(token_body
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("获取飞书令牌失败")
+            .into());
     }
     let content = json!({"text": "VPush 已绑定这个机器人，之后会用它给你发推送。"}).to_string();
-    let sent_text = ureq::AgentBuilder::new().timeout(Duration::from_secs(15)).redirects(0).build()
-        .post(&format!("https://{host}/open-apis/im/v1/messages?receive_id_type=chat_id"))
+    let sent_text = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(15))
+        .redirects(0)
+        .build()
+        .post(&format!(
+            "https://{host}/open-apis/im/v1/messages?receive_id_type=chat_id"
+        ))
         .set("Authorization", &format!("Bearer {token}"))
         .set("Content-Type", "application/json")
-        .send_string(&json!({"receive_id": chat_id, "msg_type": "text", "content": content}).to_string())
+        .send_string(
+            &json!({"receive_id": chat_id, "msg_type": "text", "content": content}).to_string(),
+        )
         .map_err(|err| err.to_string())?
         .into_string()
         .map_err(|err| err.to_string())?;
     let sent: Value = serde_json::from_str(&sent_text).map_err(|err| err.to_string())?;
     if sent.get("code").and_then(Value::as_i64).unwrap_or(-1) != 0 {
-        return Err(sent.get("msg").and_then(Value::as_str).unwrap_or("测试消息发送失败").into());
+        return Err(sent
+            .get("msg")
+            .and_then(Value::as_str)
+            .unwrap_or("测试消息发送失败")
+            .into());
     }
     Ok(())
 }
@@ -241,17 +379,32 @@ fn ping_frame(service: i32) -> Frame {
         log_id: 0,
         service,
         method: 0,
-        headers: vec![Header { key: "type".into(), value: "ping".into() }],
+        headers: vec![Header {
+            key: "type".into(),
+            value: "ping".into(),
+        }],
         payload: Vec::new(),
     }
 }
 
 fn header<'a>(frame: &'a Frame, key: &str) -> &'a str {
-    frame.headers.iter().find(|item| item.key == key).map(|item| item.value.as_str()).unwrap_or("")
+    frame
+        .headers
+        .iter()
+        .find(|item| item.key == key)
+        .map(|item| item.value.as_str())
+        .unwrap_or("")
 }
 
 fn decode_frame(data: &[u8]) -> Result<Frame, String> {
-    let mut frame = Frame { seq_id: 0, log_id: 0, service: 0, method: 0, headers: Vec::new(), payload: Vec::new() };
+    let mut frame = Frame {
+        seq_id: 0,
+        log_id: 0,
+        service: 0,
+        method: 0,
+        headers: Vec::new(),
+        payload: Vec::new(),
+    };
     let mut index = 0;
     while index < data.len() {
         let key = read_varint(data, &mut index).ok_or("飞书帧无效")?;
@@ -262,10 +415,16 @@ fn decode_frame(data: &[u8]) -> Result<Frame, String> {
             (2, 0) => frame.log_id = read_varint(data, &mut index).ok_or("飞书帧无效")?,
             (3, 0) => frame.service = read_varint(data, &mut index).ok_or("飞书帧无效")? as i32,
             (4, 0) => frame.method = read_varint(data, &mut index).ok_or("飞书帧无效")? as i32,
-            (5, 2) => frame.headers.push(decode_header(&read_bytes(data, &mut index)?)?),
+            (5, 2) => frame
+                .headers
+                .push(decode_header(&read_bytes(data, &mut index)?)?),
             (8, 2) => frame.payload = read_bytes(data, &mut index)?,
-            (_, 0) => { read_varint(data, &mut index).ok_or("飞书帧无效")?; }
-            (_, 2) => { read_bytes(data, &mut index)?; }
+            (_, 0) => {
+                read_varint(data, &mut index).ok_or("飞书帧无效")?;
+            }
+            (_, 2) => {
+                read_bytes(data, &mut index)?;
+            }
             (_, 5) => index += 4,
             (_, 1) => index += 8,
             _ => return Err("飞书帧无效".into()),
@@ -281,10 +440,20 @@ fn decode_header(data: &[u8]) -> Result<Header, String> {
     while index < data.len() {
         let tag = read_varint(data, &mut index).ok_or("飞书帧无效")?;
         match (tag >> 3, tag & 7) {
-            (1, 2) => key = String::from_utf8(read_bytes(data, &mut index)?).map_err(|_| "飞书帧无效".to_string())?,
-            (2, 2) => value = String::from_utf8(read_bytes(data, &mut index)?).map_err(|_| "飞书帧无效".to_string())?,
-            (_, 0) => { read_varint(data, &mut index).ok_or("飞书帧无效")?; }
-            (_, 2) => { read_bytes(data, &mut index)?; }
+            (1, 2) => {
+                key = String::from_utf8(read_bytes(data, &mut index)?)
+                    .map_err(|_| "飞书帧无效".to_string())?
+            }
+            (2, 2) => {
+                value = String::from_utf8(read_bytes(data, &mut index)?)
+                    .map_err(|_| "飞书帧无效".to_string())?
+            }
+            (_, 0) => {
+                read_varint(data, &mut index).ok_or("飞书帧无效")?;
+            }
+            (_, 2) => {
+                read_bytes(data, &mut index)?;
+            }
             _ => return Err("飞书帧无效".into()),
         }
     }
@@ -371,7 +540,10 @@ fn read_bytes(data: &[u8], index: &mut usize) -> Result<Vec<u8>, String> {
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|item| item.as_secs() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|item| item.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -387,6 +559,9 @@ mod tests {
         let body = serde_json::json!({"code": 0, "data": {"URL": "wss://open.feishu.cn/ws?service_id=12"}});
         let endpoint = endpoint_from(&body).unwrap();
         assert_eq!(endpoint.service, 12);
-        assert!(endpoint_from(&serde_json::json!({"code": 0, "data": {"URL": "https://evil"}})).is_err());
+        assert!(
+            endpoint_from(&serde_json::json!({"code": 0, "data": {"URL": "https://evil"}}))
+                .is_err()
+        );
     }
 }

@@ -7,27 +7,43 @@ use sqlx::Row;
 use crate::db::{Db, PushTarget};
 use crate::feishu::Note;
 
-pub async fn test_user(db: &Db, user: &crate::db::User, message: &str) -> Result<Vec<serde_json::Value>, &'static str> {
+pub async fn test_user(
+    db: &Db,
+    user: &crate::db::User,
+    message: &str,
+) -> Result<Vec<serde_json::Value>, &'static str> {
     let text = format!("【测试推送】{}", truncate(message.trim(), 500));
     let picked = channels(&user.push_channels);
     let mut results = Vec::new();
     if picked.wecom && wecom_bound(&user.wecom_webhook) {
-        results.push(outcome("wecom", send_wecom_text(&user.wecom_webhook, &text).await));
+        results.push(outcome(
+            "wecom",
+            send_wecom_text(&user.wecom_webhook, &text).await,
+        ));
     }
     if picked.bark && valid_bark_key(&user.bark_key) {
-        results.push(outcome("bark", send_bark_text(&user.bark_key, "测试推送", &text).await));
+        results.push(outcome(
+            "bark",
+            send_bark_text(&user.bark_key, "测试推送", &text).await,
+        ));
     }
     if picked.telegram {
         let token = telegram_token_for(&user.telegram_bot_token);
         if telegram_token_ok(&token) && chat_id_ok(&user.telegram_chat_id) {
-            results.push(outcome("telegram", send_telegram(&token, &user.telegram_chat_id, &text).await));
+            results.push(outcome(
+                "telegram",
+                send_telegram(&token, &user.telegram_chat_id, &text).await,
+            ));
         }
     }
     if picked.feishu && crate::feishu::configured(db).await.unwrap_or(false) {
         results.push(outcome("feishu", crate::feishu::send_text(db, &text).await));
     }
     if picked.webpush && db.webpush_count(user.id).await.unwrap_or(0) > 0 {
-        results.push(outcome("webpush", crate::webpush::send_text(db, user.id, &text).await));
+        results.push(outcome(
+            "webpush",
+            crate::webpush::send_text(db, user.id, &text).await,
+        ));
     }
     if results.is_empty() {
         Err("该用户未绑定任何推送渠道")
@@ -44,7 +60,11 @@ fn outcome(channel: &str, result: Result<(), String>) -> serde_json::Value {
 }
 
 pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), String> {
-    let Some(user) = db.user_by_id(user_id).await.map_err(|err| err.to_string())? else {
+    let Some(user) = db
+        .user_by_id(user_id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
         return Err("用户不存在".into());
     };
     let picked = channels(&user.push_channels);
@@ -72,7 +92,11 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
         crate::webpush::send_text(db, user_id, text).await?;
         sent = true;
     }
-    if sent { Ok(()) } else { Err("该用户未绑定任何推送渠道".into()) }
+    if sent {
+        Ok(())
+    } else {
+        Err("该用户未绑定任何推送渠道".into())
+    }
 }
 
 pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
@@ -90,19 +114,24 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             continue;
         }
         let channels = channels(&target.push_channels);
-        let unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|item| item.as_secs() as i64).unwrap_or(0);
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|item| item.as_secs() as i64)
+            .unwrap_or(0);
         if channels.wecom {
             if let Err(err) = wecom(&target.wecom_webhook, note).await {
                 tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
                 note_push_failure(db, &format!("企业微信：{err}")).await;
-                let _ = remember_failure(db, kol_id, note.url, "wecom", target.user_id, &err, unix).await;
+                let _ = remember_failure(db, kol_id, note.url, "wecom", target.user_id, &err, unix)
+                    .await;
             }
         }
         if channels.bark {
             if let Err(err) = bark(&target.bark_key, note).await {
                 tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
                 note_push_failure(db, &format!("Bark：{err}")).await;
-                let _ = remember_failure(db, kol_id, note.url, "bark", target.user_id, &err, unix).await;
+                let _ = remember_failure(db, kol_id, note.url, "bark", target.user_id, &err, unix)
+                    .await;
             }
         }
         if channels.telegram {
@@ -110,17 +139,23 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             if let Err(err) = send_telegram(&token, &target.telegram_chat_id, &plain(note)).await {
                 tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
                 note_push_failure(db, &format!("Telegram：{err}")).await;
-                let _ = remember_failure(db, kol_id, note.url, "telegram", target.user_id, &err, unix).await;
+                let _ =
+                    remember_failure(db, kol_id, note.url, "telegram", target.user_id, &err, unix)
+                        .await;
             }
         }
         if channels.feishu {
             want_feishu = true;
         }
         if channels.webpush {
-            if let Err(err) = crate::webpush::notify_note(db, target.user_id, note, target.favorite).await {
+            if let Err(err) =
+                crate::webpush::notify_note(db, target.user_id, note, target.favorite).await
+            {
                 tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
                 note_push_failure(db, &format!("浏览器：{err}")).await;
-                let _ = remember_failure(db, kol_id, note.url, "webpush", target.user_id, &err, unix).await;
+                let _ =
+                    remember_failure(db, kol_id, note.url, "webpush", target.user_id, &err, unix)
+                        .await;
             }
         }
     }
@@ -143,21 +178,39 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     {
         tracing::warn!(kol = kol_id, "飞书推送失败: {err}");
         note_push_failure(db, &format!("飞书：{err}")).await;
-        let unix = SystemTime::now().duration_since(UNIX_EPOCH).map(|item| item.as_secs() as i64).unwrap_or(0);
+        let unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|item| item.as_secs() as i64)
+            .unwrap_or(0);
         let _ = remember_failure(db, kol_id, note.url, "feishu", 0, &err, unix).await;
     }
 }
 
 async fn note_push_failure(db: &Db, detail: &str) {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|item| item.as_secs() as i64).unwrap_or(0);
-    if let Err(err) = crate::alerts::push_failure(db, now, detail, |message| async move { crate::alerts::notify_admins(db, &message).await }).await {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|item| item.as_secs() as i64)
+        .unwrap_or(0);
+    if let Err(err) = crate::alerts::push_failure(db, now, detail, |message| async move {
+        crate::alerts::notify_admins(db, &message).await
+    })
+    .await
+    {
         tracing::warn!("推送失败告警失败: {err}");
     }
 }
 
 const RETRY_DELAYS: [i64; 3] = [60, 300, 900];
 
-pub async fn remember_failure(db: &Db, kol_id: i64, url: &str, channel: &str, user_id: i64, error: &str, now: i64) -> Result<(), sqlx::Error> {
+pub async fn remember_failure(
+    db: &Db,
+    kol_id: i64,
+    url: &str,
+    channel: &str,
+    user_id: i64,
+    error: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
     let row = sqlx::query("SELECT id, platform, external_id, url FROM posts WHERE kol_id = ? ORDER BY id DESC LIMIT 1")
         .bind(kol_id)
         .fetch_optional(db.pool())
@@ -190,10 +243,14 @@ pub async fn remember_failure(db: &Db, kol_id: i64, url: &str, channel: &str, us
         .fetch_one(db.pool())
         .await?;
     if open == 0 {
-        db.add_push_log(post_id, channel, "failed", error, Some(user_id)).await?;
+        db.add_push_log(post_id, channel, "failed", error, Some(user_id))
+            .await?;
     }
-    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_retries").fetch_one(db.pool()).await?;
-    db.set_setting("stats_retry_pending", &pending.to_string()).await?;
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_retries")
+        .fetch_one(db.pool())
+        .await?;
+    db.set_setting("stats_retry_pending", &pending.to_string())
+        .await?;
     Ok(())
 }
 
@@ -313,8 +370,11 @@ where
             }
         }
     }
-    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_retries").fetch_one(db.pool()).await?;
-    db.set_setting("stats_retry_pending", &pending.to_string()).await?;
+    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_retries")
+        .fetch_one(db.pool())
+        .await?;
+    db.set_setting("stats_retry_pending", &pending.to_string())
+        .await?;
     Ok(done)
 }
 
@@ -376,9 +436,19 @@ struct Channels {
 }
 
 fn channels(raw: &str) -> Channels {
-    let picked: Vec<&str> = raw.split(',').map(str::trim).filter(|item| !item.is_empty()).collect();
+    let picked: Vec<&str> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .collect();
     if picked.is_empty() {
-        return Channels { wecom: true, bark: true, feishu: true, telegram: true, webpush: true };
+        return Channels {
+            wecom: true,
+            bark: true,
+            feishu: true,
+            telegram: true,
+            webpush: true,
+        };
     }
     Channels {
         wecom: picked.contains(&"wecom"),
@@ -417,7 +487,10 @@ fn clock(value: &str) -> Option<u32> {
 }
 
 fn beijing_minutes() -> u32 {
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     ((secs + 8 * 3600) % 86400 / 60) as u32
 }
 
@@ -449,7 +522,12 @@ async fn send_bark_text(key: &str, title: &str, body: &str) -> Result<(), String
     if !valid_bark_key(key) {
         return Ok(());
     }
-    let url = format!("https://api.day.app/{}/{}/{}", key, url_encode(title), url_encode(body));
+    let url = format!(
+        "https://api.day.app/{}/{}/{}",
+        key,
+        url_encode(title),
+        url_encode(body)
+    );
     tokio::task::spawn_blocking(move || post_json(&url, ""))
         .await
         .map_err(|err| err.to_string())?
@@ -470,7 +548,9 @@ pub fn telegram_token_ok(token: &str) -> bool {
     (6..=16).contains(&id.len())
         && id.bytes().all(|b| b.is_ascii_digit())
         && (20..=128).contains(&secret.len())
-        && secret.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn chat_id_ok(chat_id: &str) -> bool {
@@ -479,15 +559,23 @@ fn chat_id_ok(chat_id: &str) -> bool {
 }
 
 pub fn parse_telegram_bind(me_body: &str, updates_body: &str) -> Result<(String, String), String> {
-    let me: serde_json::Value = serde_json::from_str(me_body).map_err(|_| "token 无效：未知错误".to_string())?;
+    let me: serde_json::Value =
+        serde_json::from_str(me_body).map_err(|_| "token 无效：未知错误".to_string())?;
     if me.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let desc = me.get("description").and_then(|v| v.as_str()).unwrap_or("未知错误");
+        let desc = me
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
         return Err(format!("token 无效：{desc}"));
     }
     let username = me["result"]["username"].as_str().unwrap_or("").to_string();
-    let updates: serde_json::Value = serde_json::from_str(updates_body).map_err(|_| "获取会话失败：未知错误".to_string())?;
+    let updates: serde_json::Value =
+        serde_json::from_str(updates_body).map_err(|_| "获取会话失败：未知错误".to_string())?;
     if updates.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let desc = updates.get("description").and_then(|v| v.as_str()).unwrap_or("未知错误");
+        let desc = updates
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("未知错误");
         return Err(format!("获取会话失败：{desc}"));
     }
     let mut chat_id = String::new();
@@ -558,20 +646,43 @@ fn telegram_get(token: &str, method: &str) -> Result<String, String> {
 }
 
 fn redact_token(err: String, token: &str) -> String {
-    if token.is_empty() { err } else { err.replace(token, "<redacted>") }
+    if token.is_empty() {
+        err
+    } else {
+        err.replace(token, "<redacted>")
+    }
 }
 
 fn valid_bark_key(key: &str) -> bool {
     let len = key.len();
     (10..=100).contains(&len)
-        && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 fn plain(note: &Note<'_>) -> String {
-    let kind = if note.post_type == "reply" { " · 回复" } else { "" };
-    let body = if note.content.is_empty() { note.title } else { note.content };
-    let body = if body.is_empty() { "（无正文）" } else { body };
-    let mut text = format!("{} · {}{kind}\n\n{}", note.kol_name, platform_label(note.platform), truncate(body, 1600));
+    let kind = if note.post_type == "reply" {
+        " · 回复"
+    } else {
+        ""
+    };
+    let body = if note.content.is_empty() {
+        note.title
+    } else {
+        note.content
+    };
+    let body = if body.is_empty() {
+        "（无正文）"
+    } else {
+        body
+    };
+    let mut text = format!(
+        "{} · {}{kind}\n\n{}",
+        note.kol_name,
+        platform_label(note.platform),
+        truncate(body, 1600)
+    );
     if !note.published_at.is_empty() {
         text.push_str("\n🕐 ");
         text.push_str(note.published_at);
@@ -609,7 +720,9 @@ fn url_encode(value: &str) -> String {
     let mut out = String::new();
     for byte in value.bytes() {
         match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(byte as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
             _ => out.push_str(&format!("%{byte:02X}")),
         }
     }
@@ -625,7 +738,9 @@ fn post_json(url: &str, body: &str) -> Result<(), String> {
     let response = if body.is_empty() {
         request.call()
     } else {
-        request.set("Content-Type", "application/json").send_string(body)
+        request
+            .set("Content-Type", "application/json")
+            .send_string(body)
     };
     match response {
         Ok(resp) if (200..300).contains(&resp.status()) => Ok(()),
@@ -671,7 +786,9 @@ mod tests {
         assert!(all.feishu && all.wecom && all.bark && all.telegram);
         let only = channels("wecom, bark");
         assert!(only.wecom && only.bark && !only.feishu && !only.telegram);
-        assert!(wecom_bound("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc"));
+        assert!(wecom_bound(
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc"
+        ));
         assert!(!wecom_bound("https://evil.example/hook"));
     }
 
@@ -680,7 +797,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-push-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
@@ -695,14 +815,29 @@ mod tests {
     fn telegram_bind_uses_the_latest_chat_and_rejects_a_silent_bot() {
         let me = r#"{"ok":true,"result":{"username":"dav_bot"}}"#;
         let updates = r#"{"ok":true,"result":[{"message":{"chat":{"id":111}}},{"message":{"chat":{"id":-222}}}]}"#;
-        assert_eq!(parse_telegram_bind(me, updates).unwrap(), ("dav_bot".into(), "-222".into()));
+        assert_eq!(
+            parse_telegram_bind(me, updates).unwrap(),
+            ("dav_bot".into(), "-222".into())
+        );
         let silent = r#"{"ok":true,"result":[]}"#;
-        assert!(parse_telegram_bind(me, silent).unwrap_err().contains("先给你的机器人发一条消息"));
-        assert!(parse_telegram_bind(r#"{"ok":false,"description":"Unauthorized"}"#, silent).unwrap_err().contains("Unauthorized"));
+        assert!(parse_telegram_bind(me, silent)
+            .unwrap_err()
+            .contains("先给你的机器人发一条消息"));
+        assert!(
+            parse_telegram_bind(r#"{"ok":false,"description":"Unauthorized"}"#, silent)
+                .unwrap_err()
+                .contains("Unauthorized")
+        );
         assert!(telegram_token_ok("123456:ABCDEFGHIJKLMNOPQRST"));
         assert!(!telegram_token_ok("123456:short"));
         assert!(!telegram_token_ok("bad/token:ABCDEFGHIJKLMNOPQRST"));
-        assert_eq!(redact_token("https://api.telegram.org/bot123456:ABCDEFGHIJKLMNOPQRST/x".into(), "123456:ABCDEFGHIJKLMNOPQRST"), "https://api.telegram.org/bot<redacted>/x");
+        assert_eq!(
+            redact_token(
+                "https://api.telegram.org/bot123456:ABCDEFGHIJKLMNOPQRST/x".into(),
+                "123456:ABCDEFGHIJKLMNOPQRST"
+            ),
+            "https://api.telegram.org/bot<redacted>/x"
+        );
     }
 
     #[tokio::test]
@@ -710,41 +845,168 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-retry-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
-        sqlx::query("INSERT INTO users (username, password_hash, notify_enabled) VALUES ('甲', 'x', 1)").execute(db.pool()).await.unwrap();
-        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = '甲'").fetch_one(db.pool()).await.unwrap();
-        let kol = db.add_kol("xueqiu", "段永平", "111", None, false, false, false).await.unwrap();
-        sqlx::query("INSERT INTO subscriptions (user_id, kol_id, type) VALUES (?, ?, 'post')").bind(user).bind(kol).execute(db.pool()).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, notify_enabled) VALUES ('甲', 'x', 1)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = '甲'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let kol = db
+            .add_kol("xueqiu", "段永平", "111", None, false, false, false)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id, type) VALUES (?, ?, 'post')")
+            .bind(user)
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'p1', '标题', 'https://xueqiu.com/p/1')").bind(kol).execute(db.pool()).await.unwrap();
-        remember_failure(&db, kol, "https://xueqiu.com/p/1", "wecom", user, "超时", 1_000).await.unwrap();
-        remember_failure(&db, kol, "https://other", "wecom", user, "不应入队", 1_000).await.unwrap();
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries").fetch_one(db.pool()).await.unwrap(), 1);
-        assert_eq!(retry_due(&db, 1_000, |_, _, _| async { Ok(()) }).await.unwrap(), 0);
-        assert_eq!(retry_due(&db, 1_060, |_, _, _| async { Err("仍失败".into()) }).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT attempts FROM push_retries").fetch_one(db.pool()).await.unwrap(), 1);
-        assert_eq!(retry_due(&db, 1_060 + 300, |_, channel, _| async move {
-            assert_eq!(channel, "wecom");
-            Ok(())
-        }).await.unwrap(), 1);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries").fetch_one(db.pool()).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, String>("SELECT status FROM push_logs").fetch_one(db.pool()).await.unwrap(), "success");
+        remember_failure(
+            &db,
+            kol,
+            "https://xueqiu.com/p/1",
+            "wecom",
+            user,
+            "超时",
+            1_000,
+        )
+        .await
+        .unwrap();
+        remember_failure(&db, kol, "https://other", "wecom", user, "不应入队", 1_000)
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            retry_due(&db, 1_000, |_, _, _| async { Ok(()) })
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            retry_due(&db, 1_060, |_, _, _| async { Err("仍失败".into()) })
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT attempts FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            retry_due(&db, 1_060 + 300, |_, channel, _| async move {
+                assert_eq!(channel, "wecom");
+                Ok(())
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM push_logs")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "success"
+        );
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'p2', '二', 'https://xueqiu.com/p/2')").bind(kol).execute(db.pool()).await.unwrap();
-        remember_failure(&db, kol, "https://xueqiu.com/p/2", "bark", user, "超时", 2_000).await.unwrap();
+        remember_failure(
+            &db,
+            kol,
+            "https://xueqiu.com/p/2",
+            "bark",
+            user,
+            "超时",
+            2_000,
+        )
+        .await
+        .unwrap();
         for delay in [60, 300, 900] {
-            let at: i64 = sqlx::query_scalar("SELECT next_at FROM push_retries").fetch_one(db.pool()).await.unwrap();
-            assert_eq!(retry_due(&db, at, |_, _, _| async { Err("失败".into()) }).await.unwrap(), 0);
+            let at: i64 = sqlx::query_scalar("SELECT next_at FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(
+                retry_due(&db, at, |_, _, _| async { Err("失败".into()) })
+                    .await
+                    .unwrap(),
+                0
+            );
             let _ = delay;
         }
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries").fetch_one(db.pool()).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, String>("SELECT status FROM push_logs WHERE channel = 'bark'").fetch_one(db.pool()).await.unwrap(), "failed");
-        sqlx::query("DELETE FROM subscriptions").execute(db.pool()).await.unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT status FROM push_logs WHERE channel = 'bark'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            "failed"
+        );
+        sqlx::query("DELETE FROM subscriptions")
+            .execute(db.pool())
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'p3', '三', 'https://xueqiu.com/p/3')").bind(kol).execute(db.pool()).await.unwrap();
-        remember_failure(&db, kol, "https://xueqiu.com/p/3", "telegram", user, "超时", 3_000).await.unwrap();
-        assert_eq!(retry_due(&db, 3_060, |_, _, _| async { Ok(()) }).await.unwrap(), 0);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries").fetch_one(db.pool()).await.unwrap(), 0);
-        assert_eq!(db.setting("stats_retry_pending").await.unwrap().as_deref(), Some("0"));
+        remember_failure(
+            &db,
+            kol,
+            "https://xueqiu.com/p/3",
+            "telegram",
+            user,
+            "超时",
+            3_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            retry_due(&db, 3_060, |_, _, _| async { Ok(()) })
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            db.setting("stats_retry_pending").await.unwrap().as_deref(),
+            Some("0")
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

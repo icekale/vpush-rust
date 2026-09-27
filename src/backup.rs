@@ -41,7 +41,10 @@ impl Drop for Guard {
 }
 
 fn lock() -> Result<Guard, BackupError> {
-    if BUSY.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+    if BUSY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
         return Err(fail(409, "已有备份或恢复在进行"));
     }
     Ok(Guard)
@@ -84,24 +87,44 @@ pub async fn save(db: &Db, body: &Value) -> Result<Value, BackupError> {
         if !url.is_empty() && !valid_https(url) {
             return Err(fail(400, "WebDAV 地址需要 https"));
         }
-        db.set_setting(URL, url).await.map_err(|_| fail(500, "保存失败"))?;
+        db.set_setting(URL, url)
+            .await
+            .map_err(|_| fail(500, "保存失败"))?;
     }
     if let Some(username) = body.get("username").and_then(Value::as_str) {
-        db.set_setting(USER, username.trim()).await.map_err(|_| fail(500, "保存失败"))?;
+        db.set_setting(USER, username.trim())
+            .await
+            .map_err(|_| fail(500, "保存失败"))?;
     }
-    if let Some(password) = body.get("password").and_then(Value::as_str).filter(|text| !text.is_empty()) {
-        db.set_setting(PASSWORD, password).await.map_err(|_| fail(500, "保存失败"))?;
+    if let Some(password) = body
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        db.set_setting(PASSWORD, password)
+            .await
+            .map_err(|_| fail(500, "保存失败"))?;
     }
     if body.get("path").is_some() {
         let path = body["path"].as_str().unwrap_or("").trim();
-        let path = if path.is_empty() { DEFAULT_PATH.to_string() } else if path.starts_with('/') { path.to_string() } else { format!("/{path}") };
-        db.set_setting(PATH, &path).await.map_err(|_| fail(500, "保存失败"))?;
+        let path = if path.is_empty() {
+            DEFAULT_PATH.to_string()
+        } else if path.starts_with('/') {
+            path.to_string()
+        } else {
+            format!("/{path}")
+        };
+        db.set_setting(PATH, &path)
+            .await
+            .map_err(|_| fail(500, "保存失败"))?;
     }
     if let Some(hour) = body.get("hour").and_then(Value::as_i64) {
         if !(0..=23).contains(&hour) {
             return Err(fail(400, "每天几点需在 0-23 之间"));
         }
-        db.set_setting(HOUR, &hour.to_string()).await.map_err(|_| fail(500, "保存失败"))?;
+        db.set_setting(HOUR, &hour.to_string())
+            .await
+            .map_err(|_| fail(500, "保存失败"))?;
     } else if body.get("hour").is_some() {
         return Err(fail(400, "每天几点需在 0-23 之间"));
     }
@@ -109,7 +132,9 @@ pub async fn save(db: &Db, body: &Value) -> Result<Value, BackupError> {
         if !(1..=90).contains(&keep) {
             return Err(fail(400, "保留份数需在 1-90 之间"));
         }
-        db.set_setting(KEEP, &keep.to_string()).await.map_err(|_| fail(500, "保存失败"))?;
+        db.set_setting(KEEP, &keep.to_string())
+            .await
+            .map_err(|_| fail(500, "保存失败"))?;
     } else if body.get("keep").is_some() {
         return Err(fail(400, "保留份数需在 1-90 之间"));
     }
@@ -127,7 +152,10 @@ pub async fn restore_bytes(db: &Db, data: &[u8]) -> Result<(), BackupError> {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
     }
     if data.starts_with(MAGIC) {
-        return Err(fail(400, "备份已加密，请配置 FEISHU_CREDENTIAL_KEY 后再恢复"));
+        return Err(fail(
+            400,
+            "备份已加密，请配置 FEISHU_CREDENTIAL_KEY 后再恢复",
+        ));
     }
     if !data.starts_with(b"SQLite format 3\0") {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
@@ -176,7 +204,10 @@ pub async fn restore_webdav(db: &Db) -> Result<(), BackupError> {
     }
     let folder = join(&cfg.url, &cfg.path);
     let listing = dav_text(&cfg, "PROPFIND", &folder, Some("1"))?;
-    let name = backup_names(&listing).into_iter().next_back().ok_or(fail(400, "网盘上还没有备份文件"))?;
+    let name = backup_names(&listing)
+        .into_iter()
+        .next_back()
+        .ok_or(fail(400, "网盘上还没有备份文件"))?;
     let bytes = dav_bytes(&cfg, &join(&folder, &name))?;
     restore_bytes(db, &bytes).await
 }
@@ -203,7 +234,10 @@ async fn snapshot_unlocked(db: &Db) -> Result<PathBuf, BackupError> {
     std::fs::create_dir_all(&folder).map_err(|_| fail(500, "读取数据库失败"))?;
     let target = unique_snapshot(&folder);
     let escaped = target.to_string_lossy().replace('\'', "''");
-    sqlx::query(&format!("VACUUM INTO '{escaped}'")).execute(db.pool()).await.map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
+    sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+        .execute(db.pool())
+        .await
+        .map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
     if !sqlite_ok(&target) {
         let _ = std::fs::remove_file(&target);
         return Err(fail(500, "备份校验失败，请稍后重试"));
@@ -229,9 +263,17 @@ fn unique_snapshot(folder: &Path) -> PathBuf {
 }
 
 fn prune(folder: &Path) {
-    let mut files: Vec<_> = std::fs::read_dir(folder).into_iter().flatten().flatten().map(|entry| entry.path()).filter(|path| {
-        path.file_name().and_then(|name| name.to_str()).is_some_and(|name| name.starts_with("dav-") && name.ends_with(".db"))
-    }).collect();
+    let mut files: Vec<_> = std::fs::read_dir(folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("dav-") && name.ends_with(".db"))
+        })
+        .collect();
     files.sort();
     let keep = files.len().saturating_sub(3);
     for path in files.into_iter().take(keep) {
@@ -250,12 +292,17 @@ fn restore_into(live: &Path, source: &Path) -> bool {
     if path_unsafe(live) || path_unsafe(source) {
         return false;
     }
-    let output = Command::new("sqlite3").arg(live).arg(format!(".restore {}", source.display())).output();
+    let output = Command::new("sqlite3")
+        .arg(live)
+        .arg(format!(".restore {}", source.display()))
+        .output();
     output.is_ok_and(|output| output.status.success())
 }
 
 fn path_unsafe(path: &Path) -> bool {
-    path.to_string_lossy().chars().any(|ch| ch.is_whitespace() || ch == '\'' || ch == '"')
+    path.to_string_lossy()
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch == '\'' || ch == '"')
 }
 
 fn backup_names(xml: &str) -> Vec<String> {
@@ -295,17 +342,30 @@ fn percent_decode(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn dav(cfg: &Cfg, method: &str, url: &str, depth: Option<&str>, body: Option<&[u8]>) -> Result<u16, BackupError> {
+fn dav(
+    cfg: &Cfg,
+    method: &str,
+    url: &str,
+    depth: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<u16, BackupError> {
     let response = dav_call(cfg, method, url, depth, body)?;
     Ok(response.status())
 }
 
-fn dav_text(cfg: &Cfg, method: &str, url: &str, depth: Option<&str>) -> Result<String, BackupError> {
+fn dav_text(
+    cfg: &Cfg,
+    method: &str,
+    url: &str,
+    depth: Option<&str>,
+) -> Result<String, BackupError> {
     let response = dav_call(cfg, method, url, depth, None)?;
     if response.status() >= 400 {
         return Err(fail(400, "WebDAV 连不上，请检查地址和账号"));
     }
-    response.into_string().map_err(|_| fail(400, "WebDAV 连不上，请检查地址和账号"))
+    response
+        .into_string()
+        .map_err(|_| fail(400, "WebDAV 连不上，请检查地址和账号"))
 }
 
 fn dav_bytes(cfg: &Cfg, url: &str) -> Result<Vec<u8>, BackupError> {
@@ -317,21 +377,43 @@ fn dav_bytes(cfg: &Cfg, url: &str) -> Result<Vec<u8>, BackupError> {
         return Err(fail(400, "WebDAV 连不上，请检查地址和账号"));
     }
     let mut data = Vec::new();
-    response.into_reader().take(UPLOAD_MAX as u64 + 1).read_to_end(&mut data).map_err(|_| fail(400, "WebDAV 连不上，请检查地址和账号"))?;
+    response
+        .into_reader()
+        .take(UPLOAD_MAX as u64 + 1)
+        .read_to_end(&mut data)
+        .map_err(|_| fail(400, "WebDAV 连不上，请检查地址和账号"))?;
     if data.len() > UPLOAD_MAX {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
     }
     Ok(data)
 }
 
-fn dav_call(cfg: &Cfg, method: &str, url: &str, depth: Option<&str>, body: Option<&[u8]>) -> Result<ureq::Response, BackupError> {
-    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(20)).redirects(0).build();
-    let auth = format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(format!("{}:{}", cfg.username, cfg.password)));
+fn dav_call(
+    cfg: &Cfg,
+    method: &str,
+    url: &str,
+    depth: Option<&str>,
+    body: Option<&[u8]>,
+) -> Result<ureq::Response, BackupError> {
+    let agent = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
+        .timeout(std::time::Duration::from_secs(20))
+        .redirects(0)
+        .build();
+    let auth = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD
+            .encode(format!("{}:{}", cfg.username, cfg.password))
+    );
     let mut request = agent.request(method, url).set("Authorization", &auth);
     if let Some(depth) = depth {
         request = request.set("Depth", depth);
     }
-    let result = if let Some(body) = body { request.send_bytes(body) } else { request.call() };
+    let result = if let Some(body) = body {
+        request.send_bytes(body)
+    } else {
+        request.call()
+    };
     match result {
         Ok(response) => Ok(response),
         Err(ureq::Error::Status(status, response)) => {
@@ -353,26 +435,50 @@ async fn merged(db: &Db, body: Option<&Value>) -> Result<Cfg, BackupError> {
     if let Some(username) = body.get("username").and_then(Value::as_str) {
         cfg.username = username.trim().to_string();
     }
-    if let Some(password) = body.get("password").and_then(Value::as_str).filter(|text| !text.is_empty()) {
+    if let Some(password) = body
+        .get("password")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
         cfg.password = password.to_string();
     }
     if let Some(path) = body.get("path").and_then(Value::as_str) {
         let path = path.trim();
-        cfg.path = if path.is_empty() { DEFAULT_PATH.into() } else if path.starts_with('/') { path.into() } else { format!("/{path}") };
+        cfg.path = if path.is_empty() {
+            DEFAULT_PATH.into()
+        } else if path.starts_with('/') {
+            path.into()
+        } else {
+            format!("/{path}")
+        };
     }
     Ok(cfg)
 }
 
 async fn load(db: &Db) -> Result<Cfg, BackupError> {
-    let hour = setting(db, HOUR).await?.parse().ok().filter(|hour: &i64| (0..=23).contains(hour)).unwrap_or(3);
-    let keep = setting(db, KEEP).await?.parse().ok().filter(|keep: &i64| (1..=90).contains(keep)).unwrap_or(14);
+    let hour = setting(db, HOUR)
+        .await?
+        .parse()
+        .ok()
+        .filter(|hour: &i64| (0..=23).contains(hour))
+        .unwrap_or(3);
+    let keep = setting(db, KEEP)
+        .await?
+        .parse()
+        .ok()
+        .filter(|keep: &i64| (1..=90).contains(keep))
+        .unwrap_or(14);
     Ok(Cfg {
         url: setting(db, URL).await?,
         username: setting(db, USER).await?,
         password: setting(db, PASSWORD).await?,
         path: {
             let path = setting(db, PATH).await?;
-            if path.is_empty() { DEFAULT_PATH.into() } else { path }
+            if path.is_empty() {
+                DEFAULT_PATH.into()
+            } else {
+                path
+            }
         },
         hour,
         keep,
@@ -380,14 +486,18 @@ async fn load(db: &Db) -> Result<Cfg, BackupError> {
 }
 
 async fn setting(db: &Db, key: &str) -> Result<String, BackupError> {
-    db.setting(key).await.map(|value| value.unwrap_or_default()).map_err(|_| fail(500, "读取数据库失败"))
+    db.setting(key)
+        .await
+        .map(|value| value.unwrap_or_default())
+        .map_err(|_| fail(500, "读取数据库失败"))
 }
 
 async fn db_file(db: &Db) -> Result<PathBuf, BackupError> {
-    let file: Option<String> = sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| fail(500, "读取数据库失败"))?;
+    let file: Option<String> =
+        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+            .fetch_optional(db.pool())
+            .await
+            .map_err(|_| fail(500, "读取数据库失败"))?;
     let file = file.unwrap_or_default();
     if file.is_empty() {
         return Err(fail(400, "当前数据库不能导出"));
@@ -397,11 +507,7 @@ async fn db_file(db: &Db) -> Result<PathBuf, BackupError> {
 
 fn valid_https(url: &str) -> bool {
     let url = url.trim();
-    url.starts_with("https://")
-        && url.len() <= 500
-        && !url.contains('@')
-        && !url.chars().any(char::is_control)
-        && url["https://".len()..].contains('.')
+    url.len() <= 500 && crate::url_guard::validate_url(url, "https").is_ok()
 }
 
 fn join(base: &str, path: &str) -> String {
@@ -431,7 +537,12 @@ fn utc_stamp() -> String {
     let secs = now_secs();
     let (year, month, day) = civil_date(secs / 86_400);
     let rem = secs % 86_400;
-    format!("{year:04}{month:02}{day:02}-{:02}{:02}{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{year:04}{month:02}{day:02}-{:02}{:02}{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 fn civil_date(days: u64) -> (i32, u32, u32) {
@@ -449,7 +560,10 @@ fn civil_date(days: u64) -> (i32, u32, u32) {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
@@ -473,7 +587,11 @@ pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
             return Ok(false);
         }
     };
-    let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("dav-backup.db").to_string();
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("dav-backup.db")
+        .to_string();
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -513,7 +631,12 @@ fn utc_human() -> String {
     let secs = now_secs();
     let (year, month, day) = civil_date(secs / 86_400);
     let rem = secs % 86_400;
-    format!("{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 #[cfg(test)]
@@ -523,12 +646,19 @@ mod tests {
     #[test]
     fn names_come_from_webdav_listing() {
         let xml = r#"<D:href>/vpush-backups/</D:href><D:href>/vpush-backups/dav-20260814-030000.db</D:href><D:href>/x/dav-20260813-030000.db</D:href>"#;
-        assert_eq!(backup_names(xml), vec!["dav-20260813-030000.db".to_string(), "dav-20260814-030000.db".to_string()]);
+        assert_eq!(
+            backup_names(xml),
+            vec![
+                "dav-20260813-030000.db".to_string(),
+                "dav-20260814-030000.db".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
     async fn saves_config_downloads_and_restores_without_showing_the_password() {
-        let dir = std::env::temp_dir().join(format!("vpush-bak-{}-{}", std::process::id(), now_secs()));
+        let dir =
+            std::env::temp_dir().join(format!("vpush-bak-{}-{}", std::process::id(), now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("app.db");
         let db = Db::open(&path).await.unwrap();
@@ -545,9 +675,15 @@ mod tests {
         let bytes = std::fs::read(&snap).unwrap();
         db.set_setting("backup_marker", "after").await.unwrap();
         restore_bytes(&db, &bytes).await.unwrap();
-        assert_eq!(db.setting("backup_marker").await.unwrap().as_deref(), Some("before"));
+        assert_eq!(
+            db.setting("backup_marker").await.unwrap().as_deref(),
+            Some("before")
+        );
         assert!(restore_bytes(&db, b"not a database").await.is_err());
-        assert_eq!(db.setting("backup_marker").await.unwrap().as_deref(), Some("before"));
+        assert_eq!(
+            db.setting("backup_marker").await.unwrap().as_deref(),
+            Some("before")
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

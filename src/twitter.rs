@@ -41,7 +41,10 @@ pub fn spawn(db: Db) {
 }
 
 async fn poll(db: &Db) -> Result<(), String> {
-    let kols = db.kols_to_fetch("twitter").await.map_err(|e| e.to_string())?;
+    let kols = db
+        .kols_to_fetch("twitter")
+        .await
+        .map_err(|e| e.to_string())?;
     if kols.is_empty() {
         return Ok(());
     }
@@ -75,8 +78,13 @@ async fn poll(db: &Db) -> Result<(), String> {
 }
 
 async fn cookie(db: &Db) -> Result<Option<String>, String> {
-    let saved = db.setting("twitter_cookie").await.map_err(|e| e.to_string())?;
-    let raw = saved.or_else(|| std::env::var("TWITTER_COOKIE").ok()).unwrap_or_default();
+    let saved = db
+        .setting("twitter_cookie")
+        .await
+        .map_err(|e| e.to_string())?;
+    let raw = saved
+        .or_else(|| std::env::var("TWITTER_COOKIE").ok())
+        .unwrap_or_default();
     let auth = pair(&raw, "auth_token");
     let ct0 = pair(&raw, "ct0");
     if auth.is_empty() || ct0.is_empty() {
@@ -85,61 +93,121 @@ async fn cookie(db: &Db) -> Result<Option<String>, String> {
     Ok(Some(format!("auth_token={auth}; ct0={ct0}; lang=zh-CN")))
 }
 
-async fn pull(db: &Db, cookie: &str, kol_id: i64, name: &str, screen: &str, proxy: Option<String>) -> Result<(), String> {
+async fn pull(
+    db: &Db,
+    cookie: &str,
+    kol_id: i64,
+    name: &str,
+    screen: &str,
+    proxy: Option<String>,
+) -> Result<(), String> {
     let user_id = if screen.chars().all(|c| c.is_ascii_digit()) {
         screen.to_string()
     } else {
-        let looked = graphql(cookie, "UserByScreenName", &current_id("UserByScreenName"), &json!({"screen_name": screen, "withSafetyModeUserFields": true}), proxy.as_deref()).await?;
+        let looked = graphql(
+            cookie,
+            "UserByScreenName",
+            &current_id("UserByScreenName"),
+            &json!({"screen_name": screen, "withSafetyModeUserFields": true}),
+            proxy.as_deref(),
+        )
+        .await?;
         let result = &looked["data"]["user"]["result"];
         let id = field(result, "rest_id");
         if id.is_empty() {
             return Err(format!("X 未找到用户 {screen}"));
         }
-        let avatar = result["avatar"]["image_url"].as_str().unwrap_or("").replace("_normal", "_400x400");
+        let avatar = result["avatar"]["image_url"]
+            .as_str()
+            .unwrap_or("")
+            .replace("_normal", "_400x400");
         if avatar.starts_with("https://") {
-            db.set_avatar(kol_id, &avatar).await.map_err(|e| e.to_string())?;
+            db.set_avatar(kol_id, &avatar)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         id
     };
-    let data = graphql(cookie, "UserTweets", &current_id("UserTweets"), &json!({
-        "userId": user_id,
-        "count": 20,
-        "includePromotedContent": false,
-        "withQuickPromoteEligibilityTweetFields": true,
-        "withVoice": true,
-        "withV2Timeline": true
-    }), proxy.as_deref()).await?;
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let data = graphql(
+        cookie,
+        "UserTweets",
+        &current_id("UserTweets"),
+        &json!({
+            "userId": user_id,
+            "count": 20,
+            "includePromotedContent": false,
+            "withQuickPromoteEligibilityTweetFields": true,
+            "withVoice": true,
+            "withV2Timeline": true
+        }),
+        proxy.as_deref(),
+    )
+    .await?;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     for tweet in tweets(&data, screen) {
-        let Some(unix) = tweet.published_unix else { continue };
+        let Some(unix) = tweet.published_unix else {
+            continue;
+        };
         if now.saturating_sub(unix) > 36 * 3600 {
             continue;
         }
-        if db.has_post("twitter", &tweet.external_id).await.map_err(|e| e.to_string())? {
+        if db
+            .has_post("twitter", &tweet.external_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             continue;
         }
         let images = serde_json::to_string(&tweet.images).unwrap_or_else(|_| "[]".into());
         let kind = if tweet.reply { "reply" } else { "post" };
-        db.save_fetched(kol_id, &tweet.external_id, &tweet.content.chars().take(80).collect::<String>(), &tweet.content, kind, &images, &tweet.url, &tweet.published_at)
-            .await
-            .map_err(|e| e.to_string())?;
-        if now.saturating_sub(unix) > 60 * 60 || !db.should_push(kol_id, kind).await.map_err(|e| e.to_string())? {
+        db.save_fetched(
+            kol_id,
+            &tweet.external_id,
+            &tweet.content.chars().take(80).collect::<String>(),
+            &tweet.content,
+            kind,
+            &images,
+            &tweet.url,
+            &tweet.published_at,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
+        if now.saturating_sub(unix) > 60 * 60
+            || !db
+                .should_push(kol_id, kind)
+                .await
+                .map_err(|e| e.to_string())?
+        {
             continue;
         }
-        crate::push::deliver(db, kol_id, &crate::feishu::Note {
-            kol_name: name,
-            platform: "twitter",
-            post_type: kind,
-            title: &tweet.content.chars().take(80).collect::<String>(),
-            content: &tweet.content,
-            url: &tweet.url,
-            published_at: &tweet.published_at,
-        }).await;
+        crate::push::deliver(
+            db,
+            kol_id,
+            &crate::feishu::Note {
+                kol_name: name,
+                platform: "twitter",
+                post_type: kind,
+                title: &tweet.content.chars().take(80).collect::<String>(),
+                content: &tweet.content,
+                url: &tweet.url,
+                published_at: &tweet.published_at,
+            },
+        )
+        .await;
     }
     Ok(())
 }
 
-async fn graphql(cookie: &str, operation: &str, query_id: &str, variables: &Value, proxy: Option<&str>) -> Result<Value, String> {
+async fn graphql(
+    cookie: &str,
+    operation: &str,
+    query_id: &str,
+    variables: &Value,
+    proxy: Option<&str>,
+) -> Result<Value, String> {
     post_graphql(cookie, operation, query_id, variables, proxy).await
 }
 
@@ -160,14 +228,23 @@ fn chrome_client() -> Result<wreq::Client, String> {
         .map_err(|err| err.to_string())
 }
 
-async fn post_graphql(cookie: &str, operation: &str, query_id: &str, variables: &Value, proxy: Option<&str>) -> Result<Value, String> {
+async fn post_graphql(
+    cookie: &str,
+    operation: &str,
+    query_id: &str,
+    variables: &Value,
+    proxy: Option<&str>,
+) -> Result<Value, String> {
     let ct0 = pair(cookie, "ct0");
     let features: Value = serde_json::from_str(FEATURES).unwrap_or(json!({}));
     let body = json!({"variables": variables, "features": features}).to_string();
     let url = format!("https://x.com/i/api/graphql/{query_id}/{operation}");
     let mut request = browser()?
         .post(&url)
-        .query(&[("variables", variables.to_string()), ("features", FEATURES.to_string())])
+        .query(&[
+            ("variables", variables.to_string()),
+            ("features", FEATURES.to_string()),
+        ])
         .header("Authorization", format!("Bearer {BEARER}"))
         .header("Cookie", cookie)
         .header("x-csrf-token", &ct0)
@@ -177,10 +254,7 @@ async fn post_graphql(cookie: &str, operation: &str, query_id: &str, variables: 
     if let Some(proxy) = proxy {
         request = request.proxy(wreq::Proxy::all(proxy).map_err(|err| err.to_string())?);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+    let response = request.send().await.map_err(|err| err.to_string())?;
     let status = response.status().as_u16();
     let text = response.text().await.map_err(|err| err.to_string())?;
     if status == 400 || status == 404 {
@@ -191,7 +265,11 @@ async fn post_graphql(cookie: &str, operation: &str, query_id: &str, variables: 
         return Err(format!("X {operation} HTTP {status}"));
     }
     let value: Value = serde_json::from_str(&text).map_err(|_| "X 响应不是 JSON".to_string())?;
-    if value.get("errors").and_then(Value::as_array).is_some_and(|items| !items.is_empty()) {
+    if value
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
         return Err(format!("X {operation} 返回错误"));
     }
     Ok(value)
@@ -199,14 +277,14 @@ async fn post_graphql(cookie: &str, operation: &str, query_id: &str, variables: 
 
 fn tweets(data: &Value, screen: &str) -> Vec<Tweet> {
     let mut out = Vec::new();
-    let Some(instructions) = data["data"]["user"]["result"]["timeline"]["timeline"]["instructions"].as_array() else {
+    let Some(instructions) =
+        data["data"]["user"]["result"]["timeline"]["timeline"]["instructions"].as_array()
+    else {
         return out;
     };
     for instruction in instructions {
         let entries = if instruction["type"] == "TimelineAddEntries" {
             instruction["entries"].as_array()
-        } else if instruction["type"] == "TimelinePinEntry" {
-            None
         } else {
             None
         };
@@ -233,7 +311,11 @@ fn tweet_from(entry: &Value, screen: &str) -> Option<Tweet> {
         return None;
     }
     let external_id = field(&result, "rest_id");
-    let external_id = if external_id.is_empty() { field(legacy, "id_str") } else { external_id };
+    let external_id = if external_id.is_empty() {
+        field(legacy, "id_str")
+    } else {
+        external_id
+    };
     if external_id.is_empty() {
         return None;
     }
@@ -241,13 +323,20 @@ fn tweet_from(entry: &Value, screen: &str) -> Option<Tweet> {
     if text.is_empty() {
         text = field(legacy, "text");
     }
-    let note = field(&result["note_tweet"]["note_tweet_results"]["result"], "text");
+    let note = field(
+        &result["note_tweet"]["note_tweet_results"]["result"],
+        "text",
+    );
     if note.chars().count() > text.chars().count() {
         text = note;
     }
     let images = photos(legacy);
     if text.is_empty() {
-        text = if images.is_empty() { return None } else { "图片".into() };
+        text = if images.is_empty() {
+            return None;
+        } else {
+            "图片".into()
+        };
     }
     let (published_at, published_unix) = published(&field(legacy, "created_at"));
     let url = format!("https://x.com/{screen}/status/{external_id}");
@@ -264,7 +353,9 @@ fn tweet_from(entry: &Value, screen: &str) -> Option<Tweet> {
 
 fn photos(legacy: &Value) -> Vec<String> {
     let mut out = Vec::new();
-    let Some(media) = legacy["extended_entities"]["media"].as_array() else { return out };
+    let Some(media) = legacy["extended_entities"]["media"].as_array() else {
+        return out;
+    };
     for item in media {
         if item["type"] != "photo" {
             continue;
@@ -285,7 +376,14 @@ fn published(raw: &str) -> (String, Option<i64>) {
             let days = beijing.div_euclid(86400);
             let sod = beijing.rem_euclid(86400);
             let (y, m, d) = civil_from_days(days);
-            return (format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", sod / 3600, (sod % 3600) / 60), Some(unix));
+            return (
+                format!(
+                    "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+                    sod / 3600,
+                    (sod % 3600) / 60
+                ),
+                Some(unix),
+            );
         }
     }
     (raw.to_string(), None)
@@ -305,15 +403,31 @@ fn twitter_unix(parts: &[&str]) -> Option<i64> {
 
 fn month_num(name: &str) -> Option<u32> {
     Some(match name {
-        "Jan" => 1, "Feb" => 2, "Mar" => 3, "Apr" => 4, "May" => 5, "Jun" => 6,
-        "Jul" => 7, "Aug" => 8, "Sep" => 9, "Oct" => 10, "Nov" => 11, "Dec" => 12,
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
         _ => return None,
     })
 }
 
 fn zone_secs(raw: &str) -> Option<i64> {
-    let sign = match raw.as_bytes().first() { Some(b'+') => 1, Some(b'-') => -1, _ => return None };
-    if raw.len() < 5 { return None; }
+    let sign = match raw.as_bytes().first() {
+        Some(b'+') => 1,
+        Some(b'-') => -1,
+        _ => return None,
+    };
+    if raw.len() < 5 {
+        return None;
+    }
     let hour: i64 = raw[1..3].parse().ok()?;
     let minute: i64 = raw[3..5].parse().ok()?;
     Some(sign * (hour * 3600 + minute * 60))
@@ -345,15 +459,22 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 
 fn screen_name(raw: &str) -> String {
     let text = raw.trim().trim_end_matches('/');
-    let seg = text.rsplit('/').next().unwrap_or(text).trim_start_matches('@');
+    let seg = text
+        .rsplit('/')
+        .next()
+        .unwrap_or(text)
+        .trim_start_matches('@');
     seg.chars().take(15).collect()
 }
 
 fn pair(cookie: &str, name: &str) -> String {
-    cookie.split(';').find_map(|part| {
-        let (key, value) = part.trim().split_once('=')?;
-        (key == name).then(|| value.to_string())
-    }).unwrap_or_default()
+    cookie
+        .split(';')
+        .find_map(|part| {
+            let (key, value) = part.trim().split_once('=')?;
+            (key == name).then(|| value.to_string())
+        })
+        .unwrap_or_default()
 }
 
 struct Ids {
@@ -377,7 +498,11 @@ fn id_store() -> &'static Mutex<Ids> {
 
 fn current_id(operation: &str) -> String {
     let guard = id_store().lock().unwrap_or_else(|err| err.into_inner());
-    if operation == "UserByScreenName" { guard.by_name.clone() } else { guard.tweets.clone() }
+    if operation == "UserByScreenName" {
+        guard.by_name.clone()
+    } else {
+        guard.tweets.clone()
+    }
 }
 
 fn mark_ids_stale() {
@@ -416,27 +541,33 @@ async fn refresh_ids(cookie: &str, proxy: Option<&str>) {
     }
 }
 
-async fn fetch_ids(cookie: &str, proxy: Option<&str>) -> Result<(Option<String>, Option<String>), String> {
+async fn fetch_ids(
+    cookie: &str,
+    proxy: Option<&str>,
+) -> Result<(Option<String>, Option<String>), String> {
     let page = get_html("https://x.com/", cookie, proxy).await?;
-    let Some(url) = bundle_url(&page) else { return Ok((None, None)) };
+    let Some(url) = bundle_url(&page) else {
+        return Ok((None, None));
+    };
     let bundle = get_html(&url, cookie, proxy).await?;
-    Ok((find_query_id(&bundle, "UserTweets"), find_query_id(&bundle, "UserByScreenName")))
+    Ok((
+        find_query_id(&bundle, "UserTweets"),
+        find_query_id(&bundle, "UserByScreenName"),
+    ))
 }
 
 async fn get_html(url: &str, cookie: &str, proxy: Option<&str>) -> Result<String, String> {
     if !allowed_asset(url) {
         return Err("地址不允许".into());
     }
-    let mut request = browser()?.get(url)
-        .header("Cookie", cookie)
-        .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    let mut request = browser()?.get(url).header("Cookie", cookie).header(
+        "Accept",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    );
     if let Some(proxy) = proxy {
         request = request.proxy(wreq::Proxy::all(proxy).map_err(|err| err.to_string())?);
     }
-    let response = request
-        .send()
-        .await
-        .map_err(|err| err.to_string())?;
+    let response = request.send().await.map_err(|err| err.to_string())?;
     let text = response.text().await.map_err(|err| err.to_string())?;
     Ok(text.chars().take(8_000_000).collect())
 }
@@ -446,7 +577,9 @@ fn allowed_asset(url: &str) -> bool {
         || (url.starts_with("https://abs.twimg.com/responsive-web/client-web/main.")
             && url.ends_with(".js")
             && !url.contains("..")
-            && url.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':')))
+            && url.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'/' | b':')
+            }))
 }
 
 fn bundle_url(page: &str) -> Option<String> {
@@ -490,11 +623,17 @@ fn query_in(window: &str) -> Option<String> {
 }
 
 fn query_ok(id: &str) -> bool {
-    (8..=80).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    (8..=80).contains(&id.len())
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn field(value: &Value, key: &str) -> String {
@@ -532,15 +671,27 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].content, "你好");
         assert_eq!(rows[0].published_at, "2012-10-11 04:19");
-        assert_eq!(rows[0].images, vec!["https://pbs.twimg.com/a.jpg".to_string()]);
+        assert_eq!(
+            rows[0].images,
+            vec!["https://pbs.twimg.com/a.jpg".to_string()]
+        );
         assert_eq!(rows[0].url, "https://x.com/alice/status/42");
         assert_eq!(screen_name("https://x.com/alice"), "alice");
         assert_eq!(pair("auth_token=a; ct0=b", "ct0"), "b");
         let page = r#"<script src="https://abs.twimg.com/responsive-web/client-web/main.abc123.js"></script>"#;
-        assert_eq!(bundle_url(page).as_deref(), Some("https://abs.twimg.com/responsive-web/client-web/main.abc123.js"));
+        assert_eq!(
+            bundle_url(page).as_deref(),
+            Some("https://abs.twimg.com/responsive-web/client-web/main.abc123.js")
+        );
         let bundle = r#"{queryId:"NEWUSER01",operationName:"UserTweets",}{queryId:"OLD",}{queryId:"NAMEID001",operationName:"UserByScreenName"}"#;
-        assert_eq!(find_query_id(bundle, "UserTweets").as_deref(), Some("NEWUSER01"));
-        assert_eq!(find_query_id(bundle, "UserByScreenName").as_deref(), Some("NAMEID001"));
+        assert_eq!(
+            find_query_id(bundle, "UserTweets").as_deref(),
+            Some("NEWUSER01")
+        );
+        assert_eq!(
+            find_query_id(bundle, "UserByScreenName").as_deref(),
+            Some("NAMEID001")
+        );
         assert!(!allowed_asset("https://evil.example/main.js"));
     }
 
@@ -548,8 +699,16 @@ mod tests {
     fn chrome124_tls_hello_differs_from_firefox() {
         let chrome = tls_hello(wreq_util::Emulation::Chrome124);
         let firefox = tls_hello(wreq_util::Emulation::Firefox139);
-        assert_eq!(chrome.first().copied(), Some(0x16), "chrome hello is not TLS");
-        assert_eq!(firefox.first().copied(), Some(0x16), "firefox hello is not TLS");
+        assert_eq!(
+            chrome.first().copied(),
+            Some(0x16),
+            "chrome hello is not TLS"
+        );
+        assert_eq!(
+            firefox.first().copied(),
+            Some(0x16),
+            "firefox hello is not TLS"
+        );
         assert_ne!(chrome, firefox);
         assert!(chrome.windows(2).any(|part| part == b"h2"));
     }
@@ -565,7 +724,10 @@ mod tests {
             buf.truncate(n);
             buf
         });
-        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
         runtime.block_on(async move {
             let client = wreq::Client::builder()
                 .emulation(profile)
@@ -574,7 +736,10 @@ mod tests {
                 .timeout(Duration::from_secs(2))
                 .build()
                 .unwrap();
-            let _ = client.get(format!("https://127.0.0.1:{port}/")).send().await;
+            let _ = client
+                .get(format!("https://127.0.0.1:{port}/"))
+                .send()
+                .await;
         });
         reader.join().unwrap()
     }

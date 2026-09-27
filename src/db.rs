@@ -65,6 +65,7 @@ pub struct User {
     pub llm_api_key: String,
     pub llm_model: String,
     pub llm_api_format: String,
+    #[allow(dead_code)]
     pub wechat_openid: String,
 }
 
@@ -564,11 +565,12 @@ CREATE TABLE IF NOT EXISTS ima_abstract_translations (
 );
 ";
 
+#[allow(dead_code)]
 impl Db {
     pub async fn open(path: &Path) -> Result<Self, sqlx::Error> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent).map_err(|err| sqlx::Error::Io(err))?;
+                std::fs::create_dir_all(parent).map_err(sqlx::Error::Io)?;
             }
         }
         let opts = SqliteConnectOptions::new()
@@ -615,7 +617,14 @@ impl Db {
             .collect())
     }
 
-    pub async fn insert_feishu_source(&self, group_id: &str, media_id: &str, title: &str, timeline_path: &str, asset_root: &str) -> Result<(), sqlx::Error> {
+    pub async fn insert_feishu_source(
+        &self,
+        group_id: &str,
+        media_id: &str,
+        title: &str,
+        timeline_path: &str,
+        asset_root: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO feishu_document_sources (source_key_hash, group_id, media_id, title, timeline_path, asset_root) VALUES (?, ?, ?, ?, ?, ?)",
         )
@@ -630,7 +639,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn feishu_asset_root(&self, media_id: &str, group: &str) -> Result<Option<(String, String)>, sqlx::Error> {
+    pub async fn feishu_asset_root(
+        &self,
+        media_id: &str,
+        group: &str,
+    ) -> Result<Option<(String, String)>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT group_id, asset_root FROM feishu_document_sources \
              WHERE media_id = ? AND enabled = 1 AND deleted_at IS NULL AND (? = '' OR group_id = ?) LIMIT 1",
@@ -643,7 +656,11 @@ impl Db {
         Ok(row.map(|row| (row.get("group_id"), row.get("asset_root"))))
     }
 
-    pub async fn feishu_document(&self, media_id: &str, group: &str) -> Result<Option<Value>, sqlx::Error> {
+    pub async fn feishu_document(
+        &self,
+        media_id: &str,
+        group: &str,
+    ) -> Result<Option<Value>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT media_id, group_id, title, canonical_url, last_success_at FROM feishu_document_sources \
              WHERE media_id = ? AND enabled = 1 AND deleted_at IS NULL AND (? = '' OR group_id = ?) LIMIT 1",
@@ -678,14 +695,20 @@ impl Db {
         if self.feishu_group_exists(group_id).await? {
             return Ok(true);
         }
-        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ima_document_index WHERE group_id = ?")
-            .bind(group_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM ima_document_index WHERE group_id = ?")
+                .bind(group_id)
+                .fetch_one(&self.pool)
+                .await?;
         Ok(n > 0)
     }
 
-    pub async fn record_ima_listing(&self, group_id: &str, group_name: &str, file: &crate::ima_client::File) -> Result<(), sqlx::Error> {
+    pub async fn record_ima_listing(
+        &self,
+        group_id: &str,
+        group_name: &str,
+        file: &crate::ima_client::File,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO ima_document_index (group_id, media_id, day, sort_date, name, group_name, abstract, size)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -706,7 +729,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn mark_ima_pdf(&self, group_id: &str, media_id: &str, pdf_path: &str) -> Result<(), sqlx::Error> {
+    pub async fn mark_ima_pdf(
+        &self,
+        group_id: &str,
+        media_id: &str,
+        pdf_path: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE ima_document_index SET pdf_path = ?, downloaded_at = datetime('now') WHERE group_id = ? AND media_id = ?")
             .bind(pdf_path)
             .bind(group_id)
@@ -743,10 +771,17 @@ impl Db {
     }
 
     pub async fn ima_document_count(&self) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar("SELECT COUNT(*) FROM ima_document_index").fetch_one(&self.pool).await
+        sqlx::query_scalar("SELECT COUNT(*) FROM ima_document_index")
+            .fetch_one(&self.pool)
+            .await
     }
 
-    pub async fn ima_downloads_between(&self, group_id: &str, started: i64, finished: i64) -> Result<i64, sqlx::Error> {
+    pub async fn ima_downloads_between(
+        &self,
+        group_id: &str,
+        started: i64,
+        finished: i64,
+    ) -> Result<i64, sqlx::Error> {
         if group_id.is_empty() || finished < started {
             return Ok(0);
         }
@@ -770,7 +805,9 @@ impl Db {
         .bind(group_id)
         .fetch_optional(&self.pool)
         .await?;
-        let Some(stamp) = stamp else { return Ok((String::new(), 0)) };
+        let Some(stamp) = stamp else {
+            return Ok((String::new(), 0));
+        };
         if stamp.len() < 19 {
             return Ok((stamp, 1));
         }
@@ -793,7 +830,11 @@ impl Db {
         Ok(rows.iter().map(ima_index_row).collect())
     }
 
-    pub async fn ima_documents_for_media(&self, media_id: &str, group: &str) -> Result<Vec<Value>, sqlx::Error> {
+    pub async fn ima_documents_for_media(
+        &self,
+        media_id: &str,
+        group: &str,
+    ) -> Result<Vec<Value>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT group_id, media_id, day, sort_date, name, group_name, abstract, size, chars, pdf_path, txt_path, downloaded_at
              FROM ima_document_index WHERE media_id = ? AND (? = '' OR group_id = ?)",
@@ -806,13 +847,20 @@ impl Db {
         Ok(rows.iter().map(ima_index_row).collect())
     }
 
-    pub async fn ima_ticker_page(&self, raw_code: &str, readable: &[String], limit: i64) -> Result<Value, sqlx::Error> {
+    pub async fn ima_ticker_page(
+        &self,
+        raw_code: &str,
+        readable: &[String],
+        limit: i64,
+    ) -> Result<Value, sqlx::Error> {
         let code = self.ima_ticker_code(raw_code).await?;
         if code.is_empty() || readable.is_empty() {
             return Ok(json!({"code": code, "name": "", "digest": {}, "items": [], "count": 0}));
         }
         let limit = limit.clamp(1, 200);
-        let placeholders = std::iter::repeat("?").take(readable.len()).collect::<Vec<_>>().join(", ");
+        let placeholders = std::iter::repeat_n("?", readable.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let sql = format!(
             "SELECT t.group_id AS group_id, t.media_id AS media_id, t.name AS ticker_name, d.name AS name, d.sort_date AS sort_date, d.day AS day, \
              re.rating AS rating, re.target_price AS target_price, re.thesis AS thesis \
@@ -841,9 +889,16 @@ impl Db {
                 }
             })
         }).collect();
-        let ticker_name = rows.first().map(|row| row.get::<String, _>("ticker_name")).unwrap_or_default();
+        let ticker_name = rows
+            .first()
+            .map(|row| row.get::<String, _>("ticker_name"))
+            .unwrap_or_default();
         let digest = self.ima_ticker_digest(&code, readable).await?;
-        let name = digest["name"].as_str().filter(|text| !text.is_empty()).unwrap_or(&ticker_name).to_string();
+        let name = digest["name"]
+            .as_str()
+            .filter(|text| !text.is_empty())
+            .unwrap_or(&ticker_name)
+            .to_string();
         let count = items.len();
         Ok(json!({"code": code, "name": name, "digest": digest, "items": items, "count": count}))
     }
@@ -862,23 +917,40 @@ impl Db {
         Ok(found.unwrap_or_else(|| raw.to_ascii_uppercase()))
     }
 
-    async fn ima_ticker_digest(&self, code: &str, readable: &[String]) -> Result<Value, sqlx::Error> {
+    async fn ima_ticker_digest(
+        &self,
+        code: &str,
+        readable: &[String],
+    ) -> Result<Value, sqlx::Error> {
         let row = sqlx::query("SELECT name, source_count, digest, updated_at, status FROM ima_ticker_digests WHERE kind = 'ticker' AND code = ?")
             .bind(code)
             .fetch_optional(&self.pool)
             .await?;
         let Some(row) = row else { return Ok(json!({})) };
-        let sources = sqlx::query_scalar::<_, String>("SELECT DISTINCT group_id FROM report_extraction_tickers WHERE code = ?")
-            .bind(code)
-            .fetch_all(&self.pool)
-            .await?;
-        let configured = sqlx::query_scalar::<_, String>("SELECT DISTINCT group_id FROM ima_document_index").fetch_all(&self.pool).await?;
-        let visible = sources.iter().filter(|group| configured.iter().any(|item| item == *group)).collect::<Vec<_>>();
-        if visible.is_empty() || visible.iter().any(|group| !readable.iter().any(|item| item == *group)) {
+        let sources = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT group_id FROM report_extraction_tickers WHERE code = ?",
+        )
+        .bind(code)
+        .fetch_all(&self.pool)
+        .await?;
+        let configured =
+            sqlx::query_scalar::<_, String>("SELECT DISTINCT group_id FROM ima_document_index")
+                .fetch_all(&self.pool)
+                .await?;
+        let visible = sources
+            .iter()
+            .filter(|group| configured.iter().any(|item| item == *group))
+            .collect::<Vec<_>>();
+        if visible.is_empty()
+            || visible
+                .iter()
+                .any(|group| !readable.iter().any(|item| item == *group))
+        {
             return Ok(json!({}));
         }
         let raw = row.get::<String, _>("digest");
-        let mut view = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({"consensus": raw.chars().take(1200).collect::<String>()}));
+        let mut view = serde_json::from_str::<Value>(&raw)
+            .unwrap_or_else(|_| json!({"consensus": raw.chars().take(1200).collect::<String>()}));
         if !view.is_object() {
             view = json!({"consensus": raw.chars().take(1200).collect::<String>()});
         }
@@ -889,16 +961,28 @@ impl Db {
         Ok(view)
     }
 
-    pub async fn ima_abstract_translation(&self, group_id: &str, media_id: &str) -> Result<(String, String), sqlx::Error> {
+    pub async fn ima_abstract_translation(
+        &self,
+        group_id: &str,
+        media_id: &str,
+    ) -> Result<(String, String), sqlx::Error> {
         let row = sqlx::query("SELECT src_hash, abstract_zh FROM ima_abstract_translations WHERE group_id = ? AND media_id = ?")
             .bind(group_id)
             .bind(media_id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| (row.get("src_hash"), row.get("abstract_zh"))).unwrap_or_default())
+        Ok(row
+            .map(|row| (row.get("src_hash"), row.get("abstract_zh")))
+            .unwrap_or_default())
     }
 
-    pub async fn save_ima_abstract_translation(&self, group_id: &str, media_id: &str, src_hash: &str, text: &str) -> Result<(), sqlx::Error> {
+    pub async fn save_ima_abstract_translation(
+        &self,
+        group_id: &str,
+        media_id: &str,
+        src_hash: &str,
+        text: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO ima_abstract_translations (group_id, media_id, src_hash, abstract_zh) VALUES (?, ?, ?, ?) \
              ON CONFLICT(group_id, media_id) DO UPDATE SET src_hash = excluded.src_hash, abstract_zh = excluded.abstract_zh",
@@ -912,20 +996,29 @@ impl Db {
         Ok(())
     }
 
-    pub async fn ima_access(&self, user_id: i64) -> Result<(HashSet<String>, HashSet<String>), sqlx::Error> {
-        let acl = sqlx::query_scalar::<_, String>("SELECT group_id FROM ima_kb_acl WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?;
-        let subscribed = sqlx::query_scalar::<_, String>("SELECT group_id FROM ima_kb_subscriptions WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await?;
+    pub async fn ima_access(
+        &self,
+        user_id: i64,
+    ) -> Result<(HashSet<String>, HashSet<String>), sqlx::Error> {
+        let acl =
+            sqlx::query_scalar::<_, String>("SELECT group_id FROM ima_kb_acl WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
+        let subscribed = sqlx::query_scalar::<_, String>(
+            "SELECT group_id FROM ima_kb_subscriptions WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok((acl.into_iter().collect(), subscribed.into_iter().collect()))
     }
 
     pub async fn ima_kb_subscribe(&self, user_id: i64, group_id: &str) -> Result<(), sqlx::Error> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         sqlx::query("INSERT OR IGNORE INTO ima_kb_subscriptions (user_id, group_id, created_at) VALUES (?, ?, ?)")
             .bind(user_id)
             .bind(group_id)
@@ -935,7 +1028,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn ima_kb_unsubscribe(&self, user_id: i64, group_id: &str) -> Result<(), sqlx::Error> {
+    pub async fn ima_kb_unsubscribe(
+        &self,
+        user_id: i64,
+        group_id: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM ima_kb_subscriptions WHERE user_id = ? AND group_id = ?")
             .bind(user_id)
             .bind(group_id)
@@ -953,10 +1050,20 @@ impl Db {
         .await
     }
 
-    pub async fn set_ima_kb_acl(&self, group_id: &str, user_ids: &[i64]) -> Result<(), sqlx::Error> {
+    pub async fn set_ima_kb_acl(
+        &self,
+        group_id: &str,
+        user_ids: &[i64],
+    ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM ima_kb_acl WHERE group_id = ?").bind(group_id).execute(&mut *tx).await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        sqlx::query("DELETE FROM ima_kb_acl WHERE group_id = ?")
+            .bind(group_id)
+            .execute(&mut *tx)
+            .await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         for uid in user_ids {
             sqlx::query("INSERT OR IGNORE INTO ima_kb_acl (group_id, user_id) VALUES (?, ?)")
                 .bind(group_id)
@@ -970,10 +1077,12 @@ impl Db {
                 .execute(&mut *tx)
                 .await?;
         }
-        let existing = sqlx::query_scalar::<_, i64>("SELECT user_id FROM ima_kb_subscriptions WHERE group_id = ?")
-            .bind(group_id)
-            .fetch_all(&mut *tx)
-            .await?;
+        let existing = sqlx::query_scalar::<_, i64>(
+            "SELECT user_id FROM ima_kb_subscriptions WHERE group_id = ?",
+        )
+        .bind(group_id)
+        .fetch_all(&mut *tx)
+        .await?;
         for uid in existing {
             if !user_ids.contains(&uid) {
                 sqlx::query("DELETE FROM ima_kb_subscriptions WHERE group_id = ? AND user_id = ?")
@@ -987,45 +1096,72 @@ impl Db {
         Ok(())
     }
 
-    pub async fn ima_kb_group_ids_for_user(&self, user_id: i64) -> Result<Vec<String>, sqlx::Error> {
+    pub async fn ima_kb_group_ids_for_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
         sqlx::query_scalar("SELECT group_id FROM ima_kb_acl WHERE user_id = ? ORDER BY group_id")
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
     }
 
-    pub async fn ima_kb_subscribed_group_ids_for_user(&self, user_id: i64) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT group_id FROM ima_kb_subscriptions WHERE user_id = ? ORDER BY group_id")
-            .bind(user_id)
-            .fetch_all(&self.pool)
-            .await
+    pub async fn ima_kb_subscribed_group_ids_for_user(
+        &self,
+        user_id: i64,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT group_id FROM ima_kb_subscriptions WHERE user_id = ? ORDER BY group_id",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await
     }
 
     async fn ima_kb_acl_map(&self) -> Result<HashMap<i64, Vec<String>>, sqlx::Error> {
-        let rows = sqlx::query("SELECT user_id, group_id FROM ima_kb_acl ORDER BY group_id").fetch_all(&self.pool).await?;
+        let rows = sqlx::query("SELECT user_id, group_id FROM ima_kb_acl ORDER BY group_id")
+            .fetch_all(&self.pool)
+            .await?;
         let mut mapped = HashMap::new();
         for row in rows {
-            mapped.entry(row.get::<i64, _>("user_id")).or_insert_with(Vec::new).push(row.get("group_id"));
+            mapped
+                .entry(row.get::<i64, _>("user_id"))
+                .or_insert_with(Vec::new)
+                .push(row.get("group_id"));
         }
         Ok(mapped)
     }
 
     async fn ima_kb_sub_map(&self) -> Result<HashMap<i64, Vec<String>>, sqlx::Error> {
-        let rows = sqlx::query("SELECT user_id, group_id FROM ima_kb_subscriptions ORDER BY group_id").fetch_all(&self.pool).await?;
+        let rows =
+            sqlx::query("SELECT user_id, group_id FROM ima_kb_subscriptions ORDER BY group_id")
+                .fetch_all(&self.pool)
+                .await?;
         let mut mapped = HashMap::new();
         for row in rows {
-            mapped.entry(row.get::<i64, _>("user_id")).or_insert_with(Vec::new).push(row.get("group_id"));
+            mapped
+                .entry(row.get::<i64, _>("user_id"))
+                .or_insert_with(Vec::new)
+                .push(row.get("group_id"));
         }
         Ok(mapped)
     }
 
-    pub async fn set_ima_kb_acl_for_user(&self, user_id: i64, group_ids: &[String]) -> Result<(), sqlx::Error> {
+    pub async fn set_ima_kb_acl_for_user(
+        &self,
+        user_id: i64,
+        group_ids: &[String],
+    ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query_scalar::<_, String>("SELECT group_id FROM ima_kb_acl WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_all(&mut *tx)
-            .await?;
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let existing =
+            sqlx::query_scalar::<_, String>("SELECT group_id FROM ima_kb_acl WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_all(&mut *tx)
+                .await?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
         for group_id in group_ids {
             if existing.iter().any(|item| item == group_id) {
                 continue;
@@ -1087,7 +1223,11 @@ impl Db {
         Ok((ready, pending, failed))
     }
 
-    pub async fn note_hosted_image(&self, source_url: &str, status: &str) -> Result<(), sqlx::Error> {
+    pub async fn note_hosted_image(
+        &self,
+        source_url: &str,
+        status: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO hosted_images (source_url, status) VALUES (?, ?)")
             .bind(source_url)
             .bind(status)
@@ -1109,9 +1249,13 @@ impl Db {
     }
 
     pub async fn save_cookie(&self, key: &str, value: &str) -> Result<(), sqlx::Error> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         self.set_setting(key, value).await?;
-        self.set_setting(&format!("{key}_updated_at"), &now.to_string()).await
+        self.set_setting(&format!("{key}_updated_at"), &now.to_string())
+            .await
     }
 
     pub async fn clear_cookie(&self, kind: &str) -> Result<(), CatalogError> {
@@ -1133,9 +1277,14 @@ impl Db {
         Ok(polling_json(&settings))
     }
 
-    pub async fn update_polling(&self, body: &serde_json::Map<String, Value>) -> Result<Value, CatalogError> {
+    pub async fn update_polling(
+        &self,
+        body: &serde_json::Map<String, Value>,
+    ) -> Result<Value, CatalogError> {
         for (name, key, _default, lo, hi) in POLL_FIELDS {
-            let Some(value) = body.get(*name) else { continue };
+            let Some(value) = body.get(*name) else {
+                continue;
+            };
             let Some(n) = value.as_i64() else {
                 return Err(CatalogError::Invalid(format!("{name} 需在 {lo}-{hi} 之间")));
             };
@@ -1145,7 +1294,9 @@ impl Db {
             self.set_setting(key, &n.to_string()).await?;
         }
         for (name, key, lo, hi) in ZSXQ_INTS {
-            let Some(value) = body.get(*name) else { continue };
+            let Some(value) = body.get(*name) else {
+                continue;
+            };
             let Some(n) = value.as_i64() else {
                 return Err(CatalogError::Invalid(format!("{name} 需在 {lo}-{hi} 之间")));
             };
@@ -1155,7 +1306,9 @@ impl Db {
             self.set_setting(key, &n.to_string()).await?;
         }
         for (name, key, lo, hi) in ZSXQ_FLOATS {
-            let Some(value) = body.get(*name) else { continue };
+            let Some(value) = body.get(*name) else {
+                continue;
+            };
             let Some(n) = value.as_f64() else {
                 return Err(CatalogError::Invalid(format!("{name} 需在 {lo}-{hi} 之间")));
             };
@@ -1164,8 +1317,19 @@ impl Db {
             }
             self.set_setting(key, &n.to_string()).await?;
         }
-        for (name, key) in [("translate_twitter_content", "config_translate_twitter_content"), ("telegram_rich_messages", "config_telegram_rich_messages"), ("zsxq_prefetch_files", "zsxq_prefetch_files"), ("zsxq_fetch_comments", "zsxq_fetch_comments"), ("zsxq_app_channel", "zsxq_app_channel")] {
-            let Some(value) = body.get(name) else { continue };
+        for (name, key) in [
+            (
+                "translate_twitter_content",
+                "config_translate_twitter_content",
+            ),
+            ("telegram_rich_messages", "config_telegram_rich_messages"),
+            ("zsxq_prefetch_files", "zsxq_prefetch_files"),
+            ("zsxq_fetch_comments", "zsxq_fetch_comments"),
+            ("zsxq_app_channel", "zsxq_app_channel"),
+        ] {
+            let Some(value) = body.get(name) else {
+                continue;
+            };
             let Some(on) = value.as_bool() else {
                 return Err(CatalogError::Invalid(format!("{name} 需为布尔值")));
             };
@@ -1183,14 +1347,31 @@ impl Db {
 
     pub async fn admin_stats(&self) -> Result<Value, sqlx::Error> {
         let settings = self.settings().await?;
-        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users").fetch_one(&self.pool).await?;
-        let posts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts").fetch_one(&self.pool).await?;
-        let kols: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols").fetch_one(&self.pool).await?;
-        let enabled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols WHERE enabled = 1").fetch_one(&self.pool).await?;
-        let priority: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols WHERE priority = 1").fetch_one(&self.pool).await?;
-        let secondary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols WHERE secondary = 1").fetch_one(&self.pool).await?;
-        let active: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT kol_id) FROM subscriptions").fetch_one(&self.pool).await?;
-        let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kol_requests WHERE status = 'pending'").fetch_one(&self.pool).await?;
+        let users: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
+            .fetch_one(&self.pool)
+            .await?;
+        let posts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
+            .fetch_one(&self.pool)
+            .await?;
+        let kols: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols")
+            .fetch_one(&self.pool)
+            .await?;
+        let enabled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols WHERE enabled = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        let priority: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols WHERE priority = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        let secondary: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols WHERE secondary = 1")
+            .fetch_one(&self.pool)
+            .await?;
+        let active: i64 = sqlx::query_scalar("SELECT COUNT(DISTINCT kol_id) FROM subscriptions")
+            .fetch_one(&self.pool)
+            .await?;
+        let pending: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM kol_requests WHERE status = 'pending'")
+                .fetch_one(&self.pool)
+                .await?;
         let counts = sqlx::query("SELECT platform, SUM(enabled) AS n FROM kols GROUP BY platform")
             .fetch_all(&self.pool)
             .await?;
@@ -1233,12 +1414,20 @@ impl Db {
     }
 
     async fn settings(&self) -> Result<HashMap<String, String>, sqlx::Error> {
-        let rows = sqlx::query("SELECT key, value FROM settings").fetch_all(&self.pool).await?;
-        Ok(rows.into_iter().map(|row| (row.get("key"), row.get("value"))).collect())
+        let rows = sqlx::query("SELECT key, value FROM settings")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("key"), row.get("value")))
+            .collect())
     }
 
     pub async fn plaza_sources(&self) -> Result<Vec<Value>, sqlx::Error> {
-        Ok(plaza_rows(&self.enabled_counts().await?, &self.settings().await?))
+        Ok(plaza_rows(
+            &self.enabled_counts().await?,
+            &self.settings().await?,
+        ))
     }
 
     pub async fn set_plaza_visibility(
@@ -1278,7 +1467,11 @@ impl Db {
     }
 
     pub async fn news_flag(&self, key: &str, default: bool) -> Result<bool, sqlx::Error> {
-        Ok(self.setting(key).await?.map(|value| value == "1").unwrap_or(default))
+        Ok(self
+            .setting(key)
+            .await?
+            .map(|value| value == "1")
+            .unwrap_or(default))
     }
 
     pub async fn set_news_flag(&self, key: &str, on: bool) -> Result<(), sqlx::Error> {
@@ -1290,12 +1483,14 @@ impl Db {
         if name.is_empty() || name.chars().count() > 60 {
             return Err(CatalogError::Bad("媒体名称需 1-60 字"));
         }
-        let id = sqlx::query("INSERT INTO news_sources (slug, name, group_name) VALUES ('pending', ?, ?)")
-            .bind(name)
-            .bind(group_name.trim())
-            .execute(&self.pool)
-            .await?
-            .last_insert_rowid();
+        let id = sqlx::query(
+            "INSERT INTO news_sources (slug, name, group_name) VALUES ('pending', ?, ?)",
+        )
+        .bind(name)
+        .bind(group_name.trim())
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
         sqlx::query("UPDATE news_sources SET slug = ? WHERE id = ?")
             .bind(format!("s{id}"))
             .bind(id)
@@ -1311,7 +1506,11 @@ impl Db {
         Ok(id)
     }
 
-    pub async fn set_user_news_sources(&self, user_id: i64, ids: &[i64]) -> Result<(), CatalogError> {
+    pub async fn set_user_news_sources(
+        &self,
+        user_id: i64,
+        ids: &[i64],
+    ) -> Result<(), CatalogError> {
         let mut unique = Vec::new();
         for id in ids {
             if !unique.contains(id) {
@@ -1350,11 +1549,17 @@ impl Db {
         Ok(())
     }
 
-    pub async fn add_news_feed(&self, source_id: i64, name: &str, url: &str) -> Result<i64, CatalogError> {
-        let found: Option<i64> = sqlx::query_scalar("SELECT id FROM news_sources WHERE id = ? AND archived_at IS NULL")
-            .bind(source_id)
-            .fetch_optional(&self.pool)
-            .await?;
+    pub async fn add_news_feed(
+        &self,
+        source_id: i64,
+        name: &str,
+        url: &str,
+    ) -> Result<i64, CatalogError> {
+        let found: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM news_sources WHERE id = ? AND archived_at IS NULL")
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await?;
         if found.is_none() {
             return Err(CatalogError::Missing("媒体不存在"));
         }
@@ -1373,13 +1578,15 @@ impl Db {
         if duplicate.is_some() {
             return Err(CatalogError::Bad("Feed URL 已存在"));
         }
-        Ok(sqlx::query("INSERT INTO news_feeds (source_id, name, url) VALUES (?, ?, ?)")
-            .bind(source_id)
-            .bind(name)
-            .bind(url)
-            .execute(&self.pool)
-            .await?
-            .last_insert_rowid())
+        Ok(
+            sqlx::query("INSERT INTO news_feeds (source_id, name, url) VALUES (?, ?, ?)")
+                .bind(source_id)
+                .bind(name)
+                .bind(url)
+                .execute(&self.pool)
+                .await?
+                .last_insert_rowid(),
+        )
     }
 
     pub async fn news_feeds(&self) -> Result<Vec<(i64, i64, String, String)>, sqlx::Error> {
@@ -1391,10 +1598,25 @@ impl Db {
         )
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|row| (row.get("id"), row.get("source_id"), row.get("name"), row.get("url"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.get("id"),
+                    row.get("source_id"),
+                    row.get("name"),
+                    row.get("url"),
+                )
+            })
+            .collect())
     }
 
-    pub async fn save_news_entries(&self, source_id: i64, feed_id: i64, entries: &[NewsEntry]) -> Result<usize, sqlx::Error> {
+    pub async fn save_news_entries(
+        &self,
+        source_id: i64,
+        feed_id: i64,
+        entries: &[NewsEntry],
+    ) -> Result<usize, sqlx::Error> {
         let mut added = 0;
         for entry in entries {
             let result = sqlx::query(
@@ -1423,15 +1645,23 @@ impl Db {
         Ok(added)
     }
 
-    pub async fn save_xincai(&self, group: &str, items: &[XincaiRow]) -> Result<serde_json::Map<String, Value>, CatalogError> {
+    pub async fn save_xincai(
+        &self,
+        group: &str,
+        items: &[XincaiRow],
+    ) -> Result<serde_json::Map<String, Value>, CatalogError> {
         let mut sources = serde_json::Map::new();
         let mut saved = 0;
         let mut seen: Vec<(String, i64, i64)> = Vec::new();
         for item in items {
-            let (source_id, feed_id) = if let Some((_, source_id, feed_id)) = seen.iter().find(|(key, _, _)| key == &item.key) {
+            let (source_id, feed_id) = if let Some((_, source_id, feed_id)) =
+                seen.iter().find(|(key, _, _)| key == &item.key)
+            {
                 (*source_id, *feed_id)
             } else {
-                let source_id = self.xincai_source(&item.slug, &item.name, group, &item.kind).await?;
+                let source_id = self
+                    .xincai_source(&item.slug, &item.name, group, &item.kind)
+                    .await?;
                 let feed_id = self.xincai_feed(source_id).await?;
                 seen.push((item.key.clone(), source_id, feed_id));
                 (source_id, feed_id)
@@ -1480,31 +1710,58 @@ impl Db {
         Ok(sources)
     }
 
-    async fn xincai_source(&self, slug: &str, name: &str, group: &str, kind: &str) -> Result<i64, CatalogError> {
-        let kind = if kind == "magazine" { "magazine" } else { "feed" };
+    async fn xincai_source(
+        &self,
+        slug: &str,
+        name: &str,
+        group: &str,
+        kind: &str,
+    ) -> Result<i64, CatalogError> {
+        let kind = if kind == "magazine" {
+            "magazine"
+        } else {
+            "feed"
+        };
         let group = group.trim();
-        if let Some(row) = sqlx::query("SELECT id, kind, group_name FROM news_sources WHERE slug = ?")
-            .bind(slug)
-            .fetch_optional(&self.pool)
-            .await?
+        if let Some(row) =
+            sqlx::query("SELECT id, kind, group_name FROM news_sources WHERE slug = ?")
+                .bind(slug)
+                .fetch_optional(&self.pool)
+                .await?
         {
-            self.touch_xincai_source(row.get("id"), row.get("kind"), row.get("group_name"), kind, group).await?;
+            self.touch_xincai_source(
+                row.get("id"),
+                row.get("kind"),
+                row.get("group_name"),
+                kind,
+                group,
+            )
+            .await?;
             return Ok(row.get("id"));
         }
-        if let Some(row) = sqlx::query("SELECT id, slug, kind, group_name FROM news_sources WHERE name = ? COLLATE NOCASE")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?
+        if let Some(row) = sqlx::query(
+            "SELECT id, slug, kind, group_name FROM news_sources WHERE name = ? COLLATE NOCASE",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?
         {
             let existing: String = row.get("slug");
             if !existing.starts_with("xincai-") {
-                return Err(CatalogError::Invalid(format!("媒体名称已被公开源占用：{name}")));
+                return Err(CatalogError::Invalid(format!(
+                    "媒体名称已被公开源占用：{name}"
+                )));
             }
             let id: i64 = row.get("id");
             if existing != slug {
-                sqlx::query("UPDATE news_sources SET slug = ? WHERE id = ?").bind(slug).bind(id).execute(&self.pool).await?;
+                sqlx::query("UPDATE news_sources SET slug = ? WHERE id = ?")
+                    .bind(slug)
+                    .bind(id)
+                    .execute(&self.pool)
+                    .await?;
             }
-            self.touch_xincai_source(id, row.get("kind"), row.get("group_name"), kind, group).await?;
+            self.touch_xincai_source(id, row.get("kind"), row.get("group_name"), kind, group)
+                .await?;
             return Ok(id);
         }
         let id = sqlx::query("INSERT INTO news_sources (slug, name, group_name, kind, internal) VALUES (?, ?, ?, ?, 1)")
@@ -1515,44 +1772,69 @@ impl Db {
             .execute(&self.pool)
             .await?
             .last_insert_rowid();
-        sqlx::query("INSERT OR IGNORE INTO user_news_sources (user_id, source_id) SELECT id, ? FROM users")
-            .bind(id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT OR IGNORE INTO user_news_sources (user_id, source_id) SELECT id, ? FROM users",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
         Ok(id)
     }
 
-    async fn touch_xincai_source(&self, id: i64, current_kind: String, current_group: String, kind: &str, group: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE news_sources SET internal = 1 WHERE id = ? AND internal = 0").bind(id).execute(&self.pool).await?;
+    async fn touch_xincai_source(
+        &self,
+        id: i64,
+        current_kind: String,
+        current_group: String,
+        kind: &str,
+        group: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE news_sources SET internal = 1 WHERE id = ? AND internal = 0")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         if kind == "magazine" && current_kind != "magazine" {
-            sqlx::query("UPDATE news_sources SET kind = 'magazine' WHERE id = ?").bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_sources SET kind = 'magazine' WHERE id = ?")
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
         if !group.is_empty() && (current_group.is_empty() || current_group == "心裁") {
-            sqlx::query("UPDATE news_sources SET group_name = ? WHERE id = ?").bind(group).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_sources SET group_name = ? WHERE id = ?")
+                .bind(group)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
         Ok(())
     }
 
     async fn xincai_feed(&self, source_id: i64) -> Result<i64, sqlx::Error> {
-        if let Some(row) = sqlx::query("SELECT id FROM news_feeds WHERE source_id = ? AND name = '推送'")
-            .bind(source_id)
-            .fetch_optional(&self.pool)
-            .await?
+        if let Some(row) =
+            sqlx::query("SELECT id FROM news_feeds WHERE source_id = ? AND name = '推送'")
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await?
         {
             return Ok(row.get("id"));
         }
-        Ok(sqlx::query("INSERT INTO news_feeds (source_id, name, url, enabled) VALUES (?, '推送', '', 0)")
-            .bind(source_id)
-            .execute(&self.pool)
-            .await?
-            .last_insert_rowid())
+        Ok(sqlx::query(
+            "INSERT INTO news_feeds (source_id, name, url, enabled) VALUES (?, '推送', '', 0)",
+        )
+        .bind(source_id)
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid())
     }
 
     pub async fn admin_news_sources(&self) -> Result<Vec<Value>, sqlx::Error> {
         self.admin_news_sources_all(false).await
     }
 
-    pub async fn admin_news_sources_all(&self, include_archived: bool) -> Result<Vec<Value>, sqlx::Error> {
+    pub async fn admin_news_sources_all(
+        &self,
+        include_archived: bool,
+    ) -> Result<Vec<Value>, sqlx::Error> {
         let sources = sqlx::query(
             "SELECT id, slug, name, group_name, enabled, kind, internal, archived_at, last_success_at,
                     (SELECT COUNT(*) FROM news_articles a WHERE a.source_id = news_sources.id) AS article_count
@@ -1572,14 +1854,27 @@ impl Db {
         .bind(i64::from(include_archived))
         .fetch_all(&self.pool)
         .await?;
-        Ok(sources.into_iter().map(|row| news_source_json(&row, &feeds)).collect())
+        Ok(sources
+            .into_iter()
+            .map(|row| news_source_json(&row, &feeds))
+            .collect())
     }
 
     pub async fn admin_news_source(&self, id: i64) -> Result<Option<Value>, sqlx::Error> {
-        Ok(self.admin_news_sources_all(true).await?.into_iter().find(|row| row["id"].as_i64() == Some(id)))
+        Ok(self
+            .admin_news_sources_all(true)
+            .await?
+            .into_iter()
+            .find(|row| row["id"].as_i64() == Some(id)))
     }
 
-    pub async fn update_news_source(&self, id: i64, name: Option<&str>, group_name: Option<&str>, enabled: Option<bool>) -> Result<Value, CatalogError> {
+    pub async fn update_news_source(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        group_name: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Value, CatalogError> {
         if self.admin_news_source(id).await?.is_none() {
             return Err(CatalogError::Missing("媒体不存在"));
         }
@@ -1588,50 +1883,103 @@ impl Db {
             if name.is_empty() || name.chars().count() > 60 {
                 return Err(CatalogError::Bad("媒体名称需 1-60 字"));
             }
-            let duplicate: Option<i64> = sqlx::query_scalar("SELECT id FROM news_sources WHERE name = ? COLLATE NOCASE AND id != ?")
-                .bind(name).bind(id).fetch_optional(&self.pool).await?;
+            let duplicate: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM news_sources WHERE name = ? COLLATE NOCASE AND id != ?",
+            )
+            .bind(name)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
             if duplicate.is_some() {
                 return Err(CatalogError::Bad("媒体名称已存在"));
             }
-            sqlx::query("UPDATE news_sources SET name = ? WHERE id = ?").bind(name).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_sources SET name = ? WHERE id = ?")
+                .bind(name)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
         if let Some(group) = group_name {
             let group: String = group.trim().chars().take(40).collect();
-            sqlx::query("UPDATE news_sources SET group_name = ? WHERE id = ?").bind(group).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_sources SET group_name = ? WHERE id = ?")
+                .bind(group)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
         if let Some(on) = enabled {
-            sqlx::query("UPDATE news_sources SET enabled = ? WHERE id = ?").bind(i64::from(on)).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_sources SET enabled = ? WHERE id = ?")
+                .bind(i64::from(on))
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
-        self.admin_news_source(id).await?.ok_or(CatalogError::Missing("媒体不存在"))
+        self.admin_news_source(id)
+            .await?
+            .ok_or(CatalogError::Missing("媒体不存在"))
     }
 
-    pub async fn set_news_source_archived(&self, id: i64, archived: bool) -> Result<(), CatalogError> {
+    pub async fn set_news_source_archived(
+        &self,
+        id: i64,
+        archived: bool,
+    ) -> Result<(), CatalogError> {
         let changed = sqlx::query("UPDATE news_sources SET archived_at = CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END WHERE id = ?")
             .bind(i64::from(archived)).bind(id).execute(&self.pool).await?.rows_affected();
-        if changed == 0 { Err(CatalogError::Missing("媒体不存在")) } else { Ok(()) }
+        if changed == 0 {
+            Err(CatalogError::Missing("媒体不存在"))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn delete_news_source(&self, id: i64) -> Result<bool, sqlx::Error> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM news_sources WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM news_sources WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         if exists.is_none() {
             return Ok(false);
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM news_reads WHERE article_id IN (SELECT id FROM news_articles WHERE source_id = ?)").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_articles WHERE source_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM user_news_sources WHERE source_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_feeds WHERE source_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_sources WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM news_articles WHERE source_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM user_news_sources WHERE source_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM news_feeds WHERE source_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM news_sources WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
 
-    pub async fn news_feed_target(&self, id: i64) -> Result<Option<(i64, String, bool, bool)>, sqlx::Error> {
-        let row = sqlx::query("SELECT source_id, url, enabled, archived_at FROM news_feeds WHERE id = ?")
-            .bind(id).fetch_optional(&self.pool).await?;
+    pub async fn news_feed_target(
+        &self,
+        id: i64,
+    ) -> Result<Option<(i64, String, bool, bool)>, sqlx::Error> {
+        let row =
+            sqlx::query("SELECT source_id, url, enabled, archived_at FROM news_feeds WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|row| {
             let archived: Option<String> = row.get("archived_at");
-            (row.get("source_id"), row.get("url"), row.get::<i64, _>("enabled") != 0, archived.is_some())
+            (
+                row.get("source_id"),
+                row.get("url"),
+                row.get::<i64, _>("enabled") != 0,
+                archived.is_some(),
+            )
         }))
     }
 
@@ -1644,33 +1992,61 @@ impl Db {
                AND (? IS NULL OR f.source_id = ?)
              ORDER BY f.id",
         )
-        .bind(source_id).bind(source_id).fetch_all(&self.pool).await?;
+        .bind(source_id)
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(|row| row.get("id")).collect())
     }
 
-    pub async fn update_news_feed(&self, id: i64, name: Option<&str>, url: Option<&str>, enabled: Option<bool>) -> Result<Value, CatalogError> {
-        let current = sqlx::query("SELECT source_id, url FROM news_feeds WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
-        let Some(current) = current else { return Err(CatalogError::Missing("Feed 不存在")); };
+    pub async fn update_news_feed(
+        &self,
+        id: i64,
+        name: Option<&str>,
+        url: Option<&str>,
+        enabled: Option<bool>,
+    ) -> Result<Value, CatalogError> {
+        let current = sqlx::query("SELECT source_id, url FROM news_feeds WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(current) = current else {
+            return Err(CatalogError::Missing("Feed 不存在"));
+        };
         let source_id: i64 = current.get("source_id");
         if let Some(name) = name {
             let name = name.trim();
             if name.is_empty() || name.chars().count() > 80 {
                 return Err(CatalogError::Bad("Feed 名称需 1-80 字"));
             }
-            let duplicate: Option<i64> = sqlx::query_scalar("SELECT id FROM news_feeds WHERE source_id = ? AND name = ? AND id != ?")
-                .bind(source_id).bind(name).bind(id).fetch_optional(&self.pool).await?;
+            let duplicate: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM news_feeds WHERE source_id = ? AND name = ? AND id != ?",
+            )
+            .bind(source_id)
+            .bind(name)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
             if duplicate.is_some() {
                 return Err(CatalogError::Bad("该媒体下的 Feed 名称已存在"));
             }
-            sqlx::query("UPDATE news_feeds SET name = ? WHERE id = ?").bind(name).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_feeds SET name = ? WHERE id = ?")
+                .bind(name)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
         if let Some(url) = url {
             let url = url.trim();
             if url.is_empty() || url.len() > 2048 {
                 return Err(CatalogError::Bad("Feed URL 无效"));
             }
-            let duplicate: Option<i64> = sqlx::query_scalar("SELECT id FROM news_feeds WHERE url = ? AND id != ?")
-                .bind(url).bind(id).fetch_optional(&self.pool).await?;
+            let duplicate: Option<i64> =
+                sqlx::query_scalar("SELECT id FROM news_feeds WHERE url = ? AND id != ?")
+                    .bind(url)
+                    .bind(id)
+                    .fetch_optional(&self.pool)
+                    .await?;
             if duplicate.is_some() {
                 return Err(CatalogError::Bad("Feed URL 已存在"));
             }
@@ -1681,34 +2057,64 @@ impl Db {
             }
         }
         if let Some(on) = enabled {
-            sqlx::query("UPDATE news_feeds SET enabled = ? WHERE id = ?").bind(i64::from(on)).bind(id).execute(&self.pool).await?;
+            sqlx::query("UPDATE news_feeds SET enabled = ? WHERE id = ?")
+                .bind(i64::from(on))
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
         }
-        self.feed_value(id).await?.ok_or(CatalogError::Missing("Feed 不存在"))
+        self.feed_value(id)
+            .await?
+            .ok_or(CatalogError::Missing("Feed 不存在"))
     }
 
-    pub async fn set_news_feed_archived(&self, id: i64, archived: bool) -> Result<(), CatalogError> {
+    pub async fn set_news_feed_archived(
+        &self,
+        id: i64,
+        archived: bool,
+    ) -> Result<(), CatalogError> {
         let changed = sqlx::query("UPDATE news_feeds SET archived_at = CASE WHEN ? = 1 THEN datetime('now') ELSE NULL END WHERE id = ?")
             .bind(i64::from(archived)).bind(id).execute(&self.pool).await?.rows_affected();
-        if changed == 0 { Err(CatalogError::Missing("Feed 不存在")) } else { Ok(()) }
+        if changed == 0 {
+            Err(CatalogError::Missing("Feed 不存在"))
+        } else {
+            Ok(())
+        }
     }
 
     pub async fn delete_news_feed(&self, id: i64) -> Result<bool, sqlx::Error> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM news_feeds WHERE id = ?").bind(id).fetch_optional(&self.pool).await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM news_feeds WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         if exists.is_none() {
             return Ok(false);
         }
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM news_reads WHERE article_id IN (SELECT id FROM news_articles WHERE feed_id = ?)").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_articles WHERE feed_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_feeds WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM news_articles WHERE feed_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM news_feeds WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
 
     pub async fn delete_news_article(&self, id: i64) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM news_reads WHERE article_id = ?").bind(id).execute(&mut *tx).await?;
-        let deleted = sqlx::query("DELETE FROM news_articles WHERE id = ?").bind(id).execute(&mut *tx).await?.rows_affected();
+        sqlx::query("DELETE FROM news_reads WHERE article_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        let deleted = sqlx::query("DELETE FROM news_articles WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
         tx.commit().await?;
         Ok(deleted > 0)
     }
@@ -1744,7 +2150,11 @@ impl Db {
             }
             let id = source["id"].as_i64().unwrap_or(0);
             let chosen = self.news_source_chosen(user_id, id).await?;
-            let unread = if chosen { self.news_unread(user_id, Some(id)).await? } else { 0 };
+            let unread = if chosen {
+                self.news_unread(user_id, Some(id)).await?
+            } else {
+                0
+            };
             unread_total += unread;
             items.push(json!({
                 "id": id,
@@ -1766,7 +2176,15 @@ impl Db {
         }))
     }
 
-    pub async fn list_news(&self, user_id: i64, source_id: i64, q: &str, unread: bool, limit: i64, offset: i64) -> Result<Value, sqlx::Error> {
+    pub async fn list_news(
+        &self,
+        user_id: i64,
+        source_id: i64,
+        q: &str,
+        unread: bool,
+        limit: i64,
+        offset: i64,
+    ) -> Result<Value, sqlx::Error> {
         let like = like_pattern(q);
         let rows = sqlx::query(
             "SELECT a.id, a.source_id, s.name AS source_name, f.name AS feed_name,
@@ -1802,7 +2220,11 @@ impl Db {
         .fetch_all(&self.pool)
         .await?;
         let has_more = rows.len() as i64 > limit;
-        let items = rows.into_iter().take(limit as usize).map(|row| news_item(&row, false)).collect::<Vec<_>>();
+        let items = rows
+            .into_iter()
+            .take(limit as usize)
+            .map(|row| news_item(&row, false))
+            .collect::<Vec<_>>();
         Ok(json!({
             "items": items,
             "offset": offset,
@@ -1811,7 +2233,11 @@ impl Db {
         }))
     }
 
-    pub async fn news_article(&self, user_id: i64, article_id: i64) -> Result<Option<Value>, sqlx::Error> {
+    pub async fn news_article(
+        &self,
+        user_id: i64,
+        article_id: i64,
+    ) -> Result<Option<Value>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT a.id, a.source_id, s.name AS source_name, f.name AS feed_name,
                     a.title, a.summary, a.content, a.url, a.author, a.published_at,
@@ -1838,16 +2264,23 @@ impl Db {
         let source_id: i64 = row.get("source_id");
         let published: String = row.get("published_at");
         let mut article = news_item(&row, true);
-        article["prev_id"] = json!(self.news_neighbor(source_id, &published, article_id, true).await?);
-        article["next_id"] = json!(self.news_neighbor(source_id, &published, article_id, false).await?);
+        article["prev_id"] = json!(
+            self.news_neighbor(source_id, &published, article_id, true)
+                .await?
+        );
+        article["next_id"] = json!(
+            self.news_neighbor(source_id, &published, article_id, false)
+                .await?
+        );
         Ok(Some(article))
     }
 
     pub async fn magazine(&self, user_id: i64, source_id: i64) -> Result<Value, CatalogError> {
-        let source = sqlx::query("SELECT kind, enabled, archived_at FROM news_sources WHERE id = ?")
-            .bind(source_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let source =
+            sqlx::query("SELECT kind, enabled, archived_at FROM news_sources WHERE id = ?")
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await?;
         let Some(source) = source else {
             return Err(CatalogError::Bad("新闻来源不存在或已归档"));
         };
@@ -1892,16 +2325,23 @@ impl Db {
             let key: String = row.get("issue_key");
             if !order.contains(&key) {
                 order.push(key.clone());
-                issues.push((key.clone(), json!({
-                    "issue_key": key,
-                    "label": row.get::<String, _>("issue_label"),
-                    "title": row.get::<String, _>("issue_title"),
-                    "cover": row.get::<String, _>("issue_cover"),
-                    "published_at": row.get::<String, _>("published_at"),
-                    "articles": [],
-                })));
+                issues.push((
+                    key.clone(),
+                    json!({
+                        "issue_key": key,
+                        "label": row.get::<String, _>("issue_label"),
+                        "title": row.get::<String, _>("issue_title"),
+                        "cover": row.get::<String, _>("issue_cover"),
+                        "published_at": row.get::<String, _>("published_at"),
+                        "articles": [],
+                    }),
+                ));
             }
-            let issue = &mut issues.iter_mut().find(|(found, _)| found == &key).expect("issue").1;
+            let issue = &mut issues
+                .iter_mut()
+                .find(|(found, _)| found == &key)
+                .expect("issue")
+                .1;
             let label: String = row.get("issue_label");
             if issue["label"].as_str().unwrap_or("").is_empty() && !label.is_empty() {
                 issue["label"] = json!(label);
@@ -1918,18 +2358,28 @@ impl Db {
                 issue["cover"] = json!(cover);
             }
             let section: String = row.get("section");
-            issue["articles"].as_array_mut().expect("articles").push(json!({
-                "id": row.get::<i64, _>("id"),
-                "title": row.get::<String, _>("title"),
-                "author": row.get::<String, _>("author"),
-                "section": if section.is_empty() { "正文" } else { &section },
-                "is_read": row.get::<i64, _>("is_read") != 0,
-            }));
+            issue["articles"]
+                .as_array_mut()
+                .expect("articles")
+                .push(json!({
+                    "id": row.get::<i64, _>("id"),
+                    "title": row.get::<String, _>("title"),
+                    "author": row.get::<String, _>("author"),
+                    "section": if section.is_empty() { "正文" } else { &section },
+                    "is_read": row.get::<i64, _>("is_read") != 0,
+                }));
         }
-        Ok(json!({"source_id": source_id, "issues": issues.into_iter().map(|(_, issue)| issue).collect::<Vec<_>>()}))
+        Ok(
+            json!({"source_id": source_id, "issues": issues.into_iter().map(|(_, issue)| issue).collect::<Vec<_>>()}),
+        )
     }
 
-    pub async fn news_image_url(&self, user_id: i64, article_id: i64, index: i64) -> Result<String, CatalogError> {
+    pub async fn news_image_url(
+        &self,
+        user_id: i64,
+        article_id: i64,
+        index: i64,
+    ) -> Result<String, CatalogError> {
         if index < 0 {
             return Err(CatalogError::Missing("图片不存在"));
         }
@@ -1951,10 +2401,19 @@ impl Db {
             return Err(CatalogError::Missing("图片不存在"));
         };
         let list: Vec<String> = serde_json::from_str(&images).unwrap_or_default();
-        list.get(index as usize).filter(|url| !url.is_empty()).cloned().ok_or(CatalogError::Missing("图片不存在"))
+        list.get(index as usize)
+            .filter(|url| !url.is_empty())
+            .cloned()
+            .ok_or(CatalogError::Missing("图片不存在"))
     }
 
-    async fn news_neighbor(&self, source_id: i64, published: &str, article_id: i64, newer: bool) -> Result<Option<i64>, sqlx::Error> {
+    async fn news_neighbor(
+        &self,
+        source_id: i64,
+        published: &str,
+        article_id: i64,
+        newer: bool,
+    ) -> Result<Option<i64>, sqlx::Error> {
         let sql = if newer {
             "SELECT id FROM news_articles WHERE source_id = ? AND (published_at > ? OR (published_at = ? AND id > ?)) ORDER BY published_at, id LIMIT 1"
         } else {
@@ -1979,20 +2438,24 @@ impl Db {
         if found.is_none() {
             return Ok(false);
         }
-        sqlx::query("INSERT INTO news_reads (user_id, article_id) VALUES (?, ?) ON CONFLICT DO NOTHING")
-            .bind(user_id)
-            .bind(article_id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "INSERT INTO news_reads (user_id, article_id) VALUES (?, ?) ON CONFLICT DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(article_id)
+        .execute(&self.pool)
+        .await?;
         Ok(true)
     }
 
     pub async fn news_seen(&self, user_id: i64) -> Result<String, sqlx::Error> {
-        Ok(sqlx::query_scalar("SELECT seen_at FROM news_seen WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .unwrap_or_default())
+        Ok(
+            sqlx::query_scalar("SELECT seen_at FROM news_seen WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or_default(),
+        )
     }
 
     pub async fn set_news_seen(&self, user_id: i64, seen_at: &str) -> Result<String, sqlx::Error> {
@@ -2009,7 +2472,9 @@ impl Db {
     }
 
     pub async fn mark_news_seen_now(&self, user_id: i64) -> Result<(String, String), sqlx::Error> {
-        let now: String = sqlx::query_scalar("SELECT datetime('now')").fetch_one(&self.pool).await?;
+        let now: String = sqlx::query_scalar("SELECT datetime('now')")
+            .fetch_one(&self.pool)
+            .await?;
         let previous = self.set_news_seen(user_id, &now).await?;
         Ok((now, previous))
     }
@@ -2039,10 +2504,11 @@ impl Db {
     }
 
     async fn news_source_chosen(&self, user_id: i64, source_id: i64) -> Result<bool, sqlx::Error> {
-        let any: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_news_sources WHERE user_id = ?")
-            .bind(user_id)
-            .fetch_one(&self.pool)
-            .await?;
+        let any: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM user_news_sources WHERE user_id = ?")
+                .bind(user_id)
+                .fetch_one(&self.pool)
+                .await?;
         if any == 0 {
             return Ok(true);
         }
@@ -2060,28 +2526,35 @@ impl Db {
         let rows = sqlx::query("SELECT platform, SUM(enabled) AS n FROM kols GROUP BY platform")
             .fetch_all(&self.pool)
             .await?;
-        Ok(rows.into_iter().map(|row| (row.get("platform"), row.get("n"))).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("platform"), row.get("n")))
+            .collect())
     }
 
     pub async fn user_by_username(&self, username: &str) -> Result<Option<User>, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT * FROM users WHERE username = ? COLLATE NOCASE",
-        )
-        .bind(username)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(user_from_row))
-    }
-
-    pub async fn user_by_openid(&self, openid: &str) -> Result<Option<User>, sqlx::Error> {
-        let row = sqlx::query("SELECT * FROM users WHERE wechat_openid = ? AND wechat_openid != ''")
-            .bind(openid)
+        let row = sqlx::query("SELECT * FROM users WHERE username = ? COLLATE NOCASE")
+            .bind(username)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(user_from_row))
     }
 
-    pub async fn register_wechat(&self, code: &str, username: &str, openid: &str) -> Result<i64, RegisterError> {
+    pub async fn user_by_openid(&self, openid: &str) -> Result<Option<User>, sqlx::Error> {
+        let row =
+            sqlx::query("SELECT * FROM users WHERE wechat_openid = ? AND wechat_openid != ''")
+                .bind(openid)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(user_from_row))
+    }
+
+    pub async fn register_wechat(
+        &self,
+        code: &str,
+        username: &str,
+        openid: &str,
+    ) -> Result<i64, RegisterError> {
         let code = code.trim().to_ascii_uppercase();
         let openid = openid.trim();
         if openid.is_empty() {
@@ -2110,16 +2583,21 @@ impl Db {
                 .await?;
             let msg = match row {
                 None => "邀请码无效或已被使用",
-                Some(row) if row.get::<Option<i64>, _>("used_by").is_some() => "邀请码无效或已被使用",
-                Some(row) if row.get::<Option<String>, _>("revoked_at").is_some() => "邀请码已作废，请向管理员索取新的",
+                Some(row) if row.get::<Option<i64>, _>("used_by").is_some() => {
+                    "邀请码无效或已被使用"
+                }
+                Some(row) if row.get::<Option<String>, _>("revoked_at").is_some() => {
+                    "邀请码已作废，请向管理员索取新的"
+                }
                 Some(_) => "邀请码已过期，请向管理员索取新的",
             };
             return Err(RegisterError::Rejected(msg));
         }
-        let exists = sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ? COLLATE NOCASE")
-            .bind(username)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ? COLLATE NOCASE")
+                .bind(username)
+                .fetch_optional(&mut *tx)
+                .await?;
         if exists.is_some() {
             return Err(RegisterError::Rejected("用户名已存在"));
         }
@@ -2130,7 +2608,9 @@ impl Db {
             .await;
         let id = match inserted {
             Ok(res) => res.last_insert_rowid(),
-            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => return Err(RegisterError::Rejected("微信账号已存在")),
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                return Err(RegisterError::Rejected("微信账号已存在"))
+            }
             Err(err) => return Err(err.into()),
         };
         sqlx::query("UPDATE register_codes SET used_by = ? WHERE code = ?")
@@ -2143,12 +2623,10 @@ impl Db {
     }
 
     pub async fn user_by_id(&self, id: i64) -> Result<Option<User>, sqlx::Error> {
-        let row = sqlx::query(
-            "SELECT * FROM users WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT * FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
         Ok(row.map(user_from_row))
     }
 
@@ -2183,7 +2661,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn set_user_text(&self, id: i64, column: &str, value: &str) -> Result<(), sqlx::Error> {
+    pub async fn set_user_text(
+        &self,
+        id: i64,
+        column: &str,
+        value: &str,
+    ) -> Result<(), sqlx::Error> {
         let sql = match column {
             "telegram_chat_id" => "UPDATE users SET telegram_chat_id = ? WHERE id = ?",
             "telegram_bot_token" => "UPDATE users SET telegram_bot_token = ? WHERE id = ?",
@@ -2202,11 +2685,20 @@ impl Db {
             "llm_api_format" => "UPDATE users SET llm_api_format = ? WHERE id = ?",
             other => panic!("unknown user text column {other}"),
         };
-        sqlx::query(sql).bind(value).bind(id).execute(&self.pool).await?;
+        sqlx::query(sql)
+            .bind(value)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
-    pub async fn set_user_flag(&self, id: i64, column: &str, value: bool) -> Result<(), sqlx::Error> {
+    pub async fn set_user_flag(
+        &self,
+        id: i64,
+        column: &str,
+        value: bool,
+    ) -> Result<(), sqlx::Error> {
         let sql = match column {
             "notify_enabled" => "UPDATE users SET notify_enabled = ? WHERE id = ?",
             "daily_report" => "UPDATE users SET daily_report = ? WHERE id = ?",
@@ -2224,16 +2716,21 @@ impl Db {
         Ok(())
     }
 
-    pub async fn issue_bind_code(&self, user_id: i64, now: i64) -> Result<(String, i64), CatalogError> {
+    pub async fn issue_bind_code(
+        &self,
+        user_id: i64,
+        now: i64,
+    ) -> Result<(String, i64), CatalogError> {
         const TTL: i64 = 600;
         const LIMIT: i64 = 3;
         let window = now.div_euclid(TTL) * TTL;
         let key = format!("issue:{user_id}");
         let mut tx = self.pool.begin().await?;
-        let quota: Option<(i64, i64)> = sqlx::query_as("SELECT period_start, count FROM bind_quota WHERE key = ?")
-            .bind(&key)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let quota: Option<(i64, i64)> =
+            sqlx::query_as("SELECT period_start, count FROM bind_quota WHERE key = ?")
+                .bind(&key)
+                .fetch_optional(&mut *tx)
+                .await?;
         let count = match quota {
             Some((start, count)) if start == window => count,
             _ => 0,
@@ -2250,17 +2747,22 @@ impl Db {
         .bind(count + 1)
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM bind_codes WHERE expires_at < ?").bind(now).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM bind_codes WHERE expires_at < ?")
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
         let mut issued = None;
         for _ in 0..8 {
             let code = bind_code_text()?;
             let digest = bind_code_digest(&code);
-            let inserted = sqlx::query("INSERT OR IGNORE INTO bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)")
-                .bind(&digest)
-                .bind(user_id)
-                .bind(now + TTL)
-                .execute(&mut *tx)
-                .await?;
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO bind_codes (code, user_id, expires_at) VALUES (?, ?, ?)",
+            )
+            .bind(&digest)
+            .bind(user_id)
+            .bind(now + TTL)
+            .execute(&mut *tx)
+            .await?;
             if inserted.rows_affected() == 1 {
                 issued = Some(code);
                 break;
@@ -2273,7 +2775,13 @@ impl Db {
         Ok((code, TTL))
     }
 
-    pub async fn consume_bind_code(&self, code: &str, channel: &str, identity: &str, now: i64) -> Result<Option<i64>, CatalogError> {
+    pub async fn consume_bind_code(
+        &self,
+        code: &str,
+        channel: &str,
+        identity: &str,
+        now: i64,
+    ) -> Result<Option<i64>, CatalogError> {
         let column = match channel {
             "telegram_chat_id" | "feishu_open_id" => channel,
             _ => return Err(CatalogError::Bad("不支持的绑定渠道")),
@@ -2287,29 +2795,35 @@ impl Db {
             return Ok(None);
         }
         let mut tx = self.pool.begin().await?;
-        let user_id: Option<i64> = sqlx::query_scalar("DELETE FROM bind_codes WHERE code = ? AND expires_at >= ? RETURNING user_id")
-            .bind(&digest)
-            .bind(now)
-            .fetch_optional(&mut *tx)
-            .await?;
+        let user_id: Option<i64> = sqlx::query_scalar(
+            "DELETE FROM bind_codes WHERE code = ? AND expires_at >= ? RETURNING user_id",
+        )
+        .bind(&digest)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?;
         let Some(user_id) = user_id else {
             tx.commit().await?;
             return Ok(None);
         };
         let owner: Option<i64> = match column {
             "telegram_chat_id" => {
-                sqlx::query_scalar("SELECT id FROM users WHERE telegram_chat_id = ? AND id != ? LIMIT 1")
-                    .bind(identity)
-                    .bind(user_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                sqlx::query_scalar(
+                    "SELECT id FROM users WHERE telegram_chat_id = ? AND id != ? LIMIT 1",
+                )
+                .bind(identity)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?
             }
             _ => {
-                sqlx::query_scalar("SELECT id FROM users WHERE feishu_open_id = ? AND id != ? LIMIT 1")
-                    .bind(identity)
-                    .bind(user_id)
-                    .fetch_optional(&mut *tx)
-                    .await?
+                sqlx::query_scalar(
+                    "SELECT id FROM users WHERE feishu_open_id = ? AND id != ? LIMIT 1",
+                )
+                .bind(identity)
+                .bind(user_id)
+                .fetch_optional(&mut *tx)
+                .await?
             }
         };
         if owner.is_some() {
@@ -2319,7 +2833,11 @@ impl Db {
             "telegram_chat_id" => "UPDATE users SET telegram_chat_id = ? WHERE id = ?",
             _ => "UPDATE users SET feishu_open_id = ? WHERE id = ?",
         };
-        sqlx::query(sql).bind(identity).bind(user_id).execute(&mut *tx).await?;
+        sqlx::query(sql)
+            .bind(identity)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(Some(user_id))
     }
@@ -2335,6 +2853,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_feishu_session(
         &self,
         session_id: &str,
@@ -2362,7 +2881,10 @@ impl Db {
         Ok(())
     }
 
-    pub async fn feishu_session(&self, session_id: &str) -> Result<Option<FeishuSession>, sqlx::Error> {
+    pub async fn feishu_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<FeishuSession>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT session_id, user_id, device_code_ciphertext, registration_base_url, verification_uri,
                     candidate_app_id, candidate_app_secret_ciphertext, candidate_tenant_brand, expected_open_id,
@@ -2375,7 +2897,12 @@ impl Db {
         Ok(row.map(feishu_session_from_row))
     }
 
-    pub async fn set_feishu_status(&self, session_id: &str, status: &str, last_error: &str) -> Result<(), sqlx::Error> {
+    pub async fn set_feishu_status(
+        &self,
+        session_id: &str,
+        status: &str,
+        last_error: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE feishu_registration_sessions SET status = ?, last_error = ? WHERE session_id = ?")
             .bind(status)
             .bind(last_error)
@@ -2411,7 +2938,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn save_feishu_bind_code(&self, session_id: &str, hash: &str, expires_at: i64) -> Result<(), sqlx::Error> {
+    pub async fn save_feishu_bind_code(
+        &self,
+        session_id: &str,
+        hash: &str,
+        expires_at: i64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE feishu_registration_sessions
              SET status = 'awaiting_bind', bind_code_hash = ?, bind_code_expires_at = ?
@@ -2425,7 +2957,11 @@ impl Db {
         Ok(())
     }
 
-    pub async fn clear_feishu_bind_code(&self, session_id: &str, status: &str) -> Result<(), sqlx::Error> {
+    pub async fn clear_feishu_bind_code(
+        &self,
+        session_id: &str,
+        status: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "UPDATE feishu_registration_sessions
              SET status = ?, bind_code_hash = '', bind_code_expires_at = NULL
@@ -2438,11 +2974,16 @@ impl Db {
         Ok(())
     }
 
-    pub async fn feishu_sessions_by_status(&self, status: &str) -> Result<Vec<FeishuSession>, sqlx::Error> {
-        let rows = sqlx::query("SELECT * FROM feishu_registration_sessions WHERE status = ? ORDER BY session_id")
-            .bind(status)
-            .fetch_all(&self.pool)
-            .await?;
+    pub async fn feishu_sessions_by_status(
+        &self,
+        status: &str,
+    ) -> Result<Vec<FeishuSession>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT * FROM feishu_registration_sessions WHERE status = ? ORDER BY session_id",
+        )
+        .bind(status)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows.into_iter().map(feishu_session_from_row).collect())
     }
 
@@ -2451,7 +2992,10 @@ impl Db {
             .bind(user_id)
             .fetch_optional(&self.pool)
             .await?;
-        Ok(row.map(|row| FeishuBot { status: row.get("status"), app_id: row.get("app_id") }))
+        Ok(row.map(|row| FeishuBot {
+            status: row.get("status"),
+            app_id: row.get("app_id"),
+        }))
     }
 
     pub async fn save_feishu_bot(
@@ -2495,10 +3039,19 @@ impl Db {
         Ok(())
     }
 
-    pub async fn other_user_has(&self, column: &str, value: &str, id: i64) -> Result<bool, sqlx::Error> {
+    pub async fn other_user_has(
+        &self,
+        column: &str,
+        value: &str,
+        id: i64,
+    ) -> Result<bool, sqlx::Error> {
         let sql = match column {
-            "telegram_bot_token" => "SELECT id FROM users WHERE telegram_bot_token = ? AND id != ? LIMIT 1",
-            "telegram_chat_id" => "SELECT id FROM users WHERE telegram_chat_id = ? AND id != ? LIMIT 1",
+            "telegram_bot_token" => {
+                "SELECT id FROM users WHERE telegram_bot_token = ? AND id != ? LIMIT 1"
+            }
+            "telegram_chat_id" => {
+                "SELECT id FROM users WHERE telegram_chat_id = ? AND id != ? LIMIT 1"
+            }
             _ => return Ok(false),
         };
         Ok(sqlx::query(sql)
@@ -2563,7 +3116,14 @@ impl Db {
             .collect())
     }
 
-    pub async fn upsert_webpush(&self, user_id: i64, endpoint: &str, p256dh: &str, auth: &str, user_agent: &str) -> Result<(), sqlx::Error> {
+    pub async fn upsert_webpush(
+        &self,
+        user_id: i64,
+        endpoint: &str,
+        p256dh: &str,
+        auth: &str,
+        user_agent: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO webpush_subscriptions (user_id, endpoint, p256dh, auth, user_agent)
              VALUES (?, ?, ?, ?, ?)
@@ -2622,16 +3182,24 @@ impl Db {
         .await?;
         let acl = self.ima_kb_acl_map().await?;
         let subscribed = self.ima_kb_sub_map().await?;
-        Ok(rows.into_iter().map(|row| {
-            let mut value = admin_user_json(&row, after, purge);
-            let id = value["id"].as_i64().unwrap_or(0);
-            value["ima_kb_groups"] = json!(acl.get(&id).cloned().unwrap_or_default());
-            value["ima_kb_subscribed"] = json!(subscribed.get(&id).cloned().unwrap_or_default());
-            value
-        }).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let mut value = admin_user_json(&row, after, purge);
+                let id = value["id"].as_i64().unwrap_or(0);
+                value["ima_kb_groups"] = json!(acl.get(&id).cloned().unwrap_or_default());
+                value["ima_kb_subscribed"] =
+                    json!(subscribed.get(&id).cloned().unwrap_or_default());
+                value
+            })
+            .collect())
     }
 
-    pub async fn inactive_policy(&self, preview_after: Option<i64>, preview_purge: Option<i64>) -> Result<Value, CatalogError> {
+    pub async fn inactive_policy(
+        &self,
+        preview_after: Option<i64>,
+        preview_purge: Option<i64>,
+    ) -> Result<Value, CatalogError> {
         for value in [preview_after, preview_purge].into_iter().flatten() {
             if !(0..=3650).contains(&value) {
                 return Err(CatalogError::Bad("天数须在 0–3650"));
@@ -2639,9 +3207,18 @@ impl Db {
         }
         let (after, purge) = self.inactive_days().await?;
         let marked = self.inactive_count(preview_after.unwrap_or(after)).await?;
-        let doomed = self.inactive_count(preview_after.unwrap_or(after) + preview_purge.unwrap_or(purge)).await?;
-        let doomed = if preview_after.unwrap_or(after) <= 0 || preview_purge.unwrap_or(purge) <= 0 { 0 } else { doomed };
-        let customized = self.setting("inactive_policy_customized").await?.is_some_and(|v| v == "1");
+        let doomed = self
+            .inactive_count(preview_after.unwrap_or(after) + preview_purge.unwrap_or(purge))
+            .await?;
+        let doomed = if preview_after.unwrap_or(after) <= 0 || preview_purge.unwrap_or(purge) <= 0 {
+            0
+        } else {
+            doomed
+        };
+        let customized = self
+            .setting("inactive_policy_customized")
+            .await?
+            .is_some_and(|v| v == "1");
         Ok(json!({
             "inactive_after_days": after,
             "inactive_purge_after_days": purge,
@@ -2655,8 +3232,10 @@ impl Db {
         if !(0..=3650).contains(&after) || !(0..=3650).contains(&purge) {
             return Err(CatalogError::Bad("天数须在 0–3650"));
         }
-        self.set_setting("inactive_after_days", &after.to_string()).await?;
-        self.set_setting("inactive_purge_after_days", &purge.to_string()).await?;
+        self.set_setting("inactive_after_days", &after.to_string())
+            .await?;
+        self.set_setting("inactive_purge_after_days", &purge.to_string())
+            .await?;
         self.set_setting("inactive_policy_customized", "1").await?;
         self.inactive_policy(None, None).await
     }
@@ -2724,13 +3303,34 @@ impl Db {
             return Err(CatalogError::Bad("不能删除管理员"));
         }
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM subscriptions WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM kol_requests WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM kol_acl WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM user_news_sources WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_reads WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM news_seen WHERE user_id = ?").bind(id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM users WHERE id = ?").bind(id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM subscriptions WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM kol_requests WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM kol_acl WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM user_news_sources WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM news_reads WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM news_seen WHERE user_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM users WHERE id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2749,8 +3349,16 @@ impl Db {
     }
 
     async fn inactive_days(&self) -> Result<(i64, i64), sqlx::Error> {
-        let after = self.setting("inactive_after_days").await?.and_then(|v| v.parse().ok()).unwrap_or(90);
-        let purge = self.setting("inactive_purge_after_days").await?.and_then(|v| v.parse().ok()).unwrap_or(30);
+        let after = self
+            .setting("inactive_after_days")
+            .await?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90);
+        let purge = self
+            .setting("inactive_purge_after_days")
+            .await?
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
         Ok((after, purge))
     }
 
@@ -2794,8 +3402,15 @@ impl Db {
     }
 
     pub async fn purge_inactive_if_due(&self) -> Result<i64, sqlx::Error> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let last = self.setting("inactive_users_last_purge_at").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let last = self
+            .setting("inactive_users_last_purge_at")
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
         if last > 0 && now.saturating_sub(last) < 24 * 3600 {
             return Ok(0);
         }
@@ -2819,43 +3434,104 @@ impl Db {
         };
         let mut removed = 0;
         for id in ids {
-            let name: String = sqlx::query_scalar("SELECT username FROM users WHERE id = ?").bind(id).fetch_optional(&self.pool).await?.unwrap_or_default();
-            self.add_admin_log(0, "purge_inactive_user", &id.to_string(), &name).await?;
+            let name: String = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or_default();
+            self.add_admin_log(0, "purge_inactive_user", &id.to_string(), &name)
+                .await?;
             match self.delete_user(0, id).await {
                 Ok(()) => removed += 1,
                 Err(CatalogError::Db(err)) => return Err(err),
                 Err(_) => {}
             }
         }
-        self.set_setting("inactive_users_last_purge_at", &now.to_string()).await?;
+        self.set_setting("inactive_users_last_purge_at", &now.to_string())
+            .await?;
         Ok(removed)
     }
 
     pub async fn prune_retention_if_due(&self) -> Result<(i64, i64, i64, i64), sqlx::Error> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let last = self.setting("maintenance_last_cleanup").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let last = self
+            .setting("maintenance_last_cleanup")
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
         if last > 0 && now.saturating_sub(last) < 6 * 3600 {
             return Ok((0, 0, 0, 0));
         }
-        let posts_days = self.setting("stats_posts_retention_days").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(30).max(0);
-        let log_days = self.setting("stats_push_logs_retention_days").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(90).max(0);
+        let posts_days = self
+            .setting("stats_posts_retention_days")
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(30)
+            .max(0);
+        let log_days = self
+            .setting("stats_push_logs_retention_days")
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(90)
+            .max(0);
         let posts = if posts_days == 0 {
             0
         } else {
             sqlx::query(&format!("DELETE FROM push_logs WHERE post_id IN (SELECT id FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
             sqlx::query(&format!("DELETE FROM news_reads WHERE article_id IN (SELECT id FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
             let news = sqlx::query(&format!("DELETE FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days')")).execute(&self.pool).await?.rows_affected();
-            let posts = sqlx::query(&format!("DELETE FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days')")).execute(&self.pool).await?.rows_affected();
-            self.set_setting("maintenance_last_cleanup", &now.to_string()).await?;
-            let logs = if log_days == 0 { 0 } else { sqlx::query(&format!("DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')")).execute(&self.pool).await?.rows_affected() };
-            let admin = sqlx::query("DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')").execute(&self.pool).await?.rows_affected();
-            sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')").execute(&self.pool).await?;
+            let posts = sqlx::query(&format!(
+                "DELETE FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days')"
+            ))
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            self.set_setting("maintenance_last_cleanup", &now.to_string())
+                .await?;
+            let logs = if log_days == 0 {
+                0
+            } else {
+                sqlx::query(&format!(
+                    "DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')"
+                ))
+                .execute(&self.pool)
+                .await?
+                .rows_affected()
+            };
+            let admin = sqlx::query(
+                "DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')",
+            )
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+            sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')")
+                .execute(&self.pool)
+                .await?;
             return Ok((posts as i64, news as i64, logs as i64, admin as i64));
         };
-        let logs = if log_days == 0 { 0 } else { sqlx::query(&format!("DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')")).execute(&self.pool).await?.rows_affected() as i64 };
-        let admin = sqlx::query("DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')").execute(&self.pool).await?.rows_affected() as i64;
-        sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')").execute(&self.pool).await?;
-        self.set_setting("maintenance_last_cleanup", &now.to_string()).await?;
+        let logs = if log_days == 0 {
+            0
+        } else {
+            sqlx::query(&format!(
+                "DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')"
+            ))
+            .execute(&self.pool)
+            .await?
+            .rows_affected() as i64
+        };
+        let admin =
+            sqlx::query("DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')")
+                .execute(&self.pool)
+                .await?
+                .rows_affected() as i64;
+        sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')")
+            .execute(&self.pool)
+            .await?;
+        self.set_setting("maintenance_last_cleanup", &now.to_string())
+            .await?;
         Ok((posts, 0, logs, admin))
     }
 
@@ -2876,12 +3552,10 @@ impl Db {
         .execute(&mut *tx)
         .await?;
         if used.rows_affected() == 0 {
-            let row = sqlx::query(
-                "SELECT used_by, revoked_at FROM register_codes WHERE code = ?",
-            )
-            .bind(&code)
-            .fetch_optional(&mut *tx)
-            .await?;
+            let row = sqlx::query("SELECT used_by, revoked_at FROM register_codes WHERE code = ?")
+                .bind(&code)
+                .fetch_optional(&mut *tx)
+                .await?;
             let msg = match row {
                 None => "邀请码无效或已被使用",
                 Some(row) if row.get::<Option<i64>, _>("used_by").is_some() => {
@@ -2894,22 +3568,20 @@ impl Db {
             };
             return Err(RegisterError::Rejected(msg));
         }
-        let exists = sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM users WHERE username = ? COLLATE NOCASE",
-        )
-        .bind(username)
-        .fetch_optional(&mut *tx)
-        .await?;
+        let exists =
+            sqlx::query_scalar::<_, i64>("SELECT id FROM users WHERE username = ? COLLATE NOCASE")
+                .bind(username)
+                .fetch_optional(&mut *tx)
+                .await?;
         if exists.is_some() {
             return Err(RegisterError::Rejected("用户名已存在"));
         }
-        let inserted = sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)",
-        )
-        .bind(username)
-        .bind(password_hash)
-        .execute(&mut *tx)
-        .await;
+        let inserted =
+            sqlx::query("INSERT INTO users (username, password_hash, is_admin) VALUES (?, ?, 0)")
+                .bind(username)
+                .bind(password_hash)
+                .execute(&mut *tx)
+                .await;
         let id = match inserted {
             Ok(res) => res.last_insert_rowid(),
             Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
@@ -3070,7 +3742,11 @@ impl Db {
         Ok(changed.rows_affected() as i64)
     }
 
-    pub async fn register_codes_batch(&self, action: &str, codes: &[String]) -> Result<(i64, i64), CatalogError> {
+    pub async fn register_codes_batch(
+        &self,
+        action: &str,
+        codes: &[String],
+    ) -> Result<(i64, i64), CatalogError> {
         let codes: Vec<String> = codes
             .iter()
             .map(|code| code.trim().to_ascii_uppercase())
@@ -3094,9 +3770,7 @@ impl Db {
                 n
             }
             "delete" => {
-                let mut sql = sqlx::QueryBuilder::new(
-                    "DELETE FROM register_codes WHERE code IN (",
-                );
+                let mut sql = sqlx::QueryBuilder::new("DELETE FROM register_codes WHERE code IN (");
                 let mut separated = sql.separated(", ");
                 for code in &codes {
                     separated.push_bind(code);
@@ -3328,23 +4002,44 @@ impl Db {
 
     pub async fn dashboard(&self) -> Result<Value, sqlx::Error> {
         let users_total = self.scalar("SELECT COUNT(*) FROM users").await?;
-        let admins = self.scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1").await?;
-        let bound = self.scalar(
-            "SELECT COUNT(*) FROM users WHERE telegram_chat_id != '' OR feishu_open_id != ''
+        let admins = self
+            .scalar("SELECT COUNT(*) FROM users WHERE is_admin = 1")
+            .await?;
+        let bound = self
+            .scalar(
+                "SELECT COUNT(*) FROM users WHERE telegram_chat_id != '' OR feishu_open_id != ''
              OR feishu_chat_id != '' OR wecom_webhook != '' OR bark_key != ''
              OR EXISTS (SELECT 1 FROM webpush_subscriptions w WHERE w.user_id = users.id)",
-        ).await?;
-        let new_7d = self.scalar("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')").await?;
+            )
+            .await?;
+        let new_7d = self
+            .scalar("SELECT COUNT(*) FROM users WHERE created_at >= datetime('now', '-7 days')")
+            .await?;
         let subs = self.scalar("SELECT COUNT(*) FROM subscriptions").await?;
-        let favorite = self.scalar("SELECT COUNT(*) FROM subscriptions WHERE favorite = 1").await?;
+        let favorite = self
+            .scalar("SELECT COUNT(*) FROM subscriptions WHERE favorite = 1")
+            .await?;
         let posts_total = self.scalar("SELECT COUNT(*) FROM posts").await?;
-        let posts_today = self.scalar("SELECT COUNT(*) FROM posts WHERE fetched_at >= datetime('now', '-24 hours')").await?;
-        let posts_7d = self.scalar("SELECT COUNT(*) FROM posts WHERE fetched_at >= datetime('now', '-7 days')").await?;
+        let posts_today = self
+            .scalar("SELECT COUNT(*) FROM posts WHERE fetched_at >= datetime('now', '-24 hours')")
+            .await?;
+        let posts_7d = self
+            .scalar("SELECT COUNT(*) FROM posts WHERE fetched_at >= datetime('now', '-7 days')")
+            .await?;
         let push_ok = self.scalar("SELECT COUNT(*) FROM push_logs WHERE status = 'success' AND created_at >= datetime('now', '-7 days')").await?;
-        let push_total = self.scalar("SELECT COUNT(*) FROM push_logs WHERE created_at >= datetime('now', '-7 days')").await?;
-        let push_today = self.scalar("SELECT COUNT(*) FROM push_logs WHERE created_at >= datetime('now', '-24 hours')").await?;
-        let platforms = sqlx::query("SELECT platform, COUNT(*) AS c FROM posts GROUP BY platform ORDER BY c DESC")
-            .fetch_all(&self.pool).await?;
+        let push_total = self
+            .scalar("SELECT COUNT(*) FROM push_logs WHERE created_at >= datetime('now', '-7 days')")
+            .await?;
+        let push_today = self
+            .scalar(
+                "SELECT COUNT(*) FROM push_logs WHERE created_at >= datetime('now', '-24 hours')",
+            )
+            .await?;
+        let platforms = sqlx::query(
+            "SELECT platform, COUNT(*) AS c FROM posts GROUP BY platform ORDER BY c DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let mut by_platform = serde_json::Map::new();
         for row in platforms {
             by_platform.insert(row.get("platform"), json!(row.get::<i64, _>("c")));
@@ -3355,24 +4050,38 @@ impl Db {
         ).fetch_all(&self.pool).await?;
         let mut by_channel = serde_json::Map::new();
         for row in channels {
-            by_channel.insert(row.get("channel"), json!({"total": row.get::<i64, _>("c"), "ok": row.get::<i64, _>("ok")}));
+            by_channel.insert(
+                row.get("channel"),
+                json!({"total": row.get::<i64, _>("c"), "ok": row.get::<i64, _>("ok")}),
+            );
         }
         let trend_rows = sqlx::query(
             "SELECT strftime('%Y-%m-%d', created_at, 'localtime') AS d, COUNT(*) AS c,
                     COALESCE(SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END), 0) AS ok
              FROM push_logs WHERE created_at >= datetime('now', '-13 days') GROUP BY d ORDER BY d",
-        ).fetch_all(&self.pool).await?;
-        let trend: Vec<Value> = trend_rows.iter().map(|row| json!({
-            "date": row.get::<String, _>("d"),
-            "pushed": row.get::<i64, _>("c"),
-            "ok": row.get::<i64, _>("ok"),
-        })).collect();
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let trend: Vec<Value> = trend_rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "date": row.get::<String, _>("d"),
+                    "pushed": row.get::<i64, _>("c"),
+                    "ok": row.get::<i64, _>("ok"),
+                })
+            })
+            .collect();
         let rate = if push_total == 0 {
             Value::Null
         } else {
             json!(((push_ok as f64 / push_total as f64) * 1000.0).round() / 10.0)
         };
-        let avg = if users_total == 0 { 0.0 } else { (subs as f64 / users_total as f64 * 10.0).round() / 10.0 };
+        let avg = if users_total == 0 {
+            0.0
+        } else {
+            (subs as f64 / users_total as f64 * 10.0).round() / 10.0
+        };
         Ok(json!({
             "users": {"total": users_total, "admins": admins, "bound": bound, "new_7d": new_7d},
             "subscriptions": {"total": subs, "favorite": favorite, "avg_per_user": avg},
@@ -3394,7 +4103,13 @@ impl Db {
         sqlx::query_scalar(sql).fetch_one(&self.pool).await
     }
 
-    pub async fn add_admin_log(&self, user_id: i64, action: &str, target: &str, detail: &str) -> Result<(), sqlx::Error> {
+    pub async fn add_admin_log(
+        &self,
+        user_id: i64,
+        action: &str,
+        target: &str,
+        detail: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO admin_logs (user_id, action, target, detail) VALUES (?, ?, ?, ?)")
             .bind(user_id)
             .bind(action)
@@ -3414,18 +4129,27 @@ impl Db {
         .bind(limit.clamp(1, 500))
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(|row| json!({
-            "id": row.get::<i64, _>("id"),
-            "user_id": row.get::<Option<i64>, _>("user_id"),
-            "action": row.get::<String, _>("action"),
-            "target": row.get::<String, _>("target"),
-            "detail": row.get::<String, _>("detail"),
-            "created_at": row.get::<String, _>("created_at"),
-            "username": row.get::<Option<String>, _>("username"),
-        })).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<i64, _>("id"),
+                    "user_id": row.get::<Option<i64>, _>("user_id"),
+                    "action": row.get::<String, _>("action"),
+                    "target": row.get::<String, _>("target"),
+                    "detail": row.get::<String, _>("detail"),
+                    "created_at": row.get::<String, _>("created_at"),
+                    "username": row.get::<Option<String>, _>("username"),
+                })
+            })
+            .collect())
     }
 
-    pub async fn note_platform(&self, platform: &str, error: Option<&str>) -> Result<(), sqlx::Error> {
+    pub async fn note_platform(
+        &self,
+        platform: &str,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         let platform = platform.trim();
         if platform.is_empty() {
             return Ok(());
@@ -3452,7 +4176,9 @@ impl Db {
     }
 
     pub async fn health_alerts(&self) -> Result<Vec<String>, sqlx::Error> {
-        let today: String = sqlx::query_scalar("SELECT date('now')").fetch_one(&self.pool).await?;
+        let today: String = sqlx::query_scalar("SELECT date('now')")
+            .fetch_one(&self.pool)
+            .await?;
         let mut alerts = Vec::new();
         let feeds = sqlx::query(
             "SELECT id, name, consecutive_failures, last_error_detail FROM news_feeds
@@ -3470,7 +4196,8 @@ impl Db {
             let count: i64 = row.get("consecutive_failures");
             let detail: String = row.get("last_error_detail");
             let message = format!("资讯源「{name}」已连续失败 {count} 次：{detail}");
-            self.add_admin_log(0, "platform_health", &key, &message).await?;
+            self.add_admin_log(0, "platform_health", &key, &message)
+                .await?;
             self.set_setting(&key, &today).await?;
             alerts.push(message);
         }
@@ -3488,7 +4215,8 @@ impl Db {
             let count: i64 = row.get("consecutive_failures");
             let detail: String = row.get("last_error");
             let message = format!("平台 {platform} 已连续失败 {count} 次：{detail}");
-            self.add_admin_log(0, "platform_health", &key, &message).await?;
+            self.add_admin_log(0, "platform_health", &key, &message)
+                .await?;
             self.set_setting(&key, &today).await?;
             alerts.push(message);
         }
@@ -3496,13 +4224,27 @@ impl Db {
     }
 
     pub async fn take_daily_reports(&self) -> Result<Vec<(i64, String)>, sqlx::Error> {
-        let hour = self.setting("config_daily_report_hour").await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(8).clamp(0, 23);
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        let hour = self
+            .setting("config_daily_report_hour")
+            .await?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(8)
+            .clamp(0, 23);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
         if (((now + 8 * 3600) % 86400 / 3600) as i64) < hour {
             return Ok(Vec::new());
         }
-        let today: String = sqlx::query_scalar("SELECT date('now', '+8 hours')").fetch_one(&self.pool).await?;
-        let users: Vec<i64> = sqlx::query_scalar("SELECT id FROM users WHERE daily_report = 1 AND notify_enabled = 1 ORDER BY id").fetch_all(&self.pool).await?;
+        let today: String = sqlx::query_scalar("SELECT date('now', '+8 hours')")
+            .fetch_one(&self.pool)
+            .await?;
+        let users: Vec<i64> = sqlx::query_scalar(
+            "SELECT id FROM users WHERE daily_report = 1 AND notify_enabled = 1 ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         let mut reports = Vec::new();
         for user_id in users {
             let sent_key = format!("daily_report_sent:{user_id}");
@@ -3510,7 +4252,11 @@ impl Db {
                 continue;
             }
             let cursor_key = format!("daily_report_cursor:{user_id}");
-            let cursor = self.setting(&cursor_key).await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
+            let cursor = self
+                .setting(&cursor_key)
+                .await?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
             let rows = if cursor > 0 {
                 sqlx::query(
                     "SELECT p.id, k.name, p.title, p.content FROM posts p
@@ -3549,7 +4295,11 @@ impl Db {
                 }
                 let title: String = row.get("title");
                 let content: String = row.get("content");
-                let text = if title.trim().is_empty() { content } else { title };
+                let text = if title.trim().is_empty() {
+                    content
+                } else {
+                    title
+                };
                 let text = text.chars().take(80).collect::<String>();
                 lines.push(format!("- {text}"));
             }
@@ -3579,12 +4329,16 @@ impl Db {
         .await?;
         for row in news_users {
             let user_id: i64 = row.get("id");
-            if dnd_active(&row.get::<String, _>("dnd_start"), &row.get::<String, _>("dnd_end")) {
+            if dnd_active(
+                &row.get::<String, _>("dnd_start"),
+                &row.get::<String, _>("dnd_end"),
+            ) {
                 continue;
             }
             let since: String = row.get("keywords_match_news_since");
             if since.trim().is_empty() {
-                self.stamp_keyword_since(user_id, "keywords_match_news_since").await?;
+                self.stamp_keyword_since(user_id, "keywords_match_news_since")
+                    .await?;
                 continue;
             }
             let articles = sqlx::query(
@@ -3602,7 +4356,13 @@ impl Db {
             let keywords: String = row.get("keywords");
             let mut matched = Vec::new();
             for article in articles {
-                let text = format!("{}\n{}\n{}\n{}", article.get::<String, _>("title"), article.get::<String, _>("summary"), article.get::<String, _>("author"), article.get::<String, _>("source_name"));
+                let text = format!(
+                    "{}\n{}\n{}\n{}",
+                    article.get::<String, _>("title"),
+                    article.get::<String, _>("summary"),
+                    article.get::<String, _>("author"),
+                    article.get::<String, _>("source_name")
+                );
                 if keyword_hits(&keywords, &text).is_empty() {
                     continue;
                 }
@@ -3613,18 +4373,33 @@ impl Db {
             }
             let shown = matched.len().min(8);
             let extra = matched.len() - shown;
-            let mut lines = vec![format!("财经资讯 {} 条命中关键词", matched.len()), String::new()];
+            let mut lines = vec![
+                format!("财经资讯 {} 条命中关键词", matched.len()),
+                String::new(),
+            ];
             for article in matched.iter().take(shown) {
                 let source: String = article.get("source_name");
-                let suffix = if source.trim().is_empty() { String::new() } else { format!("（{}）", source.trim()) };
-                lines.push(format!("· {}{suffix}", clip_title(&article.get::<String, _>("title"), "财经资讯")));
+                let suffix = if source.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", source.trim())
+                };
+                lines.push(format!(
+                    "· {}{suffix}",
+                    clip_title(&article.get::<String, _>("title"), "财经资讯")
+                ));
             }
             if extra > 0 {
                 lines.push(format!("· 还有 {extra} 条"));
             }
             lines.push(String::new());
             lines.push("打开财经资讯查看 https://vpush.net/news".into());
-            digests.push(KeywordDigest { user_id, text: lines.join("\n"), articles: matched.iter().map(|row| row.get("id")).collect(), docs: Vec::new() });
+            digests.push(KeywordDigest {
+                user_id,
+                text: lines.join("\n"),
+                articles: matched.iter().map(|row| row.get("id")).collect(),
+                docs: Vec::new(),
+            });
         }
         let report_users = sqlx::query(
             "SELECT id, is_admin, keywords, dnd_start, dnd_end, keywords_match_reports_since FROM users WHERE notify_enabled = 1 AND keywords_match_reports = 1 ORDER BY id",
@@ -3633,16 +4408,24 @@ impl Db {
         .await?;
         for row in report_users {
             let user_id: i64 = row.get("id");
-            if dnd_active(&row.get::<String, _>("dnd_start"), &row.get::<String, _>("dnd_end")) {
+            if dnd_active(
+                &row.get::<String, _>("dnd_start"),
+                &row.get::<String, _>("dnd_end"),
+            ) {
                 continue;
             }
             let since: String = row.get("keywords_match_reports_since");
             if since.trim().is_empty() {
-                self.stamp_keyword_since(user_id, "keywords_match_reports_since").await?;
+                self.stamp_keyword_since(user_id, "keywords_match_reports_since")
+                    .await?;
                 continue;
             }
             let admin = row.get::<i64, _>("is_admin") != 0;
-            let (acl, subscribed) = if admin { (HashSet::new(), HashSet::new()) } else { self.ima_access(user_id).await? };
+            let (acl, subscribed) = if admin {
+                (HashSet::new(), HashSet::new())
+            } else {
+                self.ima_access(user_id).await?
+            };
             let docs = sqlx::query(
                 "SELECT d.group_id, d.media_id, d.name, d.abstract, d.group_name, COALESCE(t.abstract_zh, '') AS abstract_zh
                  FROM ima_document_index d
@@ -3659,10 +4442,16 @@ impl Db {
             let mut matched = Vec::new();
             for doc in docs {
                 let group: String = doc.get("group_id");
-                if !admin && !(acl.contains(&group) && subscribed.contains(&group)) {
+                if !(admin || acl.contains(&group) && subscribed.contains(&group)) {
                     continue;
                 }
-                let text = format!("{}\n{}\n{}\n{}", doc.get::<String, _>("name"), doc.get::<String, _>("abstract"), doc.get::<String, _>("abstract_zh"), doc.get::<String, _>("group_name"));
+                let text = format!(
+                    "{}\n{}\n{}\n{}",
+                    doc.get::<String, _>("name"),
+                    doc.get::<String, _>("abstract"),
+                    doc.get::<String, _>("abstract_zh"),
+                    doc.get::<String, _>("group_name")
+                );
                 if keyword_hits(&keywords, &text).is_empty() {
                     continue;
                 }
@@ -3673,11 +4462,21 @@ impl Db {
             }
             let shown = matched.len().min(8);
             let extra = matched.len() - shown;
-            let mut lines = vec![format!("今日研报 {} 篇命中关键词", matched.len()), String::new()];
+            let mut lines = vec![
+                format!("今日研报 {} 篇命中关键词", matched.len()),
+                String::new(),
+            ];
             for doc in matched.iter().take(shown) {
                 let source: String = doc.get("group_name");
-                let suffix = if source.trim().is_empty() { String::new() } else { format!("（{}）", source.trim()) };
-                lines.push(format!("· {}{suffix}", clip_title(&doc.get::<String, _>("name"), "研报")));
+                let suffix = if source.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!("（{}）", source.trim())
+                };
+                lines.push(format!(
+                    "· {}{suffix}",
+                    clip_title(&doc.get::<String, _>("name"), "研报")
+                ));
             }
             if extra > 0 {
                 lines.push(format!("· 还有 {extra} 篇"));
@@ -3688,7 +4487,10 @@ impl Db {
                 user_id,
                 text: lines.join("\n"),
                 articles: Vec::new(),
-                docs: matched.iter().map(|row| (row.get("group_id"), row.get("media_id"))).collect(),
+                docs: matched
+                    .iter()
+                    .map(|row| (row.get("group_id"), row.get("media_id")))
+                    .collect(),
             });
         }
         Ok(digests)
@@ -3696,7 +4498,13 @@ impl Db {
 
     pub async fn mark_keyword_digest(&self, digest: &KeywordDigest) -> Result<(), sqlx::Error> {
         for id in &digest.articles {
-            sqlx::query("INSERT OR IGNORE INTO news_keyword_notified (user_id, article_id) VALUES (?, ?)").bind(digest.user_id).bind(id).execute(&self.pool).await?;
+            sqlx::query(
+                "INSERT OR IGNORE INTO news_keyword_notified (user_id, article_id) VALUES (?, ?)",
+            )
+            .bind(digest.user_id)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         }
         for (group, media) in &digest.docs {
             sqlx::query("INSERT OR IGNORE INTO knowledge_keyword_notified (user_id, group_id, media_id) VALUES (?, ?, ?)").bind(digest.user_id).bind(group).bind(media).execute(&self.pool).await?;
@@ -3704,7 +4512,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn add_error_log(&self, level: &str, logger: &str, message: &str) -> Result<(), sqlx::Error> {
+    pub async fn add_error_log(
+        &self,
+        level: &str,
+        logger: &str,
+        message: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO error_logs (level, logger, message) VALUES (?, ?, ?)")
             .bind(level.to_ascii_uppercase())
             .bind(logger)
@@ -3714,7 +4527,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn list_error_logs(&self, limit: i64, level: &str, q: &str) -> Result<Vec<Value>, CatalogError> {
+    pub async fn list_error_logs(
+        &self,
+        limit: i64,
+        level: &str,
+        q: &str,
+    ) -> Result<Vec<Value>, CatalogError> {
         let level = level.trim().to_ascii_uppercase();
         let rank = match level.as_str() {
             "" => 0,
@@ -3723,7 +4541,11 @@ impl Db {
             "WARNING" => 30,
             "ERROR" => 40,
             "CRITICAL" => 50,
-            _ => return Err(CatalogError::Bad("level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL")),
+            _ => {
+                return Err(CatalogError::Bad(
+                    "level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL",
+                ))
+            }
         };
         let mut sql = sqlx::QueryBuilder::new(
             "SELECT id, level, logger, message, created_at FROM error_logs WHERE 1 = 1",
@@ -3743,15 +4565,21 @@ impl Db {
         sql.push(" ORDER BY id DESC LIMIT ");
         sql.push_bind(limit.clamp(10, 2000));
         let rows = sql.build().fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(|row| json!({
-            "id": row.get::<i64, _>("id"),
-            "level": row.get::<String, _>("level"),
-            "logger": row.get::<String, _>("logger"),
-            "message": row.get::<String, _>("message"),
-            "created_at": row.get::<String, _>("created_at"),
-        })).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<i64, _>("id"),
+                    "level": row.get::<String, _>("level"),
+                    "logger": row.get::<String, _>("logger"),
+                    "message": row.get::<String, _>("message"),
+                    "created_at": row.get::<String, _>("created_at"),
+                })
+            })
+            .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_kol(
         &self,
         platform: &str,
@@ -3771,11 +4599,10 @@ impl Db {
             return Err(CatalogError::Bad("名称和外部 ID 不能为空"));
         }
         if let Some(id) = category_id {
-            let found: Option<i64> =
-                sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
-                    .bind(id)
-                    .fetch_optional(&self.pool)
-                    .await?;
+            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?;
             if found.is_none() {
                 return Err(CatalogError::Bad("分类不存在"));
             }
@@ -3831,42 +4658,75 @@ impl Db {
     pub async fn patch_kol(&self, id: i64, patch: KolPatch<'_>) -> Result<(), CatalogError> {
         let row = sqlx::query("SELECT platform, name, external_id, enabled, category_id, priority, secondary, is_private, original_only, recommend_weight FROM kols WHERE id = ?")
             .bind(id).fetch_optional(&self.pool).await?;
-        let Some(row) = row else { return Err(CatalogError::Missing("大V不存在")); };
+        let Some(row) = row else {
+            return Err(CatalogError::Missing("大V不存在"));
+        };
         let platform: String = row.get("platform");
         let current_name: String = row.get("name");
         let name = patch.name.unwrap_or(current_name.as_str()).trim();
-        if name.is_empty() { return Err(CatalogError::Bad("昵称与外部ID不能为空")); }
+        if name.is_empty() {
+            return Err(CatalogError::Bad("昵称与外部ID不能为空"));
+        }
         let external_id = match patch.external_id {
             Some(value) => normalize_external_id(&platform, value),
             None => row.get("external_id"),
         };
-        if external_id.is_empty() { return Err(CatalogError::Bad("昵称与外部ID不能为空")); }
+        if external_id.is_empty() {
+            return Err(CatalogError::Bad("昵称与外部ID不能为空"));
+        }
         if patch.external_id.is_some() {
-            let dup: Option<i64> = sqlx::query_scalar("SELECT id FROM kols WHERE platform = ? AND external_id = ? AND id != ?")
-                .bind(&platform).bind(&external_id).bind(id).fetch_optional(&self.pool).await?;
-            if dup.is_some() { return Err(CatalogError::Bad("该平台已存在相同的外部ID")); }
+            let dup: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM kols WHERE platform = ? AND external_id = ? AND id != ?",
+            )
+            .bind(&platform)
+            .bind(&external_id)
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if dup.is_some() {
+                return Err(CatalogError::Bad("该平台已存在相同的外部ID"));
+            }
         }
         let category_id = match patch.category_id {
             Some(value) => value,
             None => row.get("category_id"),
         };
         if let Some(category_id) = category_id {
-            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?").bind(category_id).fetch_optional(&self.pool).await?;
-            if found.is_none() { return Err(CatalogError::Bad("分类不存在")); }
+            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
+                .bind(category_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if found.is_none() {
+                return Err(CatalogError::Bad("分类不存在"));
+            }
         }
         let mut priority = patch.priority.unwrap_or(row.get::<i64, _>("priority") != 0);
-        let mut secondary = patch.secondary.unwrap_or(row.get::<i64, _>("secondary") != 0);
-        if patch.secondary == Some(true) { priority = false; }
-        else if patch.priority == Some(true) { secondary = false; }
+        let mut secondary = patch
+            .secondary
+            .unwrap_or(row.get::<i64, _>("secondary") != 0);
+        if patch.secondary == Some(true) {
+            priority = false;
+        } else if patch.priority == Some(true) {
+            secondary = false;
+        }
         let enabled = patch.enabled.unwrap_or(row.get::<i64, _>("enabled") != 0);
-        let is_private = patch.is_private.unwrap_or(row.get::<i64, _>("is_private") != 0);
-        let original_only = patch.original_only.unwrap_or(row.get::<i64, _>("original_only") != 0);
-        let weight = patch.recommend_weight.unwrap_or(row.get("recommend_weight")).max(0);
+        let is_private = patch
+            .is_private
+            .unwrap_or(row.get::<i64, _>("is_private") != 0);
+        let original_only = patch
+            .original_only
+            .unwrap_or(row.get::<i64, _>("original_only") != 0);
+        let weight = patch
+            .recommend_weight
+            .unwrap_or(row.get("recommend_weight"))
+            .max(0);
         let mut user_ids = Vec::new();
         if let Some(names) = patch.visible_users {
             for name in names {
                 let name = name.trim();
-                if name.is_empty() { continue; }
+                if name.is_empty() {
+                    continue;
+                }
                 match self.user_by_username(name).await? {
                     Some(user) => user_ids.push(user.id),
                     None => return Err(CatalogError::Invalid(format!("用户不存在: {name}"))),
@@ -3878,9 +4738,16 @@ impl Db {
             .bind(name).bind(&external_id).bind(i64::from(enabled)).bind(category_id).bind(i64::from(priority)).bind(i64::from(secondary)).bind(i64::from(is_private)).bind(i64::from(original_only)).bind(weight).bind(id)
             .execute(&mut *tx).await?;
         if patch.visible_users.is_some() {
-            sqlx::query("DELETE FROM kol_acl WHERE kol_id = ?").bind(id).execute(&mut *tx).await?;
+            sqlx::query("DELETE FROM kol_acl WHERE kol_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
             for user_id in user_ids {
-                sqlx::query("INSERT OR IGNORE INTO kol_acl (kol_id, user_id) VALUES (?, ?)").bind(id).bind(user_id).execute(&mut *tx).await?;
+                sqlx::query("INSERT OR IGNORE INTO kol_acl (kol_id, user_id) VALUES (?, ?)")
+                    .bind(id)
+                    .bind(user_id)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
         tx.commit().await?;
@@ -3892,7 +4759,12 @@ impl Db {
             .bind(kol_id).fetch_all(&self.pool).await
     }
 
-    pub async fn batch_kols(&self, ids: &[i64], action: &str, value: Option<&Value>) -> Result<i64, CatalogError> {
+    pub async fn batch_kols(
+        &self,
+        ids: &[i64],
+        action: &str,
+        value: Option<&Value>,
+    ) -> Result<i64, CatalogError> {
         if ids.is_empty() {
             return Err(CatalogError::Bad("请先选择大V"));
         }
@@ -3904,25 +4776,35 @@ impl Db {
         }
         let mut tx = self.pool.begin().await?;
         let marks = vec!["?"; ids.len()].join(",");
-        let found: i64 = sqlx::query(&format!("SELECT COUNT(*) AS n FROM kols WHERE id IN ({marks})"))
-            .bind_ids(&ids)
-            .fetch_one(&mut *tx)
-            .await?
-            .get("n");
+        let found: i64 = sqlx::query(&format!(
+            "SELECT COUNT(*) AS n FROM kols WHERE id IN ({marks})"
+        ))
+        .bind_ids(&ids)
+        .fetch_one(&mut *tx)
+        .await?
+        .get("n");
         if found != ids.len() as i64 {
             return Err(CatalogError::Missing("大V不存在"));
         }
         match action {
             "enable" | "disable" => {
-                sqlx::query(&format!("UPDATE kols SET enabled = ? WHERE id IN ({marks})"))
-                    .bind(i64::from(action == "enable"))
-                    .bind_ids(&ids)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(&format!(
+                    "UPDATE kols SET enabled = ? WHERE id IN ({marks})"
+                ))
+                .bind(i64::from(action == "enable"))
+                .bind_ids(&ids)
+                .execute(&mut *tx)
+                .await?;
             }
             "priority" | "secondary" => {
-                let on = value.and_then(Value::as_bool).ok_or(CatalogError::Bad("缺少开关值"))?;
-                let (col, other) = if action == "priority" { ("priority", "secondary") } else { ("secondary", "priority") };
+                let on = value
+                    .and_then(Value::as_bool)
+                    .ok_or(CatalogError::Bad("缺少开关值"))?;
+                let (col, other) = if action == "priority" {
+                    ("priority", "secondary")
+                } else {
+                    ("secondary", "priority")
+                };
                 let sql = if on {
                     format!("UPDATE kols SET {col} = 1, {other} = 0 WHERE id IN ({marks})")
                 } else {
@@ -3931,10 +4813,12 @@ impl Db {
                 sqlx::query(&sql).bind_ids(&ids).execute(&mut *tx).await?;
             }
             "normal" => {
-                sqlx::query(&format!("UPDATE kols SET priority = 0, secondary = 0 WHERE id IN ({marks})"))
-                    .bind_ids(&ids)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(&format!(
+                    "UPDATE kols SET priority = 0, secondary = 0 WHERE id IN ({marks})"
+                ))
+                .bind_ids(&ids)
+                .execute(&mut *tx)
+                .await?;
             }
             "category" => {
                 let category_id = match value {
@@ -3942,26 +4826,41 @@ impl Db {
                     Some(v) => Some(v.as_i64().ok_or(CatalogError::Bad("分类不正确"))?),
                 };
                 if let Some(id) = category_id {
-                    let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
-                        .bind(id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                    let exists: Option<i64> =
+                        sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
+                            .bind(id)
+                            .fetch_optional(&mut *tx)
+                            .await?;
                     if exists.is_none() {
                         return Err(CatalogError::Bad("分类不存在"));
                     }
                 }
-                sqlx::query(&format!("UPDATE kols SET category_id = ? WHERE id IN ({marks})"))
-                    .bind(category_id)
-                    .bind_ids(&ids)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(&format!(
+                    "UPDATE kols SET category_id = ? WHERE id IN ({marks})"
+                ))
+                .bind(category_id)
+                .bind_ids(&ids)
+                .execute(&mut *tx)
+                .await?;
             }
             "delete" => {
                 for id in &ids {
-                    sqlx::query("DELETE FROM posts WHERE kol_id = ?").bind(id).execute(&mut *tx).await?;
-                    sqlx::query("DELETE FROM subscriptions WHERE kol_id = ?").bind(id).execute(&mut *tx).await?;
-                    sqlx::query("DELETE FROM kol_acl WHERE kol_id = ?").bind(id).execute(&mut *tx).await?;
-                    sqlx::query("DELETE FROM kols WHERE id = ?").bind(id).execute(&mut *tx).await?;
+                    sqlx::query("DELETE FROM posts WHERE kol_id = ?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM subscriptions WHERE kol_id = ?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM kol_acl WHERE kol_id = ?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("DELETE FROM kols WHERE id = ?")
+                        .bind(id)
+                        .execute(&mut *tx)
+                        .await?;
                 }
             }
             _ => return Err(CatalogError::Bad("不支持的操作")),
@@ -3970,7 +4869,11 @@ impl Db {
         Ok(ids.len() as i64)
     }
 
-    pub async fn batch_add_kols(&self, lines: &str, category_id: Option<i64>) -> Result<Value, CatalogError> {
+    pub async fn batch_add_kols(
+        &self,
+        lines: &str,
+        category_id: Option<i64>,
+    ) -> Result<Value, CatalogError> {
         if let Some(id) = category_id {
             let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
                 .bind(id)
@@ -3993,15 +4896,38 @@ impl Db {
                     continue;
                 }
             };
-            let name = if nickname.is_empty() { format!("{platform}_{external_id}") } else { nickname };
-            match self.add_kol(&platform, &name, &external_id, category_id, false, false, false).await {
-                Ok(id) => results.push(json!({"ok": true, "id": id, "name": name, "external_id": external_id})),
-                Err(CatalogError::Bad(msg)) => results.push(json!({"ok": false, "line": clip_line(line), "error": msg})),
-                Err(CatalogError::Invalid(msg)) => results.push(json!({"ok": false, "line": clip_line(line), "error": msg})),
+            let name = if nickname.is_empty() {
+                format!("{platform}_{external_id}")
+            } else {
+                nickname
+            };
+            match self
+                .add_kol(
+                    &platform,
+                    &name,
+                    &external_id,
+                    category_id,
+                    false,
+                    false,
+                    false,
+                )
+                .await
+            {
+                Ok(id) => results
+                    .push(json!({"ok": true, "id": id, "name": name, "external_id": external_id})),
+                Err(CatalogError::Bad(msg)) => {
+                    results.push(json!({"ok": false, "line": clip_line(line), "error": msg}))
+                }
+                Err(CatalogError::Invalid(msg)) => {
+                    results.push(json!({"ok": false, "line": clip_line(line), "error": msg}))
+                }
                 Err(err) => return Err(err),
             }
         }
-        let ids: Vec<i64> = results.iter().filter_map(|row| row.get("id").and_then(Value::as_i64)).collect();
+        let ids: Vec<i64> = results
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_i64))
+            .collect();
         let ok = ids.len();
         Ok(json!({
             "total": results.len(),
@@ -4046,32 +4972,57 @@ impl Db {
         let status_flag = status.unwrap_or(-1);
         let filter = "(? = '' OR k.platform = ?) AND (? = 0 OR k.category_id = ?) AND (? = '' OR k.name LIKE ? ESCAPE '\\' OR k.external_id LIKE ? ESCAPE '\\') AND (? = -1 OR k.enabled = ?)";
         let total: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM kols k WHERE {filter}"))
-            .bind(platform).bind(platform).bind(category_id).bind(category_id).bind(q).bind(&like).bind(&like).bind(status_flag).bind(status_flag)
-            .fetch_one(&self.pool).await?;
-        let id_rows = sqlx::query(&format!("SELECT k.id FROM kols k WHERE {filter} ORDER BY k.id"))
-            .bind(platform).bind(platform).bind(category_id).bind(category_id).bind(q).bind(&like).bind(&like).bind(status_flag).bind(status_flag)
-            .fetch_all(&self.pool).await?;
+            .bind(platform)
+            .bind(platform)
+            .bind(category_id)
+            .bind(category_id)
+            .bind(q)
+            .bind(&like)
+            .bind(&like)
+            .bind(status_flag)
+            .bind(status_flag)
+            .fetch_one(&self.pool)
+            .await?;
+        let id_rows = sqlx::query(&format!(
+            "SELECT k.id FROM kols k WHERE {filter} ORDER BY k.id"
+        ))
+        .bind(platform)
+        .bind(platform)
+        .bind(category_id)
+        .bind(category_id)
+        .bind(q)
+        .bind(&like)
+        .bind(&like)
+        .bind(status_flag)
+        .bind(status_flag)
+        .fetch_all(&self.pool)
+        .await?;
         let ids: Vec<i64> = id_rows.iter().map(|row| row.get("id")).collect();
         let rows = sqlx::query(&format!(
             "SELECT k.id, k.platform, k.name, k.external_id, k.avatar_url, k.enabled, k.is_private, k.original_only, k.priority, k.secondary, k.category_id, COALESCE(c.name, '') AS category_name, COALESCE(sc.n, 0) AS subscriber_count FROM kols k LEFT JOIN categories c ON c.id = k.category_id LEFT JOIN (SELECT kol_id, COUNT(*) AS n FROM subscriptions GROUP BY kol_id) sc ON sc.kol_id = k.id WHERE {filter} ORDER BY k.id LIMIT ? OFFSET ?"
         ))
         .bind(platform).bind(platform).bind(category_id).bind(category_id).bind(q).bind(&like).bind(&like).bind(status_flag).bind(status_flag).bind(limit).bind(offset)
         .fetch_all(&self.pool).await?;
-        let items: Vec<Value> = rows.iter().map(|row| json!({
-            "id": row.get::<i64, _>("id"),
-            "platform": row.get::<String, _>("platform"),
-            "name": row.get::<String, _>("name"),
-            "external_id": row.get::<String, _>("external_id"),
-            "avatar_url": row.get::<String, _>("avatar_url"),
-            "enabled": row.get::<i64, _>("enabled") != 0,
-            "is_private": row.get::<i64, _>("is_private") != 0,
-            "original_only": row.get::<i64, _>("original_only") != 0,
-            "priority": row.get::<i64, _>("priority") != 0,
-            "secondary": row.get::<i64, _>("secondary") != 0,
-            "category_id": row.get::<Option<i64>, _>("category_id"),
-            "category_name": row.get::<String, _>("category_name"),
-            "subscriber_count": row.get::<i64, _>("subscriber_count"),
-        })).collect();
+        let items: Vec<Value> = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "id": row.get::<i64, _>("id"),
+                    "platform": row.get::<String, _>("platform"),
+                    "name": row.get::<String, _>("name"),
+                    "external_id": row.get::<String, _>("external_id"),
+                    "avatar_url": row.get::<String, _>("avatar_url"),
+                    "enabled": row.get::<i64, _>("enabled") != 0,
+                    "is_private": row.get::<i64, _>("is_private") != 0,
+                    "original_only": row.get::<i64, _>("original_only") != 0,
+                    "priority": row.get::<i64, _>("priority") != 0,
+                    "secondary": row.get::<i64, _>("secondary") != 0,
+                    "category_id": row.get::<Option<i64>, _>("category_id"),
+                    "category_name": row.get::<String, _>("category_name"),
+                    "subscriber_count": row.get::<i64, _>("subscriber_count"),
+                })
+            })
+            .collect();
         Ok(json!({"total": total, "items": items, "ids": ids}))
     }
 
@@ -4235,7 +5186,10 @@ impl Db {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|row| subscription_json(&row)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| subscription_json(&row))
+            .collect())
     }
 
     async fn touch_flag(
@@ -4463,7 +5417,10 @@ impl Db {
         Ok(id)
     }
 
-    pub async fn kols_to_fetch(&self, platform: &str) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
+    pub async fn kols_to_fetch(
+        &self,
+        platform: &str,
+    ) -> Result<Vec<(i64, String, String)>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, name, external_id FROM kols
              WHERE enabled = 1 AND platform = ?
@@ -4512,6 +5469,7 @@ impl Db {
         Ok(hit.is_some())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_fetched(
         &self,
         kol_id: i64,
@@ -4553,7 +5511,12 @@ impl Db {
         Ok(())
     }
 
-    pub async fn set_platform_detail(&self, platform: &str, external_id: &str, detail: &str) -> Result<(), sqlx::Error> {
+    pub async fn set_platform_detail(
+        &self,
+        platform: &str,
+        external_id: &str,
+        detail: &str,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE posts SET detail = ? WHERE platform = ? AND external_id = ?")
             .bind(detail)
             .bind(platform)
@@ -4573,13 +5536,17 @@ impl Db {
     }
 
     pub async fn sqlite_path(&self) -> Result<String, sqlx::Error> {
-        let path: Option<String> = sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-            .fetch_one(&self.pool)
-            .await?;
+        let path: Option<String> =
+            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(path.unwrap_or_default())
     }
 
-    pub async fn zsxq_file_posts(&self, file_id: &str) -> Result<Vec<(i64, i64, String)>, sqlx::Error> {
+    pub async fn zsxq_file_posts(
+        &self,
+        file_id: &str,
+    ) -> Result<Vec<(i64, i64, String)>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, kol_id, detail FROM posts WHERE platform = 'zsxq' AND (detail LIKE ? OR detail LIKE ? OR detail LIKE ?)",
         )
@@ -4591,8 +5558,12 @@ impl Db {
         let mut hits = Vec::new();
         for row in rows {
             let detail: String = row.get("detail");
-            let Ok(parsed) = serde_json::from_str::<Value>(&detail) else { continue };
-            let Some(files) = parsed.get("files").and_then(Value::as_array) else { continue };
+            let Ok(parsed) = serde_json::from_str::<Value>(&detail) else {
+                continue;
+            };
+            let Some(files) = parsed.get("files").and_then(Value::as_array) else {
+                continue;
+            };
             let matched = files.iter().any(|file| {
                 let id = match &file["file_id"] {
                     Value::String(text) => text.as_str(),
@@ -4609,14 +5580,17 @@ impl Db {
     }
 
     pub async fn is_subscribed(&self, user_id: i64, kol_id: i64) -> Result<bool, sqlx::Error> {
-        let hit: Option<i64> = sqlx::query_scalar("SELECT 1 FROM subscriptions WHERE user_id = ? AND kol_id = ? LIMIT 1")
-            .bind(user_id)
-            .bind(kol_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let hit: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM subscriptions WHERE user_id = ? AND kol_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(kol_id)
+        .fetch_optional(&self.pool)
+        .await?;
         Ok(hit.is_some())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn save_combo(
         &self,
         kol_id: i64,
@@ -4662,11 +5636,12 @@ impl Db {
     }
 
     pub async fn max_published_at(&self, kol_id: i64) -> Result<String, sqlx::Error> {
-        let value: Option<String> =
-            sqlx::query_scalar("SELECT MAX(published_at) FROM posts WHERE kol_id = ? AND published_at != ''")
-                .bind(kol_id)
-                .fetch_one(&self.pool)
-                .await?;
+        let value: Option<String> = sqlx::query_scalar(
+            "SELECT MAX(published_at) FROM posts WHERE kol_id = ? AND published_at != ''",
+        )
+        .bind(kol_id)
+        .fetch_one(&self.pool)
+        .await?;
         Ok(value.unwrap_or_default())
     }
 
@@ -4685,7 +5660,12 @@ impl Db {
         Ok(row.map(|row| (row.get("payload"), row.get("fetched_at"))))
     }
 
-    pub async fn cube_fresh(&self, kol_id: i64, kind: &str, ttl_secs: i64) -> Result<bool, sqlx::Error> {
+    pub async fn cube_fresh(
+        &self,
+        kol_id: i64,
+        kind: &str,
+        ttl_secs: i64,
+    ) -> Result<bool, sqlx::Error> {
         let hit: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM cube_snapshots
              WHERE kol_id = ? AND kind = ? AND fetched_at >= datetime('now', ?)",
@@ -4804,13 +5784,12 @@ impl Db {
         if pending.is_some() {
             return Err(CatalogError::Bad("该大V的申请已在处理中"));
         }
-        let listed: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM kols WHERE platform = ? AND external_id = ?",
-        )
-        .bind(platform)
-        .bind(&external_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let listed: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM kols WHERE platform = ? AND external_id = ?")
+                .bind(platform)
+                .bind(&external_id)
+                .fetch_optional(&self.pool)
+                .await?;
         if listed.is_some() {
             return Err(CatalogError::Bad("该大V已在目录中，直接订阅即可"));
         }
@@ -4921,12 +5900,11 @@ impl Db {
             return Err(CatalogError::Missing("申请不存在或已处理"));
         }
         let user_id: i64 = row.get("user_id");
-        let is_admin: i64 =
-            sqlx::query_scalar("SELECT is_admin FROM users WHERE id = ?")
-                .bind(user_id)
-                .fetch_optional(&self.pool)
-                .await?
-                .unwrap_or(0);
+        let is_admin: i64 = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = ?")
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .unwrap_or(0);
         if let Err(err) = self.subscribe(user_id, is_admin != 0, kol_id, "post").await {
             tracing::warn!("审批后自动订阅失败 request={request_id}: {err:?}");
         }
@@ -4948,10 +5926,22 @@ impl Db {
         Ok(())
     }
 
-    pub async fn note_kol_fetch(&self, kol_id: i64, error: Option<&str>) -> Result<(), sqlx::Error> {
-        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|item| item.as_secs() as i64).unwrap_or(0);
+    pub async fn note_kol_fetch(
+        &self,
+        kol_id: i64,
+        error: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|item| item.as_secs() as i64)
+            .unwrap_or(0);
         let detail = error.unwrap_or("").chars().take(300).collect::<String>();
-        let row = sqlx::query("SELECT platform, name, fetch_fail_streak, source_alerted FROM kols WHERE id = ?").bind(kol_id).fetch_optional(&self.pool).await?;
+        let row = sqlx::query(
+            "SELECT platform, name, fetch_fail_streak, source_alerted FROM kols WHERE id = ?",
+        )
+        .bind(kol_id)
+        .fetch_optional(&self.pool)
+        .await?;
         let Some(row) = row else { return Ok(()) };
         let platform: String = row.get("platform");
         let name: String = row.get("name");
@@ -4964,12 +5954,18 @@ impl Db {
                 .await?;
             self.insert_source_event(&platform, "ok", "", 1, 0).await?;
             if alerted == 1 {
-                self.emit_kol_alert(&crate::alerts::kol_recovered_message(&platform, &name), "kol_recovered", &name).await?;
+                self.emit_kol_alert(
+                    &crate::alerts::kol_recovered_message(&platform, &name),
+                    "kol_recovered",
+                    &name,
+                )
+                .await?;
             }
             return Ok(());
         }
         let streak = row.get::<i64, _>("fetch_fail_streak") + 1;
-        self.insert_source_event(&platform, "fail", &detail, 0, 1).await?;
+        self.insert_source_event(&platform, "fail", &detail, 0, 1)
+            .await?;
         let wide = crate::alerts::platform_wide(&detail);
         if streak >= 5 && crate::alerts::terminal_kol(&detail) && !wide {
             sqlx::query("UPDATE kols SET enabled = 0, last_fetch_at = ?, last_fetch_error = ?, fetch_fail_streak = 0, source_alerted = 0 WHERE id = ?")
@@ -4978,17 +5974,33 @@ impl Db {
                 .bind(kol_id)
                 .execute(&self.pool)
                 .await?;
-            self.emit_kol_alert(&crate::alerts::kol_disabled_message(&platform, &name, &detail, streak), "kol_disabled", &name).await?;
+            self.emit_kol_alert(
+                &crate::alerts::kol_disabled_message(&platform, &name, &detail, streak),
+                "kol_disabled",
+                &name,
+            )
+            .await?;
             return Ok(());
         }
         let mut marked = alerted;
         if streak == 3 || streak % 10 == 0 {
             let key = format!("source_alert_{platform}");
-            let last = self.setting(&key).await?.and_then(|value| value.parse::<i64>().ok()).unwrap_or(0);
-            if crate::alerts::alerts_enabled() && (last == 0 || now.saturating_sub(last) >= 6 * 3600) {
+            let last = self
+                .setting(&key)
+                .await?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            if crate::alerts::alerts_enabled()
+                && (last == 0 || now.saturating_sub(last) >= 6 * 3600)
+            {
                 self.set_setting(&key, &now.to_string()).await?;
                 marked = 1;
-                self.emit_kol_alert(&crate::alerts::kol_failure_message(&platform, &name, &detail, streak), "kol_failure", &name).await?;
+                self.emit_kol_alert(
+                    &crate::alerts::kol_failure_message(&platform, &name, &detail, streak),
+                    "kol_failure",
+                    &name,
+                )
+                .await?;
             }
         }
         sqlx::query("UPDATE kols SET last_fetch_at = ?, last_fetch_error = ?, fetch_fail_streak = ?, source_alerted = ? WHERE id = ?")
@@ -4999,16 +6011,37 @@ impl Db {
             .bind(kol_id)
             .execute(&self.pool)
             .await?;
-        if platform == "weibo" && (detail.contains("登录") || detail.to_lowercase().contains("login")) {
-            self.daily_kol_warning("weibo_warning_date", &crate::alerts::weibo_login_message(&detail), "weibo_login").await?;
+        if platform == "weibo"
+            && (detail.contains("登录") || detail.to_lowercase().contains("login"))
+        {
+            self.daily_kol_warning(
+                "weibo_warning_date",
+                &crate::alerts::weibo_login_message(&detail),
+                "weibo_login",
+            )
+            .await?;
         }
-        if platform == "xueqiu" && (detail.contains("cookie") || detail.contains("WAF") || detail.contains("反爬")) {
-            self.daily_kol_warning("xueqiu_warning_date", &crate::alerts::xueqiu_cookie_message(&detail), "xueqiu_cookie").await?;
+        if platform == "xueqiu"
+            && (detail.contains("cookie") || detail.contains("WAF") || detail.contains("反爬"))
+        {
+            self.daily_kol_warning(
+                "xueqiu_warning_date",
+                &crate::alerts::xueqiu_cookie_message(&detail),
+                "xueqiu_cookie",
+            )
+            .await?;
         }
         Ok(())
     }
 
-    async fn insert_source_event(&self, platform: &str, status: &str, detail: &str, ok_count: i64, fail_count: i64) -> Result<(), sqlx::Error> {
+    async fn insert_source_event(
+        &self,
+        platform: &str,
+        status: &str,
+        detail: &str,
+        ok_count: i64,
+        fail_count: i64,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO source_events (platform, status, detail, ok_count, fail_count) VALUES (?, ?, ?, ?, ?)")
             .bind(platform)
             .bind(status)
@@ -5020,7 +6053,12 @@ impl Db {
         Ok(())
     }
 
-    async fn emit_kol_alert(&self, message: &str, action: &str, target: &str) -> Result<(), sqlx::Error> {
+    async fn emit_kol_alert(
+        &self,
+        message: &str,
+        action: &str,
+        target: &str,
+    ) -> Result<(), sqlx::Error> {
         if crate::alerts::alerts_enabled() {
             crate::alerts::notify_admins(self, message).await;
             self.add_admin_log(0, action, target, message).await?;
@@ -5028,11 +6066,18 @@ impl Db {
         Ok(())
     }
 
-    async fn daily_kol_warning(&self, key: &str, message: &str, action: &str) -> Result<(), sqlx::Error> {
+    async fn daily_kol_warning(
+        &self,
+        key: &str,
+        message: &str,
+        action: &str,
+    ) -> Result<(), sqlx::Error> {
         if !crate::alerts::alerts_enabled() {
             return Ok(());
         }
-        let today: String = sqlx::query_scalar("SELECT date('now', '+8 hours')").fetch_one(&self.pool).await?;
+        let today: String = sqlx::query_scalar("SELECT date('now', '+8 hours')")
+            .fetch_one(&self.pool)
+            .await?;
         if self.setting(key).await?.as_deref() == Some(today.as_str()) {
             return Ok(());
         }
@@ -5042,30 +6087,118 @@ impl Db {
 }
 
 const PLATFORMS: &[&str] = &[
-    "xueqiu", "combination", "weibo", "twitter", "ima", "zsxq", "truth",
+    "xueqiu",
+    "combination",
+    "weibo",
+    "twitter",
+    "ima",
+    "zsxq",
+    "truth",
 ];
 
-const PLAZA_PLATFORMS: &[&str] = &[
-    "xueqiu", "combination", "weibo", "twitter", "zsxq", "truth",
-];
+const PLAZA_PLATFORMS: &[&str] = &["xueqiu", "combination", "weibo", "twitter", "zsxq", "truth"];
 
 const POLL_FIELDS: &[(&str, &str, i64, i64, i64)] = &[
     ("interval_seconds", "config_interval_seconds", 180, 1, 3600),
-    ("priority_interval_seconds", "config_priority_interval_seconds", 60, 1, 600),
-    ("truth_interval_seconds", "config_truth_interval_seconds", 0, 0, 600),
-    ("digest_interval_seconds", "config_digest_interval_seconds", 0, 0, 86400),
-    ("source_probe_interval_seconds", "config_source_probe_interval_seconds", 0, 0, 86400),
-    ("cookie_keepalive_interval_seconds", "config_cookie_keepalive_interval_seconds", 0, 0, 86400),
+    (
+        "priority_interval_seconds",
+        "config_priority_interval_seconds",
+        60,
+        1,
+        600,
+    ),
+    (
+        "truth_interval_seconds",
+        "config_truth_interval_seconds",
+        0,
+        0,
+        600,
+    ),
+    (
+        "digest_interval_seconds",
+        "config_digest_interval_seconds",
+        0,
+        0,
+        86400,
+    ),
+    (
+        "source_probe_interval_seconds",
+        "config_source_probe_interval_seconds",
+        0,
+        0,
+        86400,
+    ),
+    (
+        "cookie_keepalive_interval_seconds",
+        "config_cookie_keepalive_interval_seconds",
+        0,
+        0,
+        86400,
+    ),
     ("daily_report_hour", "config_daily_report_hour", 8, 0, 23),
-    ("combination_base_seconds", "config_combination_base_seconds", 60, 5, 3600),
-    ("combination_idle_cap_seconds", "config_combination_idle_cap_seconds", 600, 5, 86400),
-    ("normal_idle_cap_seconds", "config_normal_idle_cap_seconds", 1800, 5, 86400),
-    ("priority_idle_cap_seconds", "config_priority_idle_cap_seconds", 600, 5, 86400),
-    ("x_fallback_cap_seconds", "config_x_fallback_cap_seconds", 600, 5, 86400),
-    ("secondary_interval_seconds", "config_secondary_base_seconds", 3600, 60, 86400),
-    ("secondary_idle_cap_seconds", "config_secondary_idle_cap_seconds", 21600, 60, 86400),
-    ("secondary_digest_interval_seconds", "config_secondary_digest_interval_seconds", 0, 0, 86400),
-    ("secondary_min_digest_count", "config_secondary_min_digest_count", 1, 1, 100),
+    (
+        "combination_base_seconds",
+        "config_combination_base_seconds",
+        60,
+        5,
+        3600,
+    ),
+    (
+        "combination_idle_cap_seconds",
+        "config_combination_idle_cap_seconds",
+        600,
+        5,
+        86400,
+    ),
+    (
+        "normal_idle_cap_seconds",
+        "config_normal_idle_cap_seconds",
+        1800,
+        5,
+        86400,
+    ),
+    (
+        "priority_idle_cap_seconds",
+        "config_priority_idle_cap_seconds",
+        600,
+        5,
+        86400,
+    ),
+    (
+        "x_fallback_cap_seconds",
+        "config_x_fallback_cap_seconds",
+        600,
+        5,
+        86400,
+    ),
+    (
+        "secondary_interval_seconds",
+        "config_secondary_base_seconds",
+        3600,
+        60,
+        86400,
+    ),
+    (
+        "secondary_idle_cap_seconds",
+        "config_secondary_idle_cap_seconds",
+        21600,
+        60,
+        86400,
+    ),
+    (
+        "secondary_digest_interval_seconds",
+        "config_secondary_digest_interval_seconds",
+        0,
+        0,
+        86400,
+    ),
+    (
+        "secondary_min_digest_count",
+        "config_secondary_min_digest_count",
+        1,
+        1,
+        100,
+    ),
 ];
 
 const ZSXQ_INTS: &[(&str, &str, i64, i64)] = &[
@@ -5075,8 +6208,18 @@ const ZSXQ_INTS: &[(&str, &str, i64, i64)] = &[
 ];
 
 const ZSXQ_FLOATS: &[(&str, &str, f64, f64)] = &[
-    ("zsxq_fetch_delay_seconds", "zsxq_fetch_delay_seconds", 0.2, 10.0),
-    ("zsxq_file_delay_seconds", "zsxq_file_delay_seconds", 0.2, 10.0),
+    (
+        "zsxq_fetch_delay_seconds",
+        "zsxq_fetch_delay_seconds",
+        0.2,
+        10.0,
+    ),
+    (
+        "zsxq_file_delay_seconds",
+        "zsxq_file_delay_seconds",
+        0.2,
+        10.0,
+    ),
 ];
 
 const VISIBLE: &str = "(? = 1 OR k.is_private = 0 OR EXISTS (
@@ -5143,7 +6286,10 @@ pub fn parse_batch_kol_line(line: &str) -> Result<(String, String, String), Stri
             }
             continue;
         }
-        if token.starts_with("http://") || token.starts_with("https://") || token.chars().all(|c| c.is_ascii_digit()) {
+        if token.starts_with("http://")
+            || token.starts_with("https://")
+            || token.chars().all(|c| c.is_ascii_digit())
+        {
             unrecognized = true;
             continue;
         }
@@ -5159,11 +6305,18 @@ pub fn parse_batch_kol_line(line: &str) -> Result<(String, String, String), Stri
             parse_error.unwrap_or_else(|| "未识别到链接或ID".into())
         });
     }
-    Ok((platform.to_string(), normalize_kol_request(platform, &external_id)?, nickname))
+    Ok((
+        platform.to_string(),
+        normalize_kol_request(platform, &external_id)?,
+        nickname,
+    ))
 }
 
 trait BindIds<'q> {
-    fn bind_ids(self, ids: &'q [i64]) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
+    fn bind_ids(
+        self,
+        ids: &'q [i64],
+    ) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>>;
 }
 
 impl<'q> BindIds<'q> for sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments<'q>> {
@@ -5195,8 +6348,19 @@ pub fn normalize_external_id(platform: &str, raw: &str) -> String {
 }
 
 const TWITTER_PAGES: &[&str] = &[
-    "home", "explore", "search", "settings", "notifications", "messages", "compose",
-    "bookmarks", "jobs", "login", "signup", "account", "i",
+    "home",
+    "explore",
+    "search",
+    "settings",
+    "notifications",
+    "messages",
+    "compose",
+    "bookmarks",
+    "jobs",
+    "login",
+    "signup",
+    "account",
+    "i",
 ];
 
 pub fn normalize_kol_request(platform: &str, raw: &str) -> Result<String, String> {
@@ -5293,7 +6457,9 @@ fn digits_after(text: &str, markers: &[&str]) -> Option<String> {
 }
 
 fn only_digits(text: &str) -> Option<String> {
-    text.chars().all(|c| c.is_ascii_digit()).then(|| text.to_string())
+    text.chars()
+        .all(|c| c.is_ascii_digit())
+        .then(|| text.to_string())
 }
 
 fn zh_code(text: &str) -> Option<String> {
@@ -5322,7 +6488,9 @@ fn ima_id(text: &str) -> Option<String> {
         }
     }
     let ok = (6..=64).contains(&text.len())
-        && text.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
     ok.then(|| text.to_string())
 }
 
@@ -5341,13 +6509,21 @@ fn zsxq_id(text: &str) -> Option<String> {
 
 fn twitter_id(text: &str) -> Result<String, String> {
     if let Some(path) = twitter_path(text) {
-        if text.contains("/status/") || text.contains("/i/") || text.ends_with("/i") || TWITTER_PAGES.contains(&path.as_str()) {
+        if text.contains("/status/")
+            || text.contains("/i/")
+            || text.ends_with("/i")
+            || TWITTER_PAGES.contains(&path.as_str())
+        {
             return Err("这是 X 的系统页面/推文链接，请复制用户主页链接（x.com/<用户名>）".into());
         }
         return Ok(path);
     }
     let handle = text.strip_prefix('@').unwrap_or(text);
-    if (1..=15).contains(&handle.len()) && handle.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if (1..=15).contains(&handle.len())
+        && handle
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
         return Ok(handle.to_string());
     }
     Err("无法识别的 X 用户名，请使用 x.com/<用户名> 链接或 @用户名".into())
@@ -5358,7 +6534,10 @@ fn twitter_path(text: &str) -> Option<String> {
         let Some((_, rest)) = text.split_once(marker) else {
             continue;
         };
-        let path: String = rest.chars().take_while(|c| c.is_ascii_alphanumeric() || *c == '_').collect();
+        let path: String = rest
+            .chars()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .collect();
         if !path.is_empty() {
             return Some(path);
         }
@@ -5367,7 +6546,10 @@ fn twitter_path(text: &str) -> Option<String> {
 }
 
 fn plaza_modes(raw: Option<&str>) -> HashMap<String, String> {
-    let mut out = PLAZA_PLATFORMS.iter().map(|platform| ((*platform).to_string(), "auto".to_string())).collect::<HashMap<_, _>>();
+    let mut out = PLAZA_PLATFORMS
+        .iter()
+        .map(|platform| ((*platform).to_string(), "auto".to_string()))
+        .collect::<HashMap<_, _>>();
     let Ok(value) = serde_json::from_str::<Value>(raw.unwrap_or("")) else {
         return out;
     };
@@ -5385,16 +6567,19 @@ fn plaza_modes(raw: Option<&str>) -> HashMap<String, String> {
 
 fn plaza_rows(counts: &HashMap<String, i64>, settings: &HashMap<String, String>) -> Vec<Value> {
     let modes = plaza_modes(settings.get("plaza_source_visibility").map(String::as_str));
-    PLAZA_PLATFORMS.iter().map(|platform| {
-        let enabled = counts.get(*platform).copied().unwrap_or(0);
-        let mode = modes.get(*platform).map(String::as_str).unwrap_or("auto");
-        json!({
-            "platform": platform,
-            "mode": mode,
-            "enabled_kols": enabled,
-            "visible": mode == "show" || (mode == "auto" && enabled > 0),
+    PLAZA_PLATFORMS
+        .iter()
+        .map(|platform| {
+            let enabled = counts.get(*platform).copied().unwrap_or(0);
+            let mode = modes.get(*platform).map(String::as_str).unwrap_or("auto");
+            json!({
+                "platform": platform,
+                "mode": mode,
+                "enabled_kols": enabled,
+                "visible": mode == "show" || (mode == "auto" && enabled > 0),
+            })
         })
-    }).collect()
+        .collect()
 }
 
 fn polling_json(settings: &HashMap<String, String>) -> Value {
@@ -5402,30 +6587,76 @@ fn polling_json(settings: &HashMap<String, String>) -> Value {
     for (name, key, default, _, _) in POLL_FIELDS {
         out.insert((*name).into(), json!(int_setting(settings, key, *default)));
     }
-    out.insert("translate_twitter_content".into(), json!(settings.get("config_translate_twitter_content").is_some_and(|v| v == "1")));
+    out.insert(
+        "translate_twitter_content".into(),
+        json!(settings
+            .get("config_translate_twitter_content")
+            .is_some_and(|v| v == "1")),
+    );
     out.insert(
         "telegram_rich_messages".into(),
-        json!(settings.get("config_telegram_rich_messages").map(|v| v == "1").unwrap_or(true)),
+        json!(settings
+            .get("config_telegram_rich_messages")
+            .map(|v| v == "1")
+            .unwrap_or(true)),
     );
-    out.insert("zsxq_max_pages".into(), json!(int_setting(settings, "zsxq_max_pages", 3)));
-    out.insert("zsxq_max_comment_pages".into(), json!(int_setting(settings, "zsxq_max_comment_pages", 3)));
-    out.insert("zsxq_comment_budget".into(), json!(int_setting(settings, "zsxq_comment_budget", 30)));
-    out.insert("zsxq_fetch_delay_seconds".into(), json!(float_setting(settings, "zsxq_fetch_delay_seconds", 1.0)));
-    out.insert("zsxq_file_delay_seconds".into(), json!(float_setting(settings, "zsxq_file_delay_seconds", 1.0)));
-    out.insert("zsxq_prefetch_files".into(), json!(settings.get("zsxq_prefetch_files").is_some_and(|v| v == "1")));
-    out.insert("zsxq_fetch_comments".into(), json!(settings.get("zsxq_fetch_comments").is_some_and(|v| v == "1")));
-    out.insert("zsxq_app_channel".into(), json!(settings.get("zsxq_app_channel").is_some_and(|v| v == "1")));
-    let device = settings.get("zsxq_app_device").filter(|v| !v.is_empty()).map(String::as_str).unwrap_or("16 OnePlus_PJD110");
+    out.insert(
+        "zsxq_max_pages".into(),
+        json!(int_setting(settings, "zsxq_max_pages", 3)),
+    );
+    out.insert(
+        "zsxq_max_comment_pages".into(),
+        json!(int_setting(settings, "zsxq_max_comment_pages", 3)),
+    );
+    out.insert(
+        "zsxq_comment_budget".into(),
+        json!(int_setting(settings, "zsxq_comment_budget", 30)),
+    );
+    out.insert(
+        "zsxq_fetch_delay_seconds".into(),
+        json!(float_setting(settings, "zsxq_fetch_delay_seconds", 1.0)),
+    );
+    out.insert(
+        "zsxq_file_delay_seconds".into(),
+        json!(float_setting(settings, "zsxq_file_delay_seconds", 1.0)),
+    );
+    out.insert(
+        "zsxq_prefetch_files".into(),
+        json!(settings
+            .get("zsxq_prefetch_files")
+            .is_some_and(|v| v == "1")),
+    );
+    out.insert(
+        "zsxq_fetch_comments".into(),
+        json!(settings
+            .get("zsxq_fetch_comments")
+            .is_some_and(|v| v == "1")),
+    );
+    out.insert(
+        "zsxq_app_channel".into(),
+        json!(settings.get("zsxq_app_channel").is_some_and(|v| v == "1")),
+    );
+    let device = settings
+        .get("zsxq_app_device")
+        .filter(|v| !v.is_empty())
+        .map(String::as_str)
+        .unwrap_or("16 OnePlus_PJD110");
     out.insert("zsxq_app_device".into(), json!(device));
     Value::Object(out)
 }
 
 fn int_setting(settings: &HashMap<String, String>, key: &str, default: i64) -> i64 {
-    settings.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+    settings
+        .get(key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn float_setting(settings: &HashMap<String, String>, key: &str, default: f64) -> f64 {
-    settings.get(key).and_then(|v| v.parse().ok()).unwrap_or(default)
+    settings
+        .get(key)
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn cookie_status(settings: &HashMap<String, String>, key: &str, env: Option<String>) -> Value {
@@ -5472,7 +6703,11 @@ fn admin_user_json(row: &sqlx::sqlite::SqliteRow, after: i64, purge: i64) -> Val
     let never_logged_in = last_login.as_deref().unwrap_or("").is_empty();
     let old_enough = after > 0 && created_before(&created_at, after);
     let inactive = !admin && never_logged_in && old_enough && !bound && subscribed == 0;
-    let origin = if register_code.is_empty() { "web" } else { "invite" };
+    let origin = if register_code.is_empty() {
+        "web"
+    } else {
+        "invite"
+    };
     json!({
         "id": row.get::<i64, _>("id"),
         "username": username,
@@ -5504,14 +6739,19 @@ fn admin_user_json(row: &sqlx::sqlite::SqliteRow, after: i64, purge: i64) -> Val
 }
 
 fn created_before(created_at: &str, days: i64) -> bool {
-    days_left(created_at, days).as_i64().is_some_and(|left| left <= 0)
+    days_left(created_at, days)
+        .as_i64()
+        .is_some_and(|left| left <= 0)
 }
 
 fn days_left(created_at: &str, days: i64) -> Value {
     let Some(created) = utc_unix(created_at) else {
         return Value::Null;
     };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let left = (created + days * 86400 - now).div_euclid(86400);
     json!(left.max(0))
 }
@@ -5718,7 +6958,11 @@ fn news_source_json(row: &sqlx::sqlite::SqliteRow, feeds: &[sqlx::sqlite::Sqlite
     let id: i64 = row.get("id");
     let enabled = row.get::<i64, _>("enabled") != 0;
     let archived: Option<String> = row.get("archived_at");
-    let feed_rows = feeds.iter().filter(|feed| feed.get::<i64, _>("source_id") == id).map(news_feed_json).collect::<Vec<_>>();
+    let feed_rows = feeds
+        .iter()
+        .filter(|feed| feed.get::<i64, _>("source_id") == id)
+        .map(news_feed_json)
+        .collect::<Vec<_>>();
     json!({
         "id": id,
         "slug": row.get::<String, _>("slug"),
@@ -5760,12 +7004,23 @@ async fn add_column(pool: &SqlitePool, sql: &str) -> Result<(), sqlx::Error> {
 }
 
 async fn ensure_news_admin_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let sources: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('news_sources')").fetch_all(pool).await?;
+    let sources: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('news_sources')")
+            .fetch_all(pool)
+            .await?;
     if !sources.is_empty() && !sources.iter().any(|column| column == "internal") {
-        add_column(pool, "ALTER TABLE news_sources ADD COLUMN internal INTEGER NOT NULL DEFAULT 0").await?;
+        add_column(
+            pool,
+            "ALTER TABLE news_sources ADD COLUMN internal INTEGER NOT NULL DEFAULT 0",
+        )
+        .await?;
     }
-    sqlx::query("UPDATE news_sources SET internal = 1 WHERE slug LIKE 'xincai-%' AND internal = 0").execute(pool).await?;
-    let feeds: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('news_feeds')").fetch_all(pool).await?;
+    sqlx::query("UPDATE news_sources SET internal = 1 WHERE slug LIKE 'xincai-%' AND internal = 0")
+        .execute(pool)
+        .await?;
+    let feeds: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('news_feeds')")
+        .fetch_all(pool)
+        .await?;
     let columns = [
         ("archived_at", "TEXT"),
         ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
@@ -5776,15 +7031,20 @@ async fn ensure_news_admin_columns(pool: &SqlitePool) -> Result<(), sqlx::Error>
         if feeds.iter().any(|column| column == name) {
             continue;
         }
-        add_column(pool, &format!("ALTER TABLE news_feeds ADD COLUMN {name} {def}")).await?;
+        add_column(
+            pool,
+            &format!("ALTER TABLE news_feeds ADD COLUMN {name} {def}"),
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn ensure_news_article_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('news_articles')")
-        .fetch_all(pool)
-        .await?;
+    let existing: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('news_articles')")
+            .fetch_all(pool)
+            .await?;
     let columns = [
         ("issue_key", "TEXT NOT NULL DEFAULT ''"),
         ("issue_label", "TEXT NOT NULL DEFAULT ''"),
@@ -5799,7 +7059,11 @@ async fn ensure_news_article_columns(pool: &SqlitePool) -> Result<(), sqlx::Erro
         if existing.iter().any(|column| column == name) {
             continue;
         }
-        add_column(pool, &format!("ALTER TABLE news_articles ADD COLUMN {name} {def}")).await?;
+        add_column(
+            pool,
+            &format!("ALTER TABLE news_articles ADD COLUMN {name} {def}"),
+        )
+        .await?;
     }
     sqlx::raw_sql(
         "CREATE TABLE IF NOT EXISTS news_keyword_notified (
@@ -5821,9 +7085,10 @@ async fn ensure_news_article_columns(pool: &SqlitePool) -> Result<(), sqlx::Erro
 }
 
 async fn ensure_feishu_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('feishu_document_sources')")
-        .fetch_all(pool)
-        .await?;
+    let existing: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('feishu_document_sources')")
+            .fetch_all(pool)
+            .await?;
     let columns = [
         ("asset_root", "TEXT NOT NULL DEFAULT ''"),
         ("source_type", "TEXT NOT NULL DEFAULT 'docx'"),
@@ -5840,7 +7105,11 @@ async fn ensure_feishu_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         if existing.is_empty() || existing.iter().any(|column| column == name) {
             continue;
         }
-        add_column(pool, &format!("ALTER TABLE feishu_document_sources ADD COLUMN {name} {def}")).await?;
+        add_column(
+            pool,
+            &format!("ALTER TABLE feishu_document_sources ADD COLUMN {name} {def}"),
+        )
+        .await?;
     }
     sqlx::raw_sql("CREATE TABLE IF NOT EXISTS feishu_oauth_sessions (state_hash TEXT PRIMARY KEY, user_id INTEGER NOT NULL, code_verifier TEXT NOT NULL, expires_at INTEGER NOT NULL)")
         .execute(pool)
@@ -5852,10 +7121,9 @@ async fn ensure_feishu_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 }
 
 async fn ensure_user_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let existing: Vec<String> =
-        sqlx::query_scalar("SELECT name FROM pragma_table_info('users')")
-            .fetch_all(pool)
-            .await?;
+    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('users')")
+        .fetch_all(pool)
+        .await?;
     let columns = [
         ("telegram_chat_id", "TEXT NOT NULL DEFAULT ''"),
         ("telegram_bot_token", "TEXT NOT NULL DEFAULT ''"),
@@ -5910,13 +7178,19 @@ async fn ensure_register_code_columns(pool: &SqlitePool) -> Result<(), sqlx::Err
         if existing.iter().any(|column| column == name) {
             continue;
         }
-        add_column(pool, &format!("ALTER TABLE register_codes ADD COLUMN {name} {def}")).await?;
+        add_column(
+            pool,
+            &format!("ALTER TABLE register_codes ADD COLUMN {name} {def}"),
+        )
+        .await?;
     }
     Ok(())
 }
 
 async fn ensure_kol_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('kols')").fetch_all(pool).await?;
+    let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info('kols')")
+        .fetch_all(pool)
+        .await?;
     let columns = [
         ("recommend_weight", "INTEGER NOT NULL DEFAULT 0"),
         ("last_fetch_at", "TEXT NOT NULL DEFAULT ''"),
@@ -5935,7 +7209,10 @@ async fn ensure_kol_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
 fn bind_code_text() -> Result<String, CatalogError> {
     const ALPHABET: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
-    Ok(random_bytes(8)?.iter().map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char).collect())
+    Ok(random_bytes(8)?
+        .iter()
+        .map(|byte| ALPHABET[(*byte as usize) % ALPHABET.len()] as char)
+        .collect())
 }
 
 fn bind_code_digest(code: &str) -> String {
@@ -5944,7 +7221,10 @@ fn bind_code_digest(code: &str) -> String {
         return String::new();
     }
     use sha2::{Digest, Sha256};
-    Sha256::digest(code.as_bytes()).iter().map(|byte| format!("{byte:02x}")).collect()
+    Sha256::digest(code.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn random_invite_code() -> Result<String, CatalogError> {
@@ -5957,13 +7237,16 @@ fn random_invite_code() -> Result<String, CatalogError> {
 }
 
 fn random_hex(n: usize) -> Result<String, CatalogError> {
-    Ok(random_bytes(n)?.iter().map(|byte| format!("{byte:02x}")).collect())
+    Ok(random_bytes(n)?
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn random_bytes(n: usize) -> Result<Vec<u8>, CatalogError> {
     let mut buf = vec![0u8; n];
-    let mut file = std::fs::File::open("/dev/urandom")
-        .map_err(|_| CatalogError::Bad("无法生成邀请码"))?;
+    let mut file =
+        std::fs::File::open("/dev/urandom").map_err(|_| CatalogError::Bad("无法生成邀请码"))?;
     std::io::Read::read_exact(&mut file, &mut buf)
         .map_err(|_| CatalogError::Bad("无法生成邀请码"))?;
     Ok(buf)
@@ -6068,14 +7351,25 @@ impl From<sqlx::Error> for CatalogError {
 }
 
 fn dnd_active(start: &str, end: &str) -> bool {
-    let Some(start) = clock_minutes(start) else { return false };
-    let Some(end) = clock_minutes(end) else { return false };
+    let Some(start) = clock_minutes(start) else {
+        return false;
+    };
+    let Some(end) = clock_minutes(end) else {
+        return false;
+    };
     if start == end {
         return false;
     }
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let now = ((now + 8 * 3600) % 86400 / 60) as u32;
-    if start < end { now >= start && now < end } else { now >= start || now < end }
+    if start < end {
+        now >= start && now < end
+    } else {
+        now >= start || now < end
+    }
 }
 
 fn clock_minutes(value: &str) -> Option<u32> {
@@ -6089,7 +7383,9 @@ fn clock_minutes(value: &str) -> Option<u32> {
 }
 
 fn keyword_hits(raw: &str, text: &str) -> Vec<String> {
-    let Ok(list) = serde_json::from_str::<Vec<String>>(raw) else { return Vec::new() };
+    let Ok(list) = serde_json::from_str::<Vec<String>>(raw) else {
+        return Vec::new();
+    };
     let text = text.to_lowercase();
     let mut seen = HashSet::new();
     let mut hits = Vec::new();
@@ -6124,9 +7420,19 @@ mod tests {
 
     #[tokio::test]
     async fn ticker_page_hides_digest_the_reader_cannot_fully_see() {
-        let path = std::env::temp_dir().join(format!("vpush-ticker-{}-{}.db", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "vpush-ticker-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let db = Db::open(&path).await.unwrap();
-        for (group, media, day) in [("reports", "m1", "2026-08-02"), ("secret", "m2", "2026-08-01")] {
+        for (group, media, day) in [
+            ("reports", "m1", "2026-08-02"),
+            ("secret", "m2", "2026-08-01"),
+        ] {
             sqlx::query("INSERT INTO ima_document_index (group_id, media_id, name, sort_date) VALUES (?, ?, '研报', ?)")
                 .bind(group).bind(media).bind(day).execute(db.pool()).await.unwrap();
             sqlx::query("INSERT INTO report_extraction_tickers (group_id, media_id, code, name) VALUES (?, ?, '600000', '浦发银行')")
@@ -6137,13 +7443,19 @@ mod tests {
         sqlx::query("INSERT INTO ima_ticker_digests (kind, code, name, source_count, digest, status, updated_at) VALUES ('ticker', '600000', '浦发银行', 2, ?, 'ok', '2026-08-02 10:00')")
             .bind(r#"{"consensus":"一致看多","divergence":"估值","evolution":[{"date":"2026-08-01","point":"上调"}]}"#)
             .execute(db.pool()).await.unwrap();
-        let full = db.ima_ticker_page("浦发银行", &["reports".into(), "secret".into()], 100).await.unwrap();
+        let full = db
+            .ima_ticker_page("浦发银行", &["reports".into(), "secret".into()], 100)
+            .await
+            .unwrap();
         assert_eq!(full["code"], "600000");
         assert_eq!(full["name"], "浦发银行");
         assert_eq!(full["count"], 2);
         assert_eq!(full["items"][0]["sort_date"], "2026-08-02");
         assert_eq!(full["digest"]["consensus"], "一致看多");
-        let partial = db.ima_ticker_page("600000", &["reports".into()], 100).await.unwrap();
+        let partial = db
+            .ima_ticker_page("600000", &["reports".into()], 100)
+            .await
+            .unwrap();
         assert_eq!(partial["count"], 1);
         assert!(partial["digest"].as_object().unwrap().is_empty());
         let _ = std::fs::remove_file(&path);
@@ -6151,20 +7463,67 @@ mod tests {
 
     #[tokio::test]
     async fn patch_kol_keeps_unspecified_fields_and_switches_tier() {
-        let path = std::env::temp_dir().join(format!("vpush-patch-{}-{}.db", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "vpush-patch-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let db = Db::open(&path).await.unwrap();
         let category = db.add_category("实盘").await.unwrap();
-        let id = db.add_kol("xueqiu", "旧名", "111", Some(category), true, false, false).await.unwrap();
-        sqlx::query("INSERT INTO users (username, password_hash, is_admin) VALUES ('Alice', 'x', 0)").execute(db.pool()).await.unwrap();
+        let id = db
+            .add_kol("xueqiu", "旧名", "111", Some(category), true, false, false)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES ('Alice', 'x', 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
         let users = vec!["alice".to_string()];
-        db.patch_kol(id, KolPatch { name: Some("段永平"), external_id: None, enabled: None, category_id: None, priority: None, secondary: None, is_private: Some(true), original_only: None, recommend_weight: Some(5), visible_users: Some(&users) }).await.unwrap();
+        db.patch_kol(
+            id,
+            KolPatch {
+                name: Some("段永平"),
+                external_id: None,
+                enabled: None,
+                category_id: None,
+                priority: None,
+                secondary: None,
+                is_private: Some(true),
+                original_only: None,
+                recommend_weight: Some(5),
+                visible_users: Some(&users),
+            },
+        )
+        .await
+        .unwrap();
         let kol = db.kol_for(1, true, id).await.unwrap().unwrap();
         assert_eq!(kol["name"], "段永平");
         assert_eq!(kol["priority"], true);
         assert_eq!(kol["category_id"], category);
         assert_eq!(kol["recommend_weight"], 5);
         assert_eq!(kol["visible_users"][0], "Alice");
-        db.patch_kol(id, KolPatch { name: None, external_id: None, enabled: Some(false), category_id: None, priority: None, secondary: Some(true), is_private: None, original_only: None, recommend_weight: None, visible_users: None }).await.unwrap();
+        db.patch_kol(
+            id,
+            KolPatch {
+                name: None,
+                external_id: None,
+                enabled: Some(false),
+                category_id: None,
+                priority: None,
+                secondary: Some(true),
+                is_private: None,
+                original_only: None,
+                recommend_weight: None,
+                visible_users: None,
+            },
+        )
+        .await
+        .unwrap();
         let kol = db.kol_for(1, true, id).await.unwrap().unwrap();
         let listed = db.admin_kol_page("", 0, "", None, 50, 0).await.unwrap();
         assert_eq!(kol["enabled"], false);
@@ -6172,18 +7531,52 @@ mod tests {
         assert_eq!(listed["items"][0]["secondary"], true);
         assert_eq!(kol["name"], "段永平");
         assert_eq!(kol["visible_users"][0], "Alice");
-        let err = db.patch_kol(id, KolPatch { name: None, external_id: None, enabled: None, category_id: None, priority: None, secondary: None, is_private: None, original_only: None, recommend_weight: None, visible_users: Some(&["missing".into()]) }).await.unwrap_err();
+        let err = db
+            .patch_kol(
+                id,
+                KolPatch {
+                    name: None,
+                    external_id: None,
+                    enabled: None,
+                    category_id: None,
+                    priority: None,
+                    secondary: None,
+                    is_private: None,
+                    original_only: None,
+                    recommend_weight: None,
+                    visible_users: Some(&["missing".into()]),
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(matches!(err, CatalogError::Invalid(_)));
         let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
     async fn admin_kol_page_filters_without_hiding_disabled() {
-        let path = std::env::temp_dir().join(format!("vpush-kols-{}-{}.db", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "vpush-kols-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let db = Db::open(&path).await.unwrap();
-        let first = db.add_kol("xueqiu", "段永平", "111", None, true, false, false).await.unwrap();
-        let second = db.add_kol("weibo", "乙", "222", None, false, true, false).await.unwrap();
-        sqlx::query("UPDATE kols SET enabled = 0 WHERE id = ?").bind(second).execute(db.pool()).await.unwrap();
+        let first = db
+            .add_kol("xueqiu", "段永平", "111", None, true, false, false)
+            .await
+            .unwrap();
+        let second = db
+            .add_kol("weibo", "乙", "222", None, false, true, false)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kols SET enabled = 0 WHERE id = ?")
+            .bind(second)
+            .execute(db.pool())
+            .await
+            .unwrap();
         db.subscribe(1, true, first, "post").await.unwrap();
         let page = db.admin_kol_page("", 0, "", None, 1, 0).await.unwrap();
         assert_eq!(page["total"], 2);
@@ -6191,7 +7584,10 @@ mod tests {
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
         assert_eq!(page["items"][0]["subscriber_count"], 1);
         assert_eq!(page["items"][0]["priority"], true);
-        let weibo = db.admin_kol_page("weibo", 0, "", Some(0), 50, 0).await.unwrap();
+        let weibo = db
+            .admin_kol_page("weibo", 0, "", Some(0), 50, 0)
+            .await
+            .unwrap();
         assert_eq!(weibo["total"], 1);
         assert_eq!(weibo["items"][0]["secondary"], true);
         assert_eq!(weibo["items"][0]["enabled"], false);
@@ -6217,7 +7613,10 @@ mod tests {
             .unwrap();
         db.ensure_admin("hash").await.unwrap();
         let taken = db.register("invite2", "admin", "hash").await;
-        assert!(matches!(taken, Err(RegisterError::Rejected("用户名已存在"))));
+        assert!(matches!(
+            taken,
+            Err(RegisterError::Rejected("用户名已存在"))
+        ));
         let id = db.register("invite2", "abcdef", "hash").await.unwrap();
         assert!(id > 0);
         let again = db.register("INVITE2", "other1", "hash").await;
@@ -6262,7 +7661,15 @@ mod tests {
         let db = Db::open(&path).await.unwrap();
         let cat = db.add_category("宏观").await.unwrap();
         let main = db
-            .add_kol("xueqiu", "甲", "https://xueqiu.com/u/111", Some(cat), false, false, false)
+            .add_kol(
+                "xueqiu",
+                "甲",
+                "https://xueqiu.com/u/111",
+                Some(cat),
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         let side = db
@@ -6270,7 +7677,15 @@ mod tests {
             .await
             .unwrap();
         let hidden = db
-            .add_kol("weibo", "丙", "https://weibo.com/u/333", None, false, false, false)
+            .add_kol(
+                "weibo",
+                "丙",
+                "https://weibo.com/u/333",
+                None,
+                false,
+                false,
+                false,
+            )
             .await
             .unwrap();
         sqlx::query("UPDATE kols SET is_private = 1 WHERE id = ?")
@@ -6317,24 +7732,36 @@ mod tests {
         db.set_favorite(admin.id, side, true).await.unwrap();
         assert!(db.should_push(side, "post").await.unwrap());
         assert_eq!(db.feed(admin.id, true, &open).await.unwrap().len(), 2);
-        let tagged = FeedFilter { tag: "宏观", ..open };
+        let tagged = FeedFilter {
+            tag: "宏观",
+            ..open
+        };
         assert_eq!(db.feed(admin.id, true, &tagged).await.unwrap().len(), 1);
         let plaza = db.catalog(reader.id, false, "", 0).await.unwrap();
         assert!(plaza.iter().all(|row| row["name"] != "丙"));
         let admin_plaza = db.catalog(admin.id, true, "", 0).await.unwrap();
         assert!(admin_plaza.iter().any(|row| row["name"] == "丙"));
-        assert!(db.subscribe(reader.id, false, hidden, "post").await.is_err());
+        assert!(db
+            .subscribe(reader.id, false, hidden, "post")
+            .await
+            .is_err());
         sqlx::query("UPDATE posts SET images = ? WHERE external_id = 'p1'")
             .bind(r#"["https://img.example/a.jpg"]"#)
             .execute(&db.pool)
             .await
             .unwrap();
         let shown = db.feed(admin.id, true, &open).await.unwrap();
-        let main_post = shown.iter().find(|row| row["content"] == "宏观正文").unwrap();
+        let main_post = shown
+            .iter()
+            .find(|row| row["content"] == "宏观正文")
+            .unwrap();
         assert_eq!(main_post["images"][0], "https://img.example/a.jpg");
         db.set_hide_images(admin.id, main, true).await.unwrap();
         let hidden_imgs = db.feed(admin.id, true, &open).await.unwrap();
-        let main_post = hidden_imgs.iter().find(|row| row["content"] == "宏观正文").unwrap();
+        let main_post = hidden_imgs
+            .iter()
+            .find(|row| row["content"] == "宏观正文")
+            .unwrap();
         assert_eq!(main_post["images"].as_array().unwrap().len(), 0);
         let subs = db.my_subscriptions(admin.id).await.unwrap();
         let row = subs.iter().find(|row| row["id"] == main).unwrap();
@@ -6359,17 +7786,30 @@ mod tests {
         let user = db.user_by_username("admin").await.unwrap().unwrap();
         assert!(user.notify_enabled);
         assert!(user.translate_twitter);
-        db.set_user_flag(user.id, "notify_enabled", false).await.unwrap();
-        db.set_user_text(user.id, "push_channels", "wecom,bark").await.unwrap();
-        db.set_user_text(user.id, "keywords", r#"["宏观"]"#).await.unwrap();
-        db.set_user_text(user.id, "wecom_webhook", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc")
+        db.set_user_flag(user.id, "notify_enabled", false)
             .await
             .unwrap();
+        db.set_user_text(user.id, "push_channels", "wecom,bark")
+            .await
+            .unwrap();
+        db.set_user_text(user.id, "keywords", r#"["宏观"]"#)
+            .await
+            .unwrap();
+        db.set_user_text(
+            user.id,
+            "wecom_webhook",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc",
+        )
+        .await
+        .unwrap();
         let saved = db.user_by_id(user.id).await.unwrap().unwrap();
         assert!(!saved.notify_enabled);
         assert_eq!(saved.push_channels, "wecom,bark");
         assert_eq!(saved.keywords, r#"["宏观"]"#);
-        let kol = db.add_kol("xueqiu", "甲", "1", None, false, false, false).await.unwrap();
+        let kol = db
+            .add_kol("xueqiu", "甲", "1", None, false, false, false)
+            .await
+            .unwrap();
         db.subscribe(user.id, true, kol, "post").await.unwrap();
         let targets = db.push_targets(kol).await.unwrap();
         assert_eq!(targets.len(), 1);
@@ -6380,9 +7820,18 @@ mod tests {
 
     #[test]
     fn kol_request_links_are_normalized() {
-        assert_eq!(normalize_kol_request("xueqiu", "https://xueqiu.com/u/4514680565").unwrap(), "4514680565");
-        assert_eq!(normalize_kol_request("combination", "ZH123456").unwrap(), "ZH123456");
-        assert_eq!(normalize_kol_request("twitter", "@some_user").unwrap(), "some_user");
+        assert_eq!(
+            normalize_kol_request("xueqiu", "https://xueqiu.com/u/4514680565").unwrap(),
+            "4514680565"
+        );
+        assert_eq!(
+            normalize_kol_request("combination", "ZH123456").unwrap(),
+            "ZH123456"
+        );
+        assert_eq!(
+            normalize_kol_request("twitter", "@some_user").unwrap(),
+            "some_user"
+        );
         let switched = normalize_kol_request("weibo", "https://xueqiu.com/u/1").unwrap_err();
         assert!(switched.contains("雪球") && switched.contains("微博"));
         assert!(normalize_kol_request("twitter", "https://x.com/home").is_err());
@@ -6395,7 +7844,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-stats-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.save_cookie("xueqiu_cookie", "xqsecret").await.unwrap();
@@ -6421,7 +7873,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-users-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
@@ -6435,18 +7890,51 @@ mod tests {
             .execute(&db.pool)
             .await
             .unwrap();
-        db.set_ima_kb_acl_for_user(reader.id, &["reports".into()]).await.unwrap();
-        assert_eq!(db.ima_kb_group_ids_for_user(reader.id).await.unwrap(), vec!["reports".to_string()]);
-        assert_eq!(db.ima_kb_subscribed_group_ids_for_user(reader.id).await.unwrap(), vec!["reports".to_string()]);
+        db.set_ima_kb_acl_for_user(reader.id, &["reports".into()])
+            .await
+            .unwrap();
+        assert_eq!(
+            db.ima_kb_group_ids_for_user(reader.id).await.unwrap(),
+            vec!["reports".to_string()]
+        );
+        assert_eq!(
+            db.ima_kb_subscribed_group_ids_for_user(reader.id)
+                .await
+                .unwrap(),
+            vec!["reports".to_string()]
+        );
         db.set_ima_kb_acl_for_user(reader.id, &[]).await.unwrap();
-        assert!(db.ima_kb_group_ids_for_user(reader.id).await.unwrap().is_empty());
-        assert!(db.ima_kb_subscribed_group_ids_for_user(reader.id).await.unwrap().is_empty());
+        assert!(db
+            .ima_kb_group_ids_for_user(reader.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(db
+            .ima_kb_subscribed_group_ids_for_user(reader.id)
+            .await
+            .unwrap()
+            .is_empty());
         let listed = db.list_admin_users().await.unwrap();
-        assert!(listed.iter().any(|row| row["username"] == "reader01" && row["inactive"] == true && row["ima_kb_groups"].as_array().unwrap().is_empty()));
-        assert!(listed.iter().all(|row| row.get("password_hash").is_none() && row.get("wecom_webhook").is_none()));
+        assert!(listed.iter().any(|row| row["username"] == "reader01"
+            && row["inactive"] == true
+            && row["ima_kb_groups"].as_array().unwrap().is_empty()));
+        assert!(listed
+            .iter()
+            .all(|row| row.get("password_hash").is_none() && row.get("wecom_webhook").is_none()));
         assert!(db.delete_user(admin.id, admin.id).await.is_err());
-        assert!(db.update_admin_user(admin.id, admin.id, None, None, Some(false)).await.is_err());
-        db.update_admin_user(admin.id, reader.id, Some("reader02"), Some("new-hash"), None).await.unwrap();
+        assert!(db
+            .update_admin_user(admin.id, admin.id, None, None, Some(false))
+            .await
+            .is_err());
+        db.update_admin_user(
+            admin.id,
+            reader.id,
+            Some("reader02"),
+            Some("new-hash"),
+            None,
+        )
+        .await
+        .unwrap();
         let renamed = db.user_by_username("reader02").await.unwrap().unwrap();
         assert_eq!(renamed.token_version, 1);
         db.delete_user(admin.id, reader.id).await.unwrap();
@@ -6462,27 +7950,66 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-plaza-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
         let admin = db.user_by_username("admin").await.unwrap().unwrap();
-        let snow = db.add_kol("xueqiu", "甲", "1", None, false, false, false).await.unwrap();
-        let blog = db.add_kol("weibo", "乙", "2", None, false, false, false).await.unwrap();
+        let snow = db
+            .add_kol("xueqiu", "甲", "1", None, false, false, false)
+            .await
+            .unwrap();
+        let blog = db
+            .add_kol("weibo", "乙", "2", None, false, false, false)
+            .await
+            .unwrap();
         db.subscribe(admin.id, true, snow, "post").await.unwrap();
         db.subscribe(admin.id, true, blog, "post").await.unwrap();
-        db.insert_post(snow, "a", "雪球", "2026-09-26 12:00", "[]").await.unwrap();
-        db.insert_post(blog, "b", "微博", "2026-09-26 12:01", "[]").await.unwrap();
-        let open = FeedFilter { limit: 20, offset: 0, platform: "", category_id: 0, q: "", favorite: false, tag: "", include_secondary: true, since_id: 0 };
+        db.insert_post(snow, "a", "雪球", "2026-09-26 12:00", "[]")
+            .await
+            .unwrap();
+        db.insert_post(blog, "b", "微博", "2026-09-26 12:01", "[]")
+            .await
+            .unwrap();
+        let open = FeedFilter {
+            limit: 20,
+            offset: 0,
+            platform: "",
+            category_id: 0,
+            q: "",
+            favorite: false,
+            tag: "",
+            include_secondary: true,
+            since_id: 0,
+        };
         assert_eq!(db.feed(admin.id, true, &open).await.unwrap().len(), 2);
-        let weibo = db.plaza_sources().await.unwrap().into_iter().find(|row| row["platform"] == "weibo").unwrap();
+        let weibo = db
+            .plaza_sources()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|row| row["platform"] == "weibo")
+            .unwrap();
         assert_eq!(weibo["visible"], true);
         let mut update = serde_json::Map::new();
         update.insert("weibo".into(), json!("hide"));
         db.set_plaza_visibility(&update).await.unwrap();
-        let hidden = db.plaza_sources().await.unwrap().into_iter().filter(|row| row["visible"] == false).map(|row| row["platform"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let hidden = db
+            .plaza_sources()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|row| row["visible"] == false)
+            .map(|row| row["platform"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>();
         let posts = db.feed(admin.id, true, &open).await.unwrap();
-        let posts = posts.into_iter().filter(|row| !hidden.iter().any(|platform| row["platform"] == *platform)).collect::<Vec<_>>();
+        let posts = posts
+            .into_iter()
+            .filter(|row| !hidden.iter().any(|platform| row["platform"] == *platform))
+            .collect::<Vec<_>>();
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0]["content"], "雪球");
         update.insert("ima".into(), json!("show"));
@@ -6495,22 +8022,35 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-news-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
         let admin = db.user_by_username("admin").await.unwrap().unwrap();
         let source = db.add_news_source("甲报", "宏观").await.unwrap();
-        let feed = db.add_news_feed(source, "甲", "https://example.com/rss").await.unwrap();
-        let added = db.save_news_entries(source, feed, &[NewsEntry {
-            external_id: "a1".into(),
-            title: "标题".into(),
-            summary: "摘要".into(),
-            content: "正文".into(),
-            url: "https://example.com/a".into(),
-            author: "".into(),
-            published_at: "2026-09-26 12:30".into(),
-        }]).await.unwrap();
+        let feed = db
+            .add_news_feed(source, "甲", "https://example.com/rss")
+            .await
+            .unwrap();
+        let added = db
+            .save_news_entries(
+                source,
+                feed,
+                &[NewsEntry {
+                    external_id: "a1".into(),
+                    title: "标题".into(),
+                    summary: "摘要".into(),
+                    content: "正文".into(),
+                    url: "https://example.com/a".into(),
+                    author: "".into(),
+                    published_at: "2026-09-26 12:30".into(),
+                }],
+            )
+            .await
+            .unwrap();
         assert_eq!(added, 1);
         let page = db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap();
         assert_eq!(page["items"][0]["is_read"], false);
@@ -6522,12 +8062,32 @@ mod tests {
         let sources = db.user_news_sources(admin.id).await.unwrap();
         assert_eq!(sources["items"][0]["unread_count"], 0);
         let other = db.add_news_source("乙报", "").await.unwrap();
-        let other_feed = db.add_news_feed(other, "乙", "https://example.com/b").await.unwrap();
-        db.save_news_entries(other, other_feed, &[NewsEntry {
-            external_id: "b1".into(), title: "另一条".into(), summary: "".into(), content: "".into(),
-            url: "https://example.com/b".into(), author: "".into(), published_at: "2026-09-26 13:00".into(),
-        }]).await.unwrap();
-        assert_eq!(db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap()["items"].as_array().unwrap().len(), 2);
+        let other_feed = db
+            .add_news_feed(other, "乙", "https://example.com/b")
+            .await
+            .unwrap();
+        db.save_news_entries(
+            other,
+            other_feed,
+            &[NewsEntry {
+                external_id: "b1".into(),
+                title: "另一条".into(),
+                summary: "".into(),
+                content: "".into(),
+                url: "https://example.com/b".into(),
+                author: "".into(),
+                published_at: "2026-09-26 13:00".into(),
+            }],
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap()["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
         db.set_user_news_sources(admin.id, &[source]).await.unwrap();
         let kept = db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap();
         assert_eq!(kept["items"].as_array().unwrap().len(), 1);
@@ -6542,7 +8102,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-ask-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         let cat = db.add_category("宏观").await.unwrap();
@@ -6552,10 +8115,19 @@ mod tests {
             .unwrap();
         let reader = db.user_by_username("reader").await.unwrap().unwrap();
         let id = db
-            .add_kol_request("xueqiu", "https://xueqiu.com/u/111", reader.id, "", Some(cat))
+            .add_kol_request(
+                "xueqiu",
+                "https://xueqiu.com/u/111",
+                reader.id,
+                "",
+                Some(cat),
+            )
             .await
             .unwrap();
-        assert!(db.add_kol_request("xueqiu", "111", reader.id, "", Some(cat)).await.is_err());
+        assert!(db
+            .add_kol_request("xueqiu", "111", reader.id, "", Some(cat))
+            .await
+            .is_err());
         let kol = db.approve_kol_request(id).await.unwrap();
         assert!(db.approve_kol_request(id).await.is_err());
         let subs = db.my_subscriptions(reader.id).await.unwrap();
@@ -6571,7 +8143,10 @@ mod tests {
             .unwrap();
         db.reject_kol_request(second).await.unwrap();
         assert!(db.reject_kol_request(second).await.is_err());
-        assert!(db.add_kol_request("xueqiu", "111", reader.id, "", Some(cat)).await.is_err());
+        assert!(db
+            .add_kol_request("xueqiu", "111", reader.id, "", Some(cat))
+            .await
+            .is_err());
         let _ = std::fs::remove_file(&path);
     }
 
@@ -6580,11 +8155,18 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-db-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
-        db.insert_ima_document("local-cicc-research", "a", "一", "2020-01-01", "", "").await.unwrap();
-        db.insert_ima_document("local-cicc-research", "b", "二", "2020-01-01", "", "").await.unwrap();
+        db.insert_ima_document("local-cicc-research", "a", "一", "2020-01-01", "", "")
+            .await
+            .unwrap();
+        db.insert_ima_document("local-cicc-research", "b", "二", "2020-01-01", "", "")
+            .await
+            .unwrap();
         sqlx::query("UPDATE ima_document_index SET downloaded_at = '2020-01-01T00:00:00+00:00'")
             .execute(&db.pool)
             .await
@@ -6600,38 +8182,61 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-db-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         let cat = db.add_category("宏观").await.unwrap();
         let other = db.add_category("其他").await.unwrap();
-        assert!(matches!(db.rename_category(cat, "其他").await, Err(CatalogError::Bad("分类已存在"))));
+        assert!(matches!(
+            db.rename_category(cat, "其他").await,
+            Err(CatalogError::Bad("分类已存在"))
+        ));
         let renamed = db.rename_category(cat, "策略").await.unwrap();
         assert_eq!(renamed["name"], "策略");
-        let kol = db.add_kol("xueqiu", "甲", "1", Some(cat), false, false, false).await.unwrap();
-        db.insert_post(kol, "p1", "百分号 % 正文", "2020-01-02 00:00", "[]").await.unwrap();
-        let hit = db.list_posts(10, 0, "xueqiu", Some(kol), "%").await.unwrap();
+        let kol = db
+            .add_kol("xueqiu", "甲", "1", Some(cat), false, false, false)
+            .await
+            .unwrap();
+        db.insert_post(kol, "p1", "百分号 % 正文", "2020-01-02 00:00", "[]")
+            .await
+            .unwrap();
+        let hit = db
+            .list_posts(10, 0, "xueqiu", Some(kol), "%")
+            .await
+            .unwrap();
         assert_eq!(hit.len(), 1);
         assert_eq!(hit[0]["kol_name"], "甲");
         assert_eq!(hit[0]["category_name"], "策略");
         let miss = db.list_posts(10, 0, "weibo", None, "").await.unwrap();
         assert!(miss.is_empty());
         let post_id = hit[0]["id"].as_i64().unwrap();
-        db.add_push_log(post_id, "telegram", "failed", "timeout", None).await.unwrap();
-        let logs = db.list_push_logs(10, None, "telegram", "failed").await.unwrap();
+        db.add_push_log(post_id, "telegram", "failed", "timeout", None)
+            .await
+            .unwrap();
+        let logs = db
+            .list_push_logs(10, None, "telegram", "failed")
+            .await
+            .unwrap();
         assert_eq!(logs.len(), 1);
         assert_eq!(logs[0]["kol_name"], "甲");
         assert!(logs[0]["user_name"].is_null());
         let hidden = db.list_push_logs(10, None, "wecom", "").await.unwrap();
         assert!(hidden.is_empty());
         db.delete_category(cat).await.unwrap();
-        let category_id: Option<i64> = sqlx::query_scalar("SELECT category_id FROM kols WHERE id = ?")
-            .bind(kol)
-            .fetch_one(&db.pool)
-            .await
-            .unwrap();
+        let category_id: Option<i64> =
+            sqlx::query_scalar("SELECT category_id FROM kols WHERE id = ?")
+                .bind(kol)
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
         assert!(category_id.is_none());
-        assert!(matches!(db.delete_category(cat).await, Err(CatalogError::Missing("分类不存在"))));
+        assert!(matches!(
+            db.delete_category(cat).await,
+            Err(CatalogError::Missing("分类不存在"))
+        ));
         assert!(db.category(other).await.unwrap().is_some());
         let _ = std::fs::remove_file(&path);
     }
@@ -6641,7 +8246,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-db-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
@@ -6649,16 +8257,24 @@ mod tests {
             .fetch_one(&db.pool)
             .await
             .unwrap();
-        let made = db.generate_register_codes(2, "内测", Some(7), admin).await.unwrap();
+        let made = db
+            .generate_register_codes(2, "内测", Some(7), admin)
+            .await
+            .unwrap();
         assert_eq!(made["count"], 2);
         assert_eq!(made["note"], "内测");
         assert!(made["expires_at"].as_str().unwrap().len() >= 10);
         let codes: Vec<String> = serde_json::from_value(made["codes"].clone()).unwrap();
         let listed = db.list_register_codes().await.unwrap();
         assert_eq!(listed.len(), 2);
-        assert!(listed.iter().all(|row| row["used_by"].is_null() && row["note"] == "内测"));
+        assert!(listed
+            .iter()
+            .all(|row| row["used_by"].is_null() && row["note"] == "内测"));
         db.register(&codes[0], "member", "hash").await.unwrap();
-        assert!(matches!(db.revoke_register_code(&codes[0]).await, Err(CatalogError::Bad("该注册码已被使用，不能删除"))));
+        assert!(matches!(
+            db.revoke_register_code(&codes[0]).await,
+            Err(CatalogError::Bad("该注册码已被使用，不能删除"))
+        ));
         db.revoke_register_code(&codes[1]).await.unwrap();
         let (deleted, skipped) = db.register_codes_batch("delete", &codes).await.unwrap();
         assert_eq!(deleted, 2);
@@ -6676,22 +8292,45 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-db-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
         let admin: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
-            .fetch_one(&db.pool).await.unwrap();
-        let codes = db.generate_register_codes(1, "", Some(7), admin).await.unwrap();
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let codes = db
+            .generate_register_codes(1, "", Some(7), admin)
+            .await
+            .unwrap();
         let code = codes["codes"][0].as_str().unwrap();
         db.register(code, "member", "hash").await.unwrap();
         let member = db.user_by_username("member").await.unwrap().unwrap();
-        db.set_user_text(member.id, "wecom_webhook", "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc").await.unwrap();
-        let kol = db.add_kol("weibo", "甲", "100", None, false, false, false).await.unwrap();
+        db.set_user_text(
+            member.id,
+            "wecom_webhook",
+            "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc",
+        )
+        .await
+        .unwrap();
+        let kol = db
+            .add_kol("weibo", "甲", "100", None, false, false, false)
+            .await
+            .unwrap();
         db.subscribe(member.id, false, kol, "post").await.unwrap();
         sqlx::query("UPDATE subscriptions SET favorite = 1 WHERE user_id = ?")
-            .bind(member.id).execute(&db.pool).await.unwrap();
-        let post = db.insert_post(kol, "p1", "正文", "2026-07-01 00:00:00", "[]").await.unwrap();
+            .bind(member.id)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let post = db
+            .insert_post(kol, "p1", "正文", "2026-07-01 00:00:00", "[]")
+            .await
+            .unwrap();
         for status in ["success", "failed"] {
             sqlx::query("INSERT INTO push_logs (post_id, channel, status, user_id) VALUES (?, 'wecom', ?, ?)")
                 .bind(post).bind(status).bind(member.id).execute(&db.pool).await.unwrap();
@@ -6712,18 +8351,24 @@ mod tests {
         assert_eq!(board["pushes"]["trend_14d"].as_array().unwrap().len(), 1);
         assert!(board["sources_fail_24h"].as_object().unwrap().is_empty());
 
-        db.add_admin_log(admin, "generate_register_codes", "batch", "1").await.unwrap();
+        db.add_admin_log(admin, "generate_register_codes", "batch", "1")
+            .await
+            .unwrap();
         let logs = db.list_admin_logs(10).await.unwrap();
         assert_eq!(logs[0]["username"], "admin");
         assert_eq!(logs[0]["action"], "generate_register_codes");
         db.add_error_log("INFO", "vpush.fetch", "ok").await.unwrap();
-        db.add_error_log("ERROR", "vpush.fetch", "雪球超时").await.unwrap();
+        db.add_error_log("ERROR", "vpush.fetch", "雪球超时")
+            .await
+            .unwrap();
         let errors = db.list_error_logs(10, "WARNING", "雪球").await.unwrap();
         assert_eq!(errors.len(), 1);
         assert_eq!(errors[0]["level"], "ERROR");
         assert!(matches!(
             db.list_error_logs(10, "NOISE", "").await,
-            Err(CatalogError::Bad("level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL"))
+            Err(CatalogError::Bad(
+                "level 需为 DEBUG/INFO/WARNING/ERROR/CRITICAL"
+            ))
         ));
         let _ = std::fs::remove_file(&path);
     }
@@ -6733,42 +8378,80 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-db-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
         let admin: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
-            .fetch_one(&db.pool).await.unwrap();
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         let (code, ttl) = db.issue_bind_code(admin, 1_000).await.unwrap();
         assert_eq!(ttl, 600);
         assert_eq!(code.len(), 8);
-        assert!(code.bytes().all(|byte| b"ABCDEFGHJKMNPQRSTUVWXYZ23456789".contains(&byte)));
-        let stored: String = sqlx::query_scalar("SELECT code FROM bind_codes").fetch_one(&db.pool).await.unwrap();
+        assert!(code
+            .bytes()
+            .all(|byte| b"ABCDEFGHJKMNPQRSTUVWXYZ23456789".contains(&byte)));
+        let stored: String = sqlx::query_scalar("SELECT code FROM bind_codes")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_ne!(stored, code);
         assert_eq!(stored, bind_code_digest(&code.to_ascii_lowercase()));
-        assert_eq!(db.consume_bind_code(&code, "telegram_chat_id", "1001", 1_100).await.unwrap(), Some(admin));
+        assert_eq!(
+            db.consume_bind_code(&code, "telegram_chat_id", "1001", 1_100)
+                .await
+                .unwrap(),
+            Some(admin)
+        );
         let chat: String = sqlx::query_scalar("SELECT telegram_chat_id FROM users WHERE id = ?")
-            .bind(admin).fetch_one(&db.pool).await.unwrap();
+            .bind(admin)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(chat, "1001");
-        assert_eq!(db.consume_bind_code(&code, "telegram_chat_id", "1001", 1_100).await.unwrap(), None);
+        assert_eq!(
+            db.consume_bind_code(&code, "telegram_chat_id", "1001", 1_100)
+                .await
+                .unwrap(),
+            None
+        );
         let (again, _) = db.issue_bind_code(admin, 1_001).await.unwrap();
-        assert!(db.consume_bind_code(&again, "feishu_open_id", "ou_1", 1_700).await.unwrap().is_none());
+        assert!(db
+            .consume_bind_code(&again, "feishu_open_id", "ou_1", 1_700)
+            .await
+            .unwrap()
+            .is_none());
         db.issue_bind_code(admin, 1_002).await.unwrap();
         assert!(matches!(
             db.issue_bind_code(admin, 1_003).await,
             Err(CatalogError::Limited("绑定码生成过于频繁，请稍后再试"))
         ));
         let (fresh, _) = db.issue_bind_code(admin, 1_600).await.unwrap();
-        let other = db.generate_register_codes(1, "", Some(7), admin).await.unwrap();
-        db.register(other["codes"][0].as_str().unwrap(), "member", "hash").await.unwrap();
+        let other = db
+            .generate_register_codes(1, "", Some(7), admin)
+            .await
+            .unwrap();
+        db.register(other["codes"][0].as_str().unwrap(), "member", "hash")
+            .await
+            .unwrap();
         let member = db.user_by_username("member").await.unwrap().unwrap();
-        db.set_user_text(member.id, "telegram_chat_id", "2002").await.unwrap();
+        db.set_user_text(member.id, "telegram_chat_id", "2002")
+            .await
+            .unwrap();
         assert!(matches!(
-            db.consume_bind_code(&fresh, "telegram_chat_id", "2002", 1_610).await,
+            db.consume_bind_code(&fresh, "telegram_chat_id", "2002", 1_610)
+                .await,
             Err(CatalogError::Bad("该渠道已绑定其他账号"))
         ));
         let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bind_codes WHERE code = ?")
-            .bind(bind_code_digest(&fresh)).fetch_one(&db.pool).await.unwrap();
+            .bind(bind_code_digest(&fresh))
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(still, 1);
         let _ = std::fs::remove_file(&path);
     }
@@ -6778,15 +8461,32 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-news-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         let source = db.add_news_source("路透", "国际").await.unwrap();
-        let feed = db.add_news_feed(source, "要闻", "https://example.com/rss.xml").await.unwrap();
-        db.save_news_entries(source, feed, &[NewsEntry {
-            external_id: "a".into(), title: "标题".into(), summary: "".into(), content: "".into(),
-            url: "https://example.com/a".into(), author: "".into(), published_at: "2026-07-01".into(),
-        }]).await.unwrap();
+        let feed = db
+            .add_news_feed(source, "要闻", "https://example.com/rss.xml")
+            .await
+            .unwrap();
+        db.save_news_entries(
+            source,
+            feed,
+            &[NewsEntry {
+                external_id: "a".into(),
+                title: "标题".into(),
+                summary: "".into(),
+                content: "".into(),
+                url: "https://example.com/a".into(),
+                author: "".into(),
+                published_at: "2026-07-01".into(),
+            }],
+        )
+        .await
+        .unwrap();
         db.set_news_source_archived(source, true).await.unwrap();
         assert!(db.admin_news_sources().await.unwrap().is_empty());
         let archived = db.admin_news_sources_all(true).await.unwrap();
@@ -6799,17 +8499,38 @@ mod tests {
         let row = db.feed_value(feed).await.unwrap().unwrap();
         assert_eq!(row["consecutive_failures"], 1);
         assert_eq!(row["last_error_detail"], "超时");
-        let article: i64 = sqlx::query_scalar("SELECT id FROM news_articles").fetch_one(&db.pool).await.unwrap();
+        let article: i64 = sqlx::query_scalar("SELECT id FROM news_articles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert!(db.delete_news_article(article).await.unwrap());
         assert!(!db.delete_news_article(article).await.unwrap());
-        db.save_news_entries(source, feed, &[NewsEntry {
-            external_id: "b".into(), title: "另一篇".into(), summary: "".into(), content: "".into(),
-            url: "".into(), author: "".into(), published_at: "".into(),
-        }]).await.unwrap();
+        db.save_news_entries(
+            source,
+            feed,
+            &[NewsEntry {
+                external_id: "b".into(),
+                title: "另一篇".into(),
+                summary: "".into(),
+                content: "".into(),
+                url: "".into(),
+                author: "".into(),
+                published_at: "".into(),
+            }],
+        )
+        .await
+        .unwrap();
         assert!(db.delete_news_source(source).await.unwrap());
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM news_articles").fetch_one(&db.pool).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM news_articles")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(left, 0);
-        assert!(matches!(db.update_news_source(source, Some("路透"), None, None).await, Err(CatalogError::Missing("媒体不存在"))));
+        assert!(matches!(
+            db.update_news_source(source, Some("路透"), None, None)
+                .await,
+            Err(CatalogError::Missing("媒体不存在"))
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -6818,7 +8539,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-kol-batch-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         let imported = db.batch_add_kols(
@@ -6827,40 +8551,100 @@ mod tests {
         ).await.unwrap();
         assert_eq!(imported["ok"], 2);
         assert_eq!(imported["total"], 4);
-        assert_eq!(imported["failed"][0]["error"], "无法识别平台，请粘贴雪球/微博/X/知识星球主页链接");
-        let again = db.batch_add_kols("https://xueqiu.com/u/101", None).await.unwrap();
+        assert_eq!(
+            imported["failed"][0]["error"],
+            "无法识别平台，请粘贴雪球/微博/X/知识星球主页链接"
+        );
+        let again = db
+            .batch_add_kols("https://xueqiu.com/u/101", None)
+            .await
+            .unwrap();
         assert_eq!(again["failed"][0]["error"], "该大V已在目录中");
-        let ids: Vec<i64> = imported["ids"].as_array().unwrap().iter().map(|v| v.as_i64().unwrap()).collect();
-        db.insert_post(ids[0], "p1", "正文", "2026-07-01", "[]").await.unwrap();
-        assert_eq!(db.batch_kols(&ids, "priority", Some(&json!(true))).await.unwrap(), 2);
+        let ids: Vec<i64> = imported["ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_i64().unwrap())
+            .collect();
+        db.insert_post(ids[0], "p1", "正文", "2026-07-01", "[]")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.batch_kols(&ids, "priority", Some(&json!(true)))
+                .await
+                .unwrap(),
+            2
+        );
         let flags: (i64, i64) = sqlx::query_as("SELECT priority, secondary FROM kols WHERE id = ?")
-            .bind(ids[1]).fetch_one(&db.pool).await.unwrap();
+            .bind(ids[1])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(flags, (1, 0));
-        db.batch_kols(&ids, "secondary", Some(&json!(true))).await.unwrap();
+        db.batch_kols(&ids, "secondary", Some(&json!(true)))
+            .await
+            .unwrap();
         let flags: (i64, i64) = sqlx::query_as("SELECT priority, secondary FROM kols WHERE id = ?")
-            .bind(ids[0]).fetch_one(&db.pool).await.unwrap();
+            .bind(ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(flags, (0, 1));
         db.batch_kols(&ids, "normal", None).await.unwrap();
         let flags: (i64, i64) = sqlx::query_as("SELECT priority, secondary FROM kols WHERE id = ?")
-            .bind(ids[0]).fetch_one(&db.pool).await.unwrap();
+            .bind(ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(flags, (0, 0));
         let category = db.add_category("宏观").await.unwrap();
-        db.batch_kols(&ids, "category", Some(&json!(category))).await.unwrap();
-        let stored: Option<i64> = sqlx::query_scalar("SELECT category_id FROM kols WHERE id = ?").bind(ids[0]).fetch_one(&db.pool).await.unwrap();
+        db.batch_kols(&ids, "category", Some(&json!(category)))
+            .await
+            .unwrap();
+        let stored: Option<i64> = sqlx::query_scalar("SELECT category_id FROM kols WHERE id = ?")
+            .bind(ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(stored, Some(category));
-        db.batch_kols(&ids, "category", Some(&Value::Null)).await.unwrap();
-        let stored: Option<i64> = sqlx::query_scalar("SELECT category_id FROM kols WHERE id = ?").bind(ids[0]).fetch_one(&db.pool).await.unwrap();
+        db.batch_kols(&ids, "category", Some(&Value::Null))
+            .await
+            .unwrap();
+        let stored: Option<i64> = sqlx::query_scalar("SELECT category_id FROM kols WHERE id = ?")
+            .bind(ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(stored, None);
-        assert!(matches!(db.batch_kols(&ids, "category", Some(&json!(999))).await, Err(CatalogError::Bad("分类不存在"))));
+        assert!(matches!(
+            db.batch_kols(&ids, "category", Some(&json!(999))).await,
+            Err(CatalogError::Bad("分类不存在"))
+        ));
         db.batch_kols(&ids, "disable", None).await.unwrap();
-        let enabled: i64 = sqlx::query_scalar("SELECT enabled FROM kols WHERE id = ?").bind(ids[0]).fetch_one(&db.pool).await.unwrap();
+        let enabled: i64 = sqlx::query_scalar("SELECT enabled FROM kols WHERE id = ?")
+            .bind(ids[0])
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!(enabled, 0);
-        assert!(matches!(db.batch_kols(&[ids[0], 999], "enable", None).await, Err(CatalogError::Missing("大V不存在"))));
+        assert!(matches!(
+            db.batch_kols(&[ids[0], 999], "enable", None).await,
+            Err(CatalogError::Missing("大V不存在"))
+        ));
         db.batch_kols(&ids, "delete", None).await.unwrap();
-        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols").fetch_one(&db.pool).await.unwrap();
-        let posts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts").fetch_one(&db.pool).await.unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kols")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let posts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
         assert_eq!((left, posts), (0, 0));
-        assert!(matches!(db.batch_kols(&[], "enable", None).await, Err(CatalogError::Bad("请先选择大V"))));
+        assert!(matches!(
+            db.batch_kols(&[], "enable", None).await,
+            Err(CatalogError::Bad("请先选择大V"))
+        ));
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -7,7 +7,7 @@ ln -sfn "/Users/kale/Documents/微信小程序大 v 订阅/dav-subscription/app/
 WEB_ADMIN_PASSWORD='至少10位' cargo run
 ```
 
-打开 <http://127.0.0.1:8000>。`admin` 只在库里还没有这个用户时创建。没设 `WEB_TOKEN_SECRET` 时，会话签名密钥写在 sqlite 的 `settings` 表。
+打开 <http://127.0.0.1:8000>。`admin` 只在库里还没有这个用户时创建。监听非回环地址时必须配置 `WEB_TOKEN_SECRET`；本机开发未配置时才会回退到 sqlite 的 `settings` 表。备份恢复需要宿主机安装 `sqlite3` 命令。
 
 | 变量 | 默认 |
 |---|---|

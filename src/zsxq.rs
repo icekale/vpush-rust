@@ -97,46 +97,89 @@ async fn token(db: &Db) -> Result<Option<String>, String> {
     Ok(None)
 }
 
-async fn pull(db: &Db, token: &str, kol_id: i64, name: &str, group_id: &str, proxy: Option<String>) -> Result<(), String> {
+async fn pull(
+    db: &Db,
+    token: &str,
+    kol_id: i64,
+    name: &str,
+    group_id: &str,
+    proxy: Option<String>,
+) -> Result<(), String> {
     let page = topics(token, group_id, proxy).await?;
     let rows = page_topics(&page)?;
     if let Some(avatar) = rows.iter().find_map(|row| {
         let avatar = topic_from(row, group_id)?.avatar;
         (!avatar.is_empty()).then_some(avatar)
     }) {
-        db.set_avatar(kol_id, &avatar).await.map_err(|e| e.to_string())?;
+        db.set_avatar(kol_id, &avatar)
+            .await
+            .map_err(|e| e.to_string())?;
     }
-    let watermark = db.max_published_at(kol_id).await.map_err(|e| e.to_string())?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let watermark = db
+        .max_published_at(kol_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     for row in rows {
-        let Some(topic) = topic_from(&row, group_id) else { continue };
+        let Some(topic) = topic_from(&row, group_id) else {
+            continue;
+        };
         let action = keep(&topic.published_at, &watermark, now);
         if matches!(action, Keep::Drop) {
             continue;
         }
-        if db.has_post("zsxq", &topic.external_id).await.map_err(|e| e.to_string())? {
+        if db
+            .has_post("zsxq", &topic.external_id)
+            .await
+            .map_err(|e| e.to_string())?
+        {
             continue;
         }
         let images = serde_json::to_string(&topic.images).unwrap_or_else(|_| "[]".into());
-        db.save_fetched(kol_id, &topic.external_id, &topic.title, &topic.content, "post", &images, &topic.url, &topic.published_at)
-            .await
-            .map_err(|e| e.to_string())?;
+        db.save_fetched(
+            kol_id,
+            &topic.external_id,
+            &topic.title,
+            &topic.content,
+            "post",
+            &images,
+            &topic.url,
+            &topic.published_at,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         if !topic.files.is_empty() {
-            let detail = serde_json::to_string(&json!({"files": topic.files})).unwrap_or_else(|_| "{}".into());
-            db.set_platform_detail("zsxq", &topic.external_id, &detail).await.map_err(|e| e.to_string())?;
+            let detail = serde_json::to_string(&json!({"files": topic.files}))
+                .unwrap_or_else(|_| "{}".into());
+            db.set_platform_detail("zsxq", &topic.external_id, &detail)
+                .await
+                .map_err(|e| e.to_string())?;
         }
-        if !matches!(action, Keep::Notify) || !db.should_push(kol_id, "post").await.map_err(|e| e.to_string())? {
+        if !matches!(action, Keep::Notify)
+            || !db
+                .should_push(kol_id, "post")
+                .await
+                .map_err(|e| e.to_string())?
+        {
             continue;
         }
-        crate::push::deliver(db, kol_id, &crate::feishu::Note {
-            kol_name: name,
-            platform: "zsxq",
-            post_type: "post",
-            title: &topic.title,
-            content: &topic.content,
-            url: &topic.url,
-            published_at: &topic.published_at,
-        }).await;
+        crate::push::deliver(
+            db,
+            kol_id,
+            &crate::feishu::Note {
+                kol_name: name,
+                platform: "zsxq",
+                post_type: "post",
+                title: &topic.title,
+                content: &topic.content,
+                url: &topic.url,
+                published_at: &topic.published_at,
+            },
+        )
+        .await;
     }
     Ok(())
 }
@@ -149,7 +192,10 @@ async fn topics(token: &str, group_id: &str, proxy: Option<String>) -> Result<Va
         let token = token.clone();
         let group_id = group_id.clone();
         let proxy = proxy.clone();
-        match tokio::task::spawn_blocking(move || fetch_topics(&token, &group_id, proxy.as_deref())).await.map_err(|e| e.to_string())? {
+        match tokio::task::spawn_blocking(move || fetch_topics(&token, &group_id, proxy.as_deref()))
+            .await
+            .map_err(|e| e.to_string())?
+        {
             Ok(page) => return Ok(page),
             Err(err) if err == "1059" => {
                 last = "知识星球暂时拒绝，已重试".into();
@@ -163,13 +209,17 @@ async fn topics(token: &str, group_id: &str, proxy: Option<String>) -> Result<Va
 
 fn fetch_topics(token: &str, group_id: &str, proxy: Option<&str>) -> Result<Value, String> {
     let url = format!("{TOPICS}/{group_id}/topics?scope=all&count=20");
-    let agent = crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20))?;
+    let agent =
+        crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20))?;
     let response = agent
         .get(&url)
         .set("Accept", "application/json, text/plain, */*")
         .set("Origin", "https://wx.zsxq.com")
         .set("Referer", "https://wx.zsxq.com/")
-        .set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        )
         .set("Cookie", &format!("zsxq_access_token={token}"))
         .call();
     let text = match response {
@@ -180,7 +230,8 @@ fn fetch_topics(token: &str, group_id: &str, proxy: Option<&str>) -> Result<Valu
         }
         Err(err) => return Err(err.to_string()),
     };
-    let value: Value = serde_json::from_str(&text).map_err(|_| "知识星球响应不是 JSON".to_string())?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|_| "知识星球响应不是 JSON".to_string())?;
     if value.get("succeeded") == Some(&json!(true)) {
         return Ok(value);
     }
@@ -192,7 +243,10 @@ fn fetch_topics(token: &str, group_id: &str, proxy: Option<&str>) -> Result<Valu
 }
 
 fn page_topics(page: &Value) -> Result<Vec<Value>, String> {
-    Ok(page["resp_data"]["topics"].as_array().cloned().unwrap_or_default())
+    Ok(page["resp_data"]["topics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default())
 }
 
 fn topic_from(topic: &Value, group_id: &str) -> Option<Topic> {
@@ -229,12 +283,20 @@ fn topic_from(topic: &Value, group_id: &str) -> Option<Topic> {
         content.push_str(&files.join("、"));
     }
     if content.is_empty() {
-        content = if title.is_empty() { "（无声主题）".into() } else { title.clone() };
+        content = if title.is_empty() {
+            "（无声主题）".into()
+        } else {
+            title.clone()
+        };
     }
     let avatar = field(&topic["group"]["owner"], "avatar_url");
     Some(Topic {
         external_id: external_id.clone(),
-        title: if title.is_empty() { content.chars().take(80).collect() } else { title },
+        title: if title.is_empty() {
+            content.chars().take(80).collect()
+        } else {
+            title
+        },
         content,
         url: format!("https://wx.zsxq.com/group/{group_id}/{external_id}"),
         images: images(topic),
@@ -247,7 +309,9 @@ fn topic_from(topic: &Value, group_id: &str) -> Option<Topic> {
 fn topic_files(topic: &Value) -> Vec<Value> {
     let mut out = Vec::new();
     for key in ["talk", "question", "answer", "task", "solution"] {
-        let Some(files) = topic[key].get("files").and_then(Value::as_array) else { continue };
+        let Some(files) = topic[key].get("files").and_then(Value::as_array) else {
+            continue;
+        };
         for file in files {
             let id = match &file["file_id"] {
                 Value::String(text) => text.clone(),
@@ -263,7 +327,10 @@ fn topic_files(topic: &Value) -> Vec<Value> {
             if url.starts_with("https://") {
                 item["url"] = json!(url);
             }
-            if !out.iter().any(|have: &Value| have["file_id"] == item["file_id"]) {
+            if !out
+                .iter()
+                .any(|have: &Value| have["file_id"] == item["file_id"])
+            {
                 out.push(item);
             }
         }
@@ -274,7 +341,9 @@ fn topic_files(topic: &Value) -> Vec<Value> {
 fn file_names(topic: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for key in ["talk", "question", "answer", "task", "solution"] {
-        let Some(files) = topic[key].get("files").and_then(Value::as_array) else { continue };
+        let Some(files) = topic[key].get("files").and_then(Value::as_array) else {
+            continue;
+        };
         for file in files {
             let name = field(file, "name");
             if !name.is_empty() && !out.contains(&name) {
@@ -288,7 +357,9 @@ fn file_names(topic: &Value) -> Vec<String> {
 fn images(topic: &Value) -> Vec<String> {
     let mut out = Vec::new();
     for key in ["talk", "question", "answer", "task", "solution"] {
-        let Some(images) = topic[key].get("images").and_then(Value::as_array) else { continue };
+        let Some(images) = topic[key].get("images").and_then(Value::as_array) else {
+            continue;
+        };
         for image in images {
             let chosen = if image["original"].is_object() {
                 &image["original"]
@@ -348,7 +419,13 @@ fn days_from_civil(mut year: i32, month: u32, day: u32) -> i64 {
 
 fn stamp(raw: &str) -> String {
     let raw = raw.trim();
-    if raw.len() >= 16 && raw.as_bytes().get(4) == Some(&b'-') && raw.as_bytes().get(10).is_some_and(|b| *b == b'T' || *b == b' ') {
+    if raw.len() >= 16
+        && raw.as_bytes().get(4) == Some(&b'-')
+        && raw
+            .as_bytes()
+            .get(10)
+            .is_some_and(|b| *b == b'T' || *b == b' ')
+    {
         return format!("{} {}", &raw[..10], &raw[11..16]);
     }
     raw.to_string()
@@ -359,14 +436,21 @@ fn strip_e(input: &str) -> String {
     let mut rest = input;
     while let Some(start) = rest.find('<') {
         out.push_str(&rest[..start]);
-        let end = rest[start..].find('>').map(|n| start + n).unwrap_or(rest.len() - 1);
+        let end = rest[start..]
+            .find('>')
+            .map(|n| start + n)
+            .unwrap_or(rest.len() - 1);
         let tag = &rest[start..=end];
         if tag.to_ascii_lowercase().starts_with("<e") {
             if let Some(title) = attr(tag, "title") {
                 out.push_str(&percent_decode(&title));
             }
         }
-        rest = if end + 1 < rest.len() { &rest[end + 1..] } else { "" };
+        rest = if end + 1 < rest.len() {
+            &rest[end + 1..]
+        } else {
+            ""
+        };
     }
     out.push_str(rest);
     out.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -390,7 +474,9 @@ fn percent_decode(input: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(value) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+            if let Ok(value) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(value);
                 i += 3;
                 continue;
@@ -432,7 +518,14 @@ mod tests {
         assert_eq!(parsed.images, vec!["https://img.example/a.jpg".to_string()]);
         assert!(parsed.files.is_empty());
         assert_eq!(parsed.url, "https://wx.zsxq.com/group/100/9");
-        assert!(matches!(keep("2020-01-01 00:00", "", 1_700_000_000), Keep::Drop));
-        assert!(page_topics(&json!({"succeeded": true, "resp_data": {"topics": []}})).unwrap().is_empty());
+        assert!(matches!(
+            keep("2020-01-01 00:00", "", 1_700_000_000),
+            Keep::Drop
+        ));
+        assert!(
+            page_topics(&json!({"succeeded": true, "resp_data": {"topics": []}}))
+                .unwrap()
+                .is_empty()
+        );
     }
 }

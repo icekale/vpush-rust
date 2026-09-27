@@ -55,9 +55,18 @@ fn stale(key: &str) -> Option<Value> {
 
 fn store(key: &str, page: &Value) {
     let mut guard = cache().lock().unwrap_or_else(|err| err.into_inner());
-    guard.insert(key.to_string(), Slot { at: Instant::now(), page: page.clone() });
+    guard.insert(
+        key.to_string(),
+        Slot {
+            at: Instant::now(),
+            page: page.clone(),
+        },
+    );
     if guard.len() > 64 {
-        let oldest = guard.iter().min_by_key(|(_, slot)| slot.at).map(|(key, _)| key.clone());
+        let oldest = guard
+            .iter()
+            .min_by_key(|(_, slot)| slot.at)
+            .map(|(key, _)| key.clone());
         if let Some(oldest) = oldest {
             guard.remove(&oldest);
         }
@@ -73,7 +82,10 @@ fn fetch(cursor: &str, limit: i64) -> Result<Value, String> {
         .get(LIVES_URL)
         .query("channel", "global-channel")
         .query("limit", &limit.to_string())
-        .set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36");
+        .set(
+            "User-Agent",
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+        );
     if !cursor.is_empty() {
         req = req.query("cursor", cursor);
     }
@@ -91,7 +103,10 @@ fn fetch(cursor: &str, limit: i64) -> Result<Value, String> {
 
 pub(crate) fn page_from(payload: &Value) -> Result<Value, String> {
     if payload.get("code") != Some(&json!(20000)) {
-        let msg = payload.get("message").and_then(Value::as_str).unwrap_or("WSCN API 错误");
+        let msg = payload
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("WSCN API 错误");
         return Err(msg.to_string());
     }
     let data = &payload["data"];
@@ -112,9 +127,14 @@ pub(crate) fn page_from(payload: &Value) -> Result<Value, String> {
 }
 
 fn item_from(raw: &Value) -> Option<Value> {
-    let id = raw["id"].as_i64().or_else(|| raw["id"].as_str().and_then(|s| s.parse().ok()))?;
+    let id = raw["id"]
+        .as_i64()
+        .or_else(|| raw["id"].as_str().and_then(|s| s.parse().ok()))?;
     let ts = raw["display_time"].as_i64().unwrap_or(0);
-    let content = raw["content"].as_str().or_else(|| raw["content_text"].as_str()).unwrap_or("");
+    let content = raw["content"]
+        .as_str()
+        .or_else(|| raw["content_text"].as_str())
+        .unwrap_or("");
     let url = raw["uri"].as_str().unwrap_or("").trim();
     let url = if url.is_empty() {
         format!("https://wallstreetcn.com/livenews/{id}")
@@ -150,12 +170,19 @@ fn plain(content: &str) -> String {
             break;
         };
         text.push_str(&rest[..start]);
-        let end = rest[start..].find('>').map(|n| start + n).unwrap_or(rest.len() - 1);
+        let end = rest[start..]
+            .find('>')
+            .map(|n| start + n)
+            .unwrap_or(rest.len() - 1);
         let tag = rest[start..=end].to_ascii_lowercase();
         if tag.starts_with("<br") || tag.starts_with("</p") {
             text.push('\n');
         }
-        rest = if end + 1 < rest.len() { &rest[end + 1..] } else { "" };
+        rest = if end + 1 < rest.len() {
+            &rest[end + 1..]
+        } else {
+            ""
+        };
     }
     text.replace("&amp;", "&")
         .replace("&lt;", "<")
@@ -218,10 +245,19 @@ mod tests {
         let page = page_from(&payload).unwrap();
         assert_eq!(page["items"][0]["body"], "甲\n乙 & 丙");
         assert_eq!(page["items"][0]["highlight_title"], "标题");
-        assert_eq!(page["items"][0]["published_at"], "2012-10-12T08:00:00+08:00");
+        assert_eq!(
+            page["items"][0]["published_at"],
+            "2012-10-12T08:00:00+08:00"
+        );
         assert_eq!(page["next_cursor"], "8");
         assert_eq!(page["polling_cursor"], 9);
-        assert_eq!(filter_since(page.clone(), 9)["items"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            filter_since(page.clone(), 9)["items"]
+                .as_array()
+                .unwrap()
+                .len(),
+            0
+        );
         assert_eq!(filter_since(page, 8)["items"][0]["id"], 9);
         assert!(page_from(&json!({"code": 500})).is_err());
     }

@@ -56,7 +56,10 @@ pub fn spawn(db: Db) {
 }
 
 async fn poll(db: &Db) -> Result<(), String> {
-    let kols = db.kols_to_fetch("combination").await.map_err(|e| e.to_string())?;
+    let kols = db
+        .kols_to_fetch("combination")
+        .await
+        .map_err(|e| e.to_string())?;
     if kols.is_empty() {
         return Ok(());
     }
@@ -96,7 +99,14 @@ async fn poll(db: &Db) -> Result<(), String> {
     Ok(())
 }
 
-async fn sync_one(db: &Db, cookie: &str, kol_id: i64, name: &str, symbol: &str, proxy: Option<String>) -> Result<(), FetchErr> {
+async fn sync_one(
+    db: &Db,
+    cookie: &str,
+    kol_id: i64,
+    name: &str,
+    symbol: &str,
+    proxy: Option<String>,
+) -> Result<(), FetchErr> {
     let history = get_json(
         cookie,
         HISTORY,
@@ -104,15 +114,27 @@ async fn sync_one(db: &Db, cookie: &str, kol_id: i64, name: &str, symbol: &str, 
         proxy.as_deref(),
     )
     .await?;
-    let rows = history.get("list").and_then(Value::as_array).cloned().unwrap_or_default();
-    let watermark = db.max_published_at(kol_id).await.map_err(|e| FetchErr::Other(e.to_string()))?;
+    let rows = history
+        .get("list")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let watermark = db
+        .max_published_at(kol_id)
+        .await
+        .map_err(|e| FetchErr::Other(e.to_string()))?;
     let mut fresh = Vec::new();
     for item in &rows {
         if item.get("status").and_then(Value::as_str) != Some("success") {
             continue;
         }
         let external_id = field_str(item, "id");
-        if external_id.is_empty() || stale(&crate::xueqiu::published_of(&item["updated_at"]), &watermark) {
+        if external_id.is_empty()
+            || stale(
+                &crate::xueqiu::published_of(&item["updated_at"]),
+                &watermark,
+            )
+        {
             continue;
         }
         if !db
@@ -123,12 +145,23 @@ async fn sync_one(db: &Db, cookie: &str, kol_id: i64, name: &str, symbol: &str, 
             fresh.push(item.clone());
         }
     }
-    refresh_snapshots(db, cookie, kol_id, symbol, !fresh.is_empty(), proxy.as_deref()).await;
+    refresh_snapshots(
+        db,
+        cookie,
+        kol_id,
+        symbol,
+        !fresh.is_empty(),
+        proxy.as_deref(),
+    )
+    .await;
     let quote = load_quote(db, kol_id).await;
     let (mut holdings, cash) = load_holdings(db, kol_id).await;
     if !fresh.is_empty() {
         for item in fresh.iter().rev() {
-            let histories = item.get("rebalancing_histories").cloned().unwrap_or(Value::Null);
+            let histories = item
+                .get("rebalancing_histories")
+                .cloned()
+                .unwrap_or(Value::Null);
             holdings = apply_rebalancing(&holdings, &histories);
         }
         let payload = json!({ "holdings": holdings, "cash": cash }).to_string();
@@ -181,10 +214,29 @@ async fn sync_one(db: &Db, cookie: &str, kol_id: i64, name: &str, symbol: &str, 
     Ok(())
 }
 
-async fn refresh_snapshots(db: &Db, cookie: &str, kol_id: i64, symbol: &str, force_holdings: bool, proxy: Option<&str>) {
+async fn refresh_snapshots(
+    db: &Db,
+    cookie: &str,
+    kol_id: i64,
+    symbol: &str,
+    force_holdings: bool,
+    proxy: Option<&str>,
+) {
     let jobs = [
-        ("quote", QUOTE, vec![("code", symbol), ("cube_symbol", symbol)], 60, false),
-        ("holdings", CURRENT, vec![("cube_symbol", symbol)], 300, force_holdings),
+        (
+            "quote",
+            QUOTE,
+            vec![("code", symbol), ("cube_symbol", symbol)],
+            60,
+            false,
+        ),
+        (
+            "holdings",
+            CURRENT,
+            vec![("cube_symbol", symbol)],
+            300,
+            force_holdings,
+        ),
         ("nav", NAV, vec![("cube_symbol", symbol)], 3600, false),
     ];
     for (kind, url, query, ttl, force) in jobs {
@@ -235,7 +287,11 @@ async fn load_quote(db: &Db, kol_id: i64) -> Quote {
     let raw = db.cube_snapshot(kol_id, "quote").await.ok().flatten();
     raw.and_then(|(payload, _)| serde_json::from_str(&payload).ok())
         .map(|value| parse_quote(&value))
-        .unwrap_or(Quote { net: None, day: None, annual: None })
+        .unwrap_or(Quote {
+            net: None,
+            day: None,
+            annual: None,
+        })
 }
 
 async fn load_holdings(db: &Db, kol_id: i64) -> (Vec<Value>, Value) {
@@ -300,13 +356,25 @@ fn parse_quote(input: &Value) -> Quote {
         data = inner;
     }
     if data.get("net_value").is_none() && data.get("daily_gain").is_none() {
-        if let Some(inner) = data.as_object().and_then(|obj| obj.values().find(|v| v.is_object())).cloned() {
+        if let Some(inner) = data
+            .as_object()
+            .and_then(|obj| obj.values().find(|v| v.is_object()))
+            .cloned()
+        {
             data = inner;
         }
     }
-    let day = ["daily_gain", "day_percent_gain", "percent"].into_iter().find_map(|key| num(&data[key]));
-    let annual = ["annualized_gain", "annualized_gain_rate"].into_iter().find_map(|key| num(&data[key]));
-    Quote { net: num(&data["net_value"]), day, annual }
+    let day = ["daily_gain", "day_percent_gain", "percent"]
+        .into_iter()
+        .find_map(|key| num(&data[key]));
+    let annual = ["annualized_gain", "annualized_gain_rate"]
+        .into_iter()
+        .find_map(|key| num(&data[key]));
+    Quote {
+        net: num(&data["net_value"]),
+        day,
+        annual,
+    }
 }
 
 fn quote_json(quote: &Quote) -> Value {
@@ -322,7 +390,9 @@ fn parse_holdings(data: &Value) -> Vec<Value> {
     for row in holdings_rows(data) {
         let weight = num(&row["weight"]).or_else(|| num(&row["target_weight"]));
         let Some(weight) = weight else { continue };
-        if !row.get("weight").is_some_and(Value::is_number) && !row.get("target_weight").is_some_and(Value::is_number) {
+        if !row.get("weight").is_some_and(Value::is_number)
+            && !row.get("target_weight").is_some_and(Value::is_number)
+        {
             continue;
         }
         let mut item = json!({
@@ -348,7 +418,10 @@ fn holdings_rows(data: &Value) -> Vec<Value> {
     if let Some(rows) = inner.and_then(Value::as_array) {
         return rows.clone();
     }
-    if let Some(rows) = inner.and_then(|v| v.get("holdings")).and_then(Value::as_array) {
+    if let Some(rows) = inner
+        .and_then(|v| v.get("holdings"))
+        .and_then(Value::as_array)
+    {
         return rows.clone();
     }
     if let Some(rows) = data.get("holdings").and_then(Value::as_array) {
@@ -370,8 +443,13 @@ fn holdings_rows(data: &Value) -> Vec<Value> {
 fn parse_cash(data: &Value) -> Option<f64> {
     let inner = data.get("data").filter(|v| v.is_object());
     for obj in [data.get("last_rb"), inner.and_then(|v| v.get("last_rb"))] {
-        let Some(cash) = obj.and_then(|v| num(&v["cash"])) else { continue };
-        if obj.is_some_and(|v| v.get("cash").is_some_and(Value::is_number) || v.get("cash").is_some_and(Value::is_string)) {
+        let Some(cash) = obj.and_then(|v| num(&v["cash"])) else {
+            continue;
+        };
+        if obj.is_some_and(|v| {
+            v.get("cash").is_some_and(Value::is_number)
+                || v.get("cash").is_some_and(Value::is_string)
+        }) {
             return Some(round_n(cash, 2));
         }
     }
@@ -382,20 +460,31 @@ fn looks_like_holdings(data: &Value) -> bool {
     if data.is_array() {
         return true;
     }
-    if data.get("holdings").is_some_and(Value::is_array) || data.get("last_rb").is_some_and(Value::is_object) {
+    if data.get("holdings").is_some_and(Value::is_array)
+        || data.get("last_rb").is_some_and(Value::is_object)
+    {
         return true;
     }
     let inner = data.get("data");
     inner.is_some_and(Value::is_array)
-        || inner.is_some_and(|v| v.get("holdings").is_some_and(Value::is_array) || v.get("last_rb").is_some_and(Value::is_object))
+        || inner.is_some_and(|v| {
+            v.get("holdings").is_some_and(Value::is_array)
+                || v.get("last_rb").is_some_and(Value::is_object)
+        })
 }
 
 fn parse_nav(data: &Value) -> Vec<Value> {
-    data.as_array().and_then(|rows| rows.first()).map(nav_series).unwrap_or_default()
+    data.as_array()
+        .and_then(|rows| rows.first())
+        .map(nav_series)
+        .unwrap_or_default()
 }
 
 fn parse_benchmark(data: &Value) -> Vec<Value> {
-    data.as_array().and_then(|rows| rows.get(1)).map(nav_series).unwrap_or_default()
+    data.as_array()
+        .and_then(|rows| rows.get(1))
+        .map(nav_series)
+        .unwrap_or_default()
 }
 
 fn nav_series(obj: &Value) -> Vec<Value> {
@@ -440,13 +529,17 @@ fn apply_rebalancing(holdings: &[Value], histories: &Value) -> Vec<Value> {
         if key.is_empty() {
             continue;
         }
-        let target = row.get("target_weight").filter(|v| v.is_number()).and_then(num)
+        let target = row
+            .get("target_weight")
+            .filter(|v| v.is_number())
+            .and_then(num)
             .or_else(|| row.get("weight").filter(|v| v.is_number()).and_then(num));
         if target.is_none_or(|w| w <= 0.0) {
             index.retain(|(k, _)| k != &key);
             continue;
         }
-        let kept = json!({ "name": name, "symbol": symbol, "weight": round_n(target.unwrap_or(0.0), 2) });
+        let kept =
+            json!({ "name": name, "symbol": symbol, "weight": round_n(target.unwrap_or(0.0), 2) });
         if let Some(pos) = index.iter().position(|(k, _)| k == &key) {
             index[pos].1 = kept;
         } else {
@@ -456,7 +549,12 @@ fn apply_rebalancing(holdings: &[Value], histories: &Value) -> Vec<Value> {
     }
     order
         .into_iter()
-        .filter_map(|key| index.iter().find(|(k, _)| k == &key).map(|(_, row)| row.clone()))
+        .filter_map(|key| {
+            index
+                .iter()
+                .find(|(k, _)| k == &key)
+                .map(|(_, row)| row.clone())
+        })
         .collect()
 }
 
@@ -509,8 +607,14 @@ fn build_posts(
         let mut lines = Vec::new();
         let mut actions = Vec::new();
         for row in histories {
-            let prev = row.get("prev_weight").filter(|v| v.is_number()).and_then(num);
-            let target = row.get("target_weight").filter(|v| v.is_number()).and_then(num);
+            let prev = row
+                .get("prev_weight")
+                .filter(|v| v.is_number())
+                .and_then(num);
+            let target = row
+                .get("target_weight")
+                .filter(|v| v.is_number())
+                .and_then(num);
             if let (Some(prev), Some(target)) = (prev, target) {
                 if (target - prev).abs() < 1e-9 {
                     continue;
@@ -547,7 +651,10 @@ fn build_posts(
                 "prev": if prev_s.is_empty() { "0.0%" } else { &prev_s },
                 "target": if target_s.is_empty() { "0.0%" } else { &target_s },
             });
-            if let Some(price) = ["price", "stock_price", "trade_price"].into_iter().find_map(|key| num(&row[key])) {
+            if let Some(price) = ["price", "stock_price", "trade_price"]
+                .into_iter()
+                .find_map(|key| num(&row[key]))
+            {
                 action["price"] = json!(format!("{price:.2}"));
             }
             actions.push(action);
@@ -562,10 +669,18 @@ fn build_posts(
         let mut content = lines.join("\n");
         if !cash_pct.is_empty() {
             let cash_line = format!("现金 {cash_pct}");
-            content = if content.is_empty() { cash_line } else { format!("{content}\n{cash_line}") };
+            content = if content.is_empty() {
+                cash_line
+            } else {
+                format!("{content}\n{cash_line}")
+            };
         }
         if !stats_line.is_empty() {
-            content = if content.is_empty() { stats_line.clone() } else { format!("{stats_line}\n{content}") };
+            content = if content.is_empty() {
+                stats_line.clone()
+            } else {
+                format!("{stats_line}\n{content}")
+            };
         }
         posts.push(ComboPost {
             external_id,
@@ -590,7 +705,11 @@ fn stale(published_at: &str, watermark: &str) -> bool {
 
 fn holding_key(symbol: &str, name: &str) -> String {
     let symbol = symbol.trim();
-    if !symbol.is_empty() { symbol.to_string() } else { name.trim().to_string() }
+    if !symbol.is_empty() {
+        symbol.to_string()
+    } else {
+        name.trim().to_string()
+    }
 }
 
 fn xueqiu_error(data: &Value) -> bool {
@@ -634,22 +753,41 @@ fn session_dead(value: &Value) -> bool {
         field_str(value, "message")
     )
     .to_lowercase();
-    ["重新登录", "请登录", "登录帐号", "登录账号", "login"].iter().any(|m| text.contains(m))
+    ["重新登录", "请登录", "登录帐号", "登录账号", "login"]
+        .iter()
+        .any(|m| text.contains(m))
 }
 
-async fn get_json(cookie: &str, url: &str, query: &[(&str, &str)], proxy: Option<&str>) -> Result<Value, FetchErr> {
+async fn get_json(
+    cookie: &str,
+    url: &str,
+    query: &[(&str, &str)],
+    proxy: Option<&str>,
+) -> Result<Value, FetchErr> {
     let cookie = cookie.to_string();
     let url = url.to_string();
     let proxy = proxy.map(str::to_string);
-    let query: Vec<(String, String)> = query.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
-    match tokio::task::spawn_blocking(move || fetch_json(&cookie, &url, &query, proxy.as_deref())).await {
+    let query: Vec<(String, String)> = query
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+        .collect();
+    match tokio::task::spawn_blocking(move || fetch_json(&cookie, &url, &query, proxy.as_deref()))
+        .await
+    {
         Ok(result) => result,
         Err(err) => Err(FetchErr::Other(err.to_string())),
     }
 }
 
-fn fetch_json(cookie: &str, url: &str, query: &[(String, String)], proxy: Option<&str>) -> Result<Value, FetchErr> {
-    let agent = crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20)).map_err(FetchErr::Other)?;
+fn fetch_json(
+    cookie: &str,
+    url: &str,
+    query: &[(String, String)],
+    proxy: Option<&str>,
+) -> Result<Value, FetchErr> {
+    let agent =
+        crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20))
+            .map_err(FetchErr::Other)?;
     let mut req = agent.get(url);
     for (key, value) in query {
         req = req.query(key, value);
@@ -663,7 +801,8 @@ fn fetch_json(cookie: &str, url: &str, query: &[(String, String)], proxy: Option
         .set("Referer", "https://xueqiu.com/")
         .set("Cookie", cookie);
     let (status, text) = read_response(req.call()).map_err(FetchErr::Other)?;
-    if text.contains("EO_Bot_Ssid") || text.contains("__tst_status") || text.contains("aliyun_waf") {
+    if text.contains("EO_Bot_Ssid") || text.contains("__tst_status") || text.contains("aliyun_waf")
+    {
         return Err(FetchErr::Other("组合接口返回挑战页".into()));
     }
     let value: Value = serde_json::from_str(&text).map_err(|e| FetchErr::Other(e.to_string()))?;
@@ -683,11 +822,14 @@ fn read_response(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, St
     match result {
         Ok(resp) => {
             let status = resp.status();
-            resp.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
+            resp.into_string()
+                .map(|text| (status, text))
+                .map_err(|e| e.to_string())
         }
-        Err(ureq::Error::Status(status, resp)) => {
-            resp.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
-        }
+        Err(ureq::Error::Status(status, resp)) => resp
+            .into_string()
+            .map(|text| (status, text))
+            .map_err(|e| e.to_string()),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -698,8 +840,13 @@ mod tests {
 
     #[test]
     fn quote_holdings_nav_and_rebalance_card() {
-        assert_eq!(cube_symbol("https://xueqiu.com/P/ZH1234567?from=home"), "ZH1234567");
-        let quote = parse_quote(&json!({"ZH1": {"net_value": "1.2345", "daily_gain": "-0.5", "annualized_gain_rate": "12.34"}}));
+        assert_eq!(
+            cube_symbol("https://xueqiu.com/P/ZH1234567?from=home"),
+            "ZH1234567"
+        );
+        let quote = parse_quote(
+            &json!({"ZH1": {"net_value": "1.2345", "daily_gain": "-0.5", "annualized_gain_rate": "12.34"}}),
+        );
         assert_eq!(quote.net, Some(1.2345));
         assert_eq!(quote.day, Some(-0.5));
         assert_eq!(quote.annual, Some(12.34));
@@ -711,10 +858,13 @@ mod tests {
         assert_eq!(holdings.len(), 1);
         assert_eq!(holdings[0]["prev"], 18.0);
         assert_eq!(parse_cash(&current), Some(12.35));
-        let changed = apply_rebalancing(&holdings, &json!([
-            {"stock_name": "茅台", "stock_symbol": "SH600519", "target_weight": 0},
-            {"stock_name": "招行", "stock_symbol": "SH600036", "target_weight": 15.126}
-        ]));
+        let changed = apply_rebalancing(
+            &holdings,
+            &json!([
+                {"stock_name": "茅台", "stock_symbol": "SH600519", "target_weight": 0},
+                {"stock_name": "招行", "stock_symbol": "SH600036", "target_weight": 15.126}
+            ]),
+        );
         assert_eq!(changed.len(), 1);
         assert_eq!(changed[0]["symbol"], "SH600036");
         assert_eq!(changed[0]["weight"], 15.13);
@@ -737,7 +887,9 @@ mod tests {
         );
         assert_eq!(posts.len(), 1);
         assert_eq!(posts[0].external_id, "9");
-        assert!(posts[0].content.starts_with("今日 -0.50% · 年化 12.3% · 净值 1.234"));
+        assert!(posts[0]
+            .content
+            .starts_with("今日 -0.50% · 年化 12.3% · 净值 1.234"));
         assert!(posts[0].content.contains("➕ 招行 10.0% → 15.0%"));
         assert!(posts[0].content.contains("现金 12.2%"));
         assert!(!posts[0].content.contains("茅台"));
@@ -758,27 +910,59 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-combo-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
         let admin = db.user_by_username("admin").await.unwrap().unwrap();
-        let kol = db.add_kol("combination", "示例组合", "ZH1", None, false, false, false).await.unwrap();
+        let kol = db
+            .add_kol("combination", "示例组合", "ZH1", None, false, false, false)
+            .await
+            .unwrap();
         db.subscribe(admin.id, true, kol, "post").await.unwrap();
-        db.set_cube_snapshot(kol, "quote", r#"{"net_value":1.2,"day_percent_gain":0.5,"annualized_gain":8}"#).await.unwrap();
+        db.set_cube_snapshot(
+            kol,
+            "quote",
+            r#"{"net_value":1.2,"day_percent_gain":0.5,"annualized_gain":8}"#,
+        )
+        .await
+        .unwrap();
         let posts = build_posts(
             "示例组合",
             "ZH1",
-            &Quote { net: Some(1.2), day: Some(0.5), annual: Some(8.0) },
+            &Quote {
+                net: Some(1.2),
+                day: Some(0.5),
+                annual: Some(8.0),
+            },
             &[json!({"name":"招行","symbol":"SH600036","weight":15.0})],
-            &[json!({"id": 3, "status": "success", "updated_at": "2024-03-02 09:30", "rebalancing_histories": [
-                {"stock_name": "招行", "stock_symbol": "SH600036", "target_weight": 15}
-            ]})],
+            &[
+                json!({"id": 3, "status": "success", "updated_at": "2024-03-02 09:30", "rebalancing_histories": [
+                    {"stock_name": "招行", "stock_symbol": "SH600036", "target_weight": 15}
+                ]}),
+            ],
             "",
         );
         let post = &posts[0];
-        db.save_combo(kol, &post.external_id, &post.title, &post.content, &post.url, &post.published_at, &post.detail.to_string()).await.unwrap();
-        let page = db.kol_posts(admin.id, true, kol, 10).await.unwrap().unwrap();
+        db.save_combo(
+            kol,
+            &post.external_id,
+            &post.title,
+            &post.content,
+            &post.url,
+            &post.published_at,
+            &post.detail.to_string(),
+        )
+        .await
+        .unwrap();
+        let page = db
+            .kol_posts(admin.id, true, kol, 10)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(page[0]["detail"]["actions"][0]["type"], "新建");
         let listed = db.catalog(admin.id, true, "combination", 0).await.unwrap();
         assert_eq!(listed[0]["quote"]["net_value"], 1.2);

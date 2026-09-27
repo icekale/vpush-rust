@@ -78,7 +78,11 @@ fn bytes32(value: &BigUint) -> [u8; 32] {
 }
 
 pub fn encode_public_key(q: &(BigUint, BigUint)) -> String {
-    format!("04{}{}", hex::encode_upper(bytes32(&q.0)), hex::encode_upper(bytes32(&q.1)))
+    format!(
+        "04{}{}",
+        hex::encode_upper(bytes32(&q.0)),
+        hex::encode_upper(bytes32(&q.1))
+    )
 }
 
 pub fn decode_public_key(pub_hex: &str) -> Result<(BigUint, BigUint), String> {
@@ -116,8 +120,14 @@ pub fn generate_keypair() -> (BigUint, (BigUint, BigUint)) {
 
 fn sm3(msg: &[u8]) -> [u8; 32] {
     const IV: [u32; 8] = [
-        0x7380_166f, 0x4914_b2b9, 0x1724_42d7, 0xda8a_0600,
-        0xa96f_30bc, 0x1631_38aa, 0xe38d_ee4d, 0xb0fb_0e4e,
+        0x7380_166f,
+        0x4914_b2b9,
+        0x1724_42d7,
+        0xda8a_0600,
+        0xa96f_30bc,
+        0x1631_38aa,
+        0xe38d_ee4d,
+        0xb0fb_0e4e,
     ];
     let mut data = msg.to_vec();
     let bits = (msg.len() as u64).saturating_mul(8);
@@ -179,13 +189,25 @@ fn sm3(msg: &[u8]) -> [u8; 32] {
 }
 
 fn ff(j: usize, x: u32, y: u32, z: u32) -> u32 {
-    if j < 16 { x ^ y ^ z } else { (x & y) | (x & z) | (y & z) }
+    if j < 16 {
+        x ^ y ^ z
+    } else {
+        (x & y) | (x & z) | (y & z)
+    }
 }
 fn gg(j: usize, x: u32, y: u32, z: u32) -> u32 {
-    if j < 16 { x ^ y ^ z } else { (x & y) | (!x & z) }
+    if j < 16 {
+        x ^ y ^ z
+    } else {
+        (x & y) | (!x & z)
+    }
 }
-fn p0(x: u32) -> u32 { x ^ x.rotate_left(9) ^ x.rotate_left(17) }
-fn p1(x: u32) -> u32 { x ^ x.rotate_left(15) ^ x.rotate_left(23) }
+fn p0(x: u32) -> u32 {
+    x ^ x.rotate_left(9) ^ x.rotate_left(17)
+}
+fn p1(x: u32) -> u32 {
+    x ^ x.rotate_left(15) ^ x.rotate_left(23)
+}
 
 const SBOX: [u8; 256] = [
     0xd6, 0x90, 0xe9, 0xfe, 0xcc, 0xe1, 0x3d, 0xb7, 0x16, 0xb6, 0x14, 0xc2, 0x28, 0xfb, 0x2c, 0x05,
@@ -208,10 +230,19 @@ const SBOX: [u8; 256] = [
 
 fn tau(x: u32) -> u32 {
     let b = x.to_be_bytes();
-    u32::from_be_bytes([SBOX[b[0] as usize], SBOX[b[1] as usize], SBOX[b[2] as usize], SBOX[b[3] as usize]])
+    u32::from_be_bytes([
+        SBOX[b[0] as usize],
+        SBOX[b[1] as usize],
+        SBOX[b[2] as usize],
+        SBOX[b[3] as usize],
+    ])
 }
-fn lin(x: u32) -> u32 { x ^ x.rotate_left(2) ^ x.rotate_left(10) ^ x.rotate_left(18) ^ x.rotate_left(24) }
-fn lin_key(x: u32) -> u32 { x ^ x.rotate_left(13) ^ x.rotate_left(23) }
+fn lin(x: u32) -> u32 {
+    x ^ x.rotate_left(2) ^ x.rotate_left(10) ^ x.rotate_left(18) ^ x.rotate_left(24)
+}
+fn lin_key(x: u32) -> u32 {
+    x ^ x.rotate_left(13) ^ x.rotate_left(23)
+}
 
 fn round_keys(key: &[u8; 16]) -> [u32; 32] {
     const FK: [u32; 4] = [0xa3b1_bac6, 0x56aa_3350, 0x677d_9197, 0xb270_22dc];
@@ -220,7 +251,7 @@ fn round_keys(key: &[u8; 16]) -> [u32; 32] {
         k[i] = u32::from_be_bytes(key[i * 4..i * 4 + 4].try_into().unwrap()) ^ FK[i];
     }
     let mut rk = [0u32; 32];
-    for i in 0..32 {
+    for (i, slot) in rk.iter_mut().enumerate() {
         let ck = u32::from_be_bytes([
             ((4 * i) * 7) as u8,
             ((4 * i + 1) * 7) as u8,
@@ -229,7 +260,7 @@ fn round_keys(key: &[u8; 16]) -> [u32; 32] {
         ]);
         let t = k[1] ^ k[2] ^ k[3] ^ ck;
         let next = k[0] ^ lin_key(tau(t));
-        rk[i] = next;
+        *slot = next;
         k = [k[1], k[2], k[3], next];
     }
     rk
@@ -255,7 +286,7 @@ fn crypt_block(block: &[u8; 16], rk: &[u32; 32]) -> [u8; 16] {
 fn pkcs7(data: &[u8]) -> Vec<u8> {
     let n = 16 - (data.len() % 16);
     let mut out = data.to_vec();
-    out.extend(std::iter::repeat(n as u8).take(n));
+    out.extend(std::iter::repeat_n(n as u8, n));
     out
 }
 
@@ -283,7 +314,7 @@ pub fn sm4_encrypt(key_hex: &str, plain: &[u8]) -> Result<Vec<u8>, String> {
 
 pub fn sm4_decrypt(key_hex: &str, cipher: &[u8]) -> Result<Vec<u8>, String> {
     let key = hex::decode(key_hex).map_err(|e| e.to_string())?;
-    if key.len() != 16 || cipher.len() % 16 != 0 || cipher.is_empty() {
+    if key.len() != 16 || !cipher.len().is_multiple_of(16) || cipher.is_empty() {
         return Err("SM4 密文长度不对".into());
     }
     let key: [u8; 16] = key.try_into().unwrap();
@@ -322,7 +353,10 @@ mod tests {
 
     #[test]
     fn sm3_abc_and_sm4_block() {
-        assert_eq!(hex::encode(sm3(b"abc")), "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0");
+        assert_eq!(
+            hex::encode(sm3(b"abc")),
+            "66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0"
+        );
         let key = hex::decode("0123456789abcdeffedcba9876543210").unwrap();
         let pt = hex::decode("0123456789abcdeffedcba9876543210").unwrap();
         let rk = round_keys(key.as_slice().try_into().unwrap());
@@ -340,11 +374,20 @@ mod tests {
         );
         let peer = point_mul(BigUint::from(2u32), g()).unwrap();
         let shared = ecdh_shared_hex(&d, &peer).unwrap();
-        assert_eq!(shared, "8EBBE9B804CBA6EDC7FA09F938CCE07CAB3980885716F56FF2AB12BB610F4640");
+        assert_eq!(
+            shared,
+            "8EBBE9B804CBA6EDC7FA09F938CCE07CAB3980885716F56FF2AB12BB610F4640"
+        );
         let key = derive_sm4_key(&shared);
         assert_eq!(key, "46D2B9341A0F76A38A2BE226690907FE");
         let ct = sm4_encrypt_hex(&key, b"client_id=JtXbaMn7eP&type=1").unwrap();
-        assert_eq!(ct, "F2C3BF444D7757BD1CD312227C18D2A7EDA99261A11E9BF6B12E27420BD6FF32");
-        assert_eq!(sm4_decrypt_hex(&key, &ct).unwrap(), b"client_id=JtXbaMn7eP&type=1");
+        assert_eq!(
+            ct,
+            "F2C3BF444D7757BD1CD312227C18D2A7EDA99261A11E9BF6B12E27420BD6FF32"
+        );
+        assert_eq!(
+            sm4_decrypt_hex(&key, &ct).unwrap(),
+            b"client_id=JtXbaMn7eP&type=1"
+        );
     }
 }

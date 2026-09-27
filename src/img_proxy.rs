@@ -58,16 +58,30 @@ pub fn validate(raw: &str) -> Result<Target, ImgError> {
         return Err(bad());
     }
     let (authority, path) = rest.split_once(['/', '?', '#']).unwrap_or((rest, ""));
-    let host = authority.rsplit_once(':').map(|(host, port)| {
-        if port.chars().all(|c| c.is_ascii_digit()) { host } else { authority }
-    }).unwrap_or(authority);
-    let host = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let host = authority
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            if port.chars().all(|c| c.is_ascii_digit()) {
+                host
+            } else {
+                authority
+            }
+        })
+        .unwrap_or(authority);
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
     if host.is_empty() || !HOSTS.contains(&host.as_str()) {
         return Err(bad());
     }
     let path = path.split(['?', '#']).next().unwrap_or("");
-    let video = path.to_ascii_lowercase().ends_with(".mp4") || path.to_ascii_lowercase().ends_with(".webm");
-    Ok(Target { url: url.to_string(), host, video })
+    let video =
+        path.to_ascii_lowercase().ends_with(".mp4") || path.to_ascii_lowercase().ends_with(".webm");
+    Ok(Target {
+        url: url.to_string(),
+        host,
+        video,
+    })
 }
 
 pub fn resolution_ok(ips: &[IpAddr]) -> bool {
@@ -77,7 +91,10 @@ pub fn resolution_ok(ips: &[IpAddr]) -> bool {
 pub fn ip_allowed(ip: IpAddr) -> bool {
     match unwrap_v4(ip) {
         Some(v4) => !ipv4_blocked(v4),
-        None => !ipv6_blocked(match ip { IpAddr::V6(v6) => v6, IpAddr::V4(_) => return false }),
+        None => !ipv6_blocked(match ip {
+            IpAddr::V6(v6) => v6,
+            IpAddr::V4(_) => return false,
+        }),
     }
 }
 
@@ -91,7 +108,9 @@ fn unwrap_v4(ip: IpAddr) -> Option<Ipv4Addr> {
 fn nat64(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let octets = v6.octets();
     if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
-        Some(Ipv4Addr::new(octets[12], octets[13], octets[14], octets[15]))
+        Some(Ipv4Addr::new(
+            octets[12], octets[13], octets[14], octets[15],
+        ))
     } else {
         None
     }
@@ -139,7 +158,9 @@ pub fn bounded_range(header: Option<&str>) -> String {
                 let end = if end.is_empty() {
                     start.saturating_add(VIDEO_PROBE - 1)
                 } else {
-                    end.parse::<u64>().unwrap_or(start).min(start.saturating_add(VIDEO_MAX as u64 - 1))
+                    end.parse::<u64>()
+                        .unwrap_or(start)
+                        .min(start.saturating_add(VIDEO_MAX as u64 - 1))
                 };
                 return format!("bytes={start}-{}", end.max(start));
             }
@@ -161,7 +182,11 @@ pub fn take_quota(video: bool, ip: &str, now: u64) -> Result<(), ImgError> {
     if entry.1 >= limit {
         return Err(ImgError {
             status: 429,
-            detail: if video { "视频加载过于频繁，请稍后再试" } else { "图片加载过于频繁，请稍后再试" },
+            detail: if video {
+                "视频加载过于频繁，请稍后再试"
+            } else {
+                "图片加载过于频繁，请稍后再试"
+            },
             retry_after: Some((WINDOW - now % WINDOW).max(1)),
         });
     }
@@ -169,12 +194,14 @@ pub fn take_quota(video: bool, ip: &str, now: u64) -> Result<(), ImgError> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn reset_quota() {
     *QUOTA.lock().expect("img quota") = Some(HashMap::new());
 }
 
 pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> {
     let agent = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
         .timeout(Duration::from_secs(if target.video { 30 } else { 15 }))
         .redirects(0)
         .build();
@@ -197,7 +224,9 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
         .unwrap_or("")
         .trim()
         .to_ascii_lowercase();
-    let content_length = response.header("content-length").and_then(|v| v.parse::<usize>().ok());
+    let content_length = response
+        .header("content-length")
+        .and_then(|v| v.parse::<usize>().ok());
     let content_range = response.header("content-range").map(str::to_string);
     let max = if target.video { VIDEO_MAX } else { IMAGE_MAX };
     if !target.video {
@@ -205,32 +234,63 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
             return Err(upstream(false));
         }
         if !IMAGE_TYPES.contains(&content_type.as_str()) {
-            return Err(ImgError { status: 400, detail: "非图片内容", retry_after: None });
+            return Err(ImgError {
+                status: 400,
+                detail: "非图片内容",
+                retry_after: None,
+            });
         }
         if content_length.is_some_and(|n| n > IMAGE_MAX) {
-            return Err(ImgError { status: 400, detail: "图片过大", retry_after: None });
+            return Err(ImgError {
+                status: 400,
+                detail: "图片过大",
+                retry_after: None,
+            });
         }
     } else {
         if status != 200 && status != 206 {
             return Err(upstream(true));
         }
         if !VIDEO_TYPES.contains(&content_type.as_str()) {
-            return Err(ImgError { status: 400, detail: "非视频内容", retry_after: None });
+            return Err(ImgError {
+                status: 400,
+                detail: "非视频内容",
+                retry_after: None,
+            });
         }
         if status == 200 && content_length.is_some_and(|n| n > VIDEO_MAX) {
-            return Err(ImgError { status: 400, detail: "视频过大", retry_after: None });
+            return Err(ImgError {
+                status: 400,
+                detail: "视频过大",
+                retry_after: None,
+            });
         }
     }
     let mut body = Vec::new();
-    response.into_reader().take(max as u64 + 1).read_to_end(&mut body).map_err(|_| upstream(target.video))?;
+    response
+        .into_reader()
+        .take(max as u64 + 1)
+        .read_to_end(&mut body)
+        .map_err(|_| upstream(target.video))?;
     if body.len() > max {
         return Err(ImgError {
             status: 400,
-            detail: if target.video { "视频过大" } else { "图片过大" },
+            detail: if target.video {
+                "视频过大"
+            } else {
+                "图片过大"
+            },
             retry_after: None,
         });
     }
-    finish(target.video, status, content_type, content_length, content_range, body)
+    finish(
+        target.video,
+        status,
+        content_type,
+        content_length,
+        content_range,
+        body,
+    )
 }
 
 fn finish(
@@ -242,7 +302,12 @@ fn finish(
     body: Vec<u8>,
 ) -> Result<Proxied, ImgError> {
     if video {
-        let media_type = if content_type == "video/quicktime" { "video/mp4" } else { &content_type }.to_string();
+        let media_type = if content_type == "video/quicktime" {
+            "video/mp4"
+        } else {
+            &content_type
+        }
+        .to_string();
         let mut headers = vec![
             ("cache-control", "private, no-store".into()),
             ("vary", "Range".into()),
@@ -254,7 +319,12 @@ fn finish(
         if let Some(len) = content_length {
             headers.push(("content-length", len.to_string()));
         }
-        Ok(Proxied { status, media_type, headers, body })
+        Ok(Proxied {
+            status,
+            media_type,
+            headers,
+            body,
+        })
     } else {
         Ok(Proxied {
             status: 200,
@@ -267,15 +337,30 @@ fn finish(
 
 pub fn resolve(host: &str) -> Vec<IpAddr> {
     use std::net::ToSocketAddrs;
-    (host, 443).to_socket_addrs().map(|iter| iter.map(|addr| addr.ip()).collect()).unwrap_or_default()
+    (host, 443)
+        .to_socket_addrs()
+        .map(|iter| iter.map(|addr| addr.ip()).collect())
+        .unwrap_or_default()
 }
 
 fn bad() -> ImgError {
-    ImgError { status: 400, detail: "不支持的图片地址", retry_after: None }
+    ImgError {
+        status: 400,
+        detail: "不支持的图片地址",
+        retry_after: None,
+    }
 }
 
 fn upstream(video: bool) -> ImgError {
-    ImgError { status: 502, detail: if video { "视频源请求失败" } else { "图片源请求失败" }, retry_after: None }
+    ImgError {
+        status: 502,
+        detail: if video {
+            "视频源请求失败"
+        } else {
+            "图片源请求失败"
+        },
+        retry_after: None,
+    }
 }
 
 #[cfg(test)]
@@ -291,10 +376,16 @@ mod tests {
         let image = validate("https://pbs.twimg.com/media/a.jpg").unwrap();
         assert_eq!(image.host, "pbs.twimg.com");
         assert!(!image.video);
-        assert!(validate("https://video.twimg.com/ext/a.mp4?tag=1").unwrap().video);
+        assert!(
+            validate("https://video.twimg.com/ext/a.mp4?tag=1")
+                .unwrap()
+                .video
+        );
         assert!(!resolution_ok(&[]));
         assert!(!resolution_ok(&[IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))]));
-        assert!(!resolution_ok(&[IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254))]));
+        assert!(!resolution_ok(&[IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))]));
         assert!(!ip_allowed("::ffff:10.0.0.1".parse().unwrap()));
         assert!(!ip_allowed("64:ff9b::a00:1".parse().unwrap()));
         assert!(ip_allowed(IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1))));
@@ -303,8 +394,14 @@ mod tests {
 
     #[test]
     fn bounds_video_ranges_and_image_quota() {
-        assert_eq!(bounded_range(Some("bytes=0-")), format!("bytes=0-{}", VIDEO_PROBE - 1));
-        assert_eq!(bounded_range(Some("bytes=-999999999")), format!("bytes=-{VIDEO_MAX}"));
+        assert_eq!(
+            bounded_range(Some("bytes=0-")),
+            format!("bytes=0-{}", VIDEO_PROBE - 1)
+        );
+        assert_eq!(
+            bounded_range(Some("bytes=-999999999")),
+            format!("bytes=-{VIDEO_MAX}")
+        );
         assert_eq!(bounded_range(None), format!("bytes=0-{}", VIDEO_PROBE - 1));
         reset_quota();
         for _ in 0..IMAGE_QUOTA {

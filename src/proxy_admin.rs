@@ -4,7 +4,15 @@ use serde_json::{json, Value};
 
 use crate::db::Db;
 
-const PLATFORMS: [&str; 7] = ["combination", "ima", "truth", "twitter", "weibo", "xueqiu", "zsxq"];
+const PLATFORMS: [&str; 7] = [
+    "combination",
+    "ima",
+    "truth",
+    "twitter",
+    "weibo",
+    "xueqiu",
+    "zsxq",
+];
 const ROUTES_KEY: &str = "proxy_routes";
 
 #[derive(Debug)]
@@ -73,14 +81,33 @@ pub async fn delete_pool(db: &Db, id: i64) -> Result<(), AdminError> {
     if one_pool(db, id).await.is_err() {
         return Err(missing("代理池不存在"));
     }
-    let mut tx = db.pool().begin().await.map_err(|_| fail(500, "删除代理池失败"))?;
-    sqlx::query("DELETE FROM proxies WHERE pool_id = ?").bind(id).execute(&mut *tx).await.map_err(|_| fail(500, "删除代理池失败"))?;
-    sqlx::query("DELETE FROM proxy_pools WHERE id = ?").bind(id).execute(&mut *tx).await.map_err(|_| fail(500, "删除代理池失败"))?;
+    let mut tx = db
+        .pool()
+        .begin()
+        .await
+        .map_err(|_| fail(500, "删除代理池失败"))?;
+    sqlx::query("DELETE FROM proxies WHERE pool_id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| fail(500, "删除代理池失败"))?;
+    sqlx::query("DELETE FROM proxy_pools WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| fail(500, "删除代理池失败"))?;
     tx.commit().await.map_err(|_| fail(500, "删除代理池失败"))
 }
 
-pub async fn import_text(db: &Db, pool_id: i64, text: &str, protocol: Option<&str>) -> Result<Value, AdminError> {
-    let pool = one_pool(db, pool_id).await.map_err(|_| missing("代理池不存在"))?;
+pub async fn import_text(
+    db: &Db,
+    pool_id: i64,
+    text: &str,
+    protocol: Option<&str>,
+) -> Result<Value, AdminError> {
+    let pool = one_pool(db, pool_id)
+        .await
+        .map_err(|_| missing("代理池不存在"))?;
     let default = protocol.unwrap_or_else(|| pool["protocol"].as_str().unwrap_or("http"));
     if norm_protocol(default).is_empty() {
         return Err(bad("协议须为 http 或 socks5"));
@@ -94,17 +121,30 @@ pub async fn import_text(db: &Db, pool_id: i64, text: &str, protocol: Option<&st
 }
 
 pub async fn extract_target(db: &Db, pool_id: i64) -> Result<String, AdminError> {
-    let pool = one_pool(db, pool_id).await.map_err(|_| missing("代理池不存在"))?;
+    let pool = one_pool(db, pool_id)
+        .await
+        .map_err(|_| missing("代理池不存在"))?;
     if pool["kind"] != "extract" {
         return Err(bad("不是提取池"));
     }
-    let url = pool["extract_url"].as_str().unwrap_or("").trim().to_string();
+    let url = pool["extract_url"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     check_extract_url(&url)?;
     Ok(url)
 }
 
-pub async fn store_extracted(db: &Db, pool_id: i64, body: &str, now: i64) -> Result<Value, AdminError> {
-    let pool = one_pool(db, pool_id).await.map_err(|_| missing("代理池不存在"))?;
+pub async fn store_extracted(
+    db: &Db,
+    pool_id: i64,
+    body: &str,
+    now: i64,
+) -> Result<Value, AdminError> {
+    let pool = one_pool(db, pool_id)
+        .await
+        .map_err(|_| missing("代理池不存在"))?;
     let protocol = pool["protocol"].as_str().unwrap_or("http");
     let expire = pool["expire_seconds"].as_i64().unwrap_or(0);
     let expires_at = if expire > 0 { Some(now + expire) } else { None };
@@ -194,7 +234,13 @@ pub async fn proxy_endpoint(db: &Db, id: i64) -> Result<String, AdminError> {
     Ok(endpoint(&row))
 }
 
-pub async fn finish_probe(db: &Db, id: i64, ok: bool, status_code: Option<u16>, error: &str) -> Result<Value, AdminError> {
+pub async fn finish_probe(
+    db: &Db,
+    id: i64,
+    ok: bool,
+    status_code: Option<u16>,
+    error: &str,
+) -> Result<Value, AdminError> {
     if proxy_row(db, id).await.is_err() {
         return Err(missing("代理不存在"));
     }
@@ -268,7 +314,11 @@ pub async fn note(db: &Db, proxy_id: Option<i64>, ok: bool, error: &str) {
     let Ok(Some(row)) = current else { return };
     use sqlx::Row;
     let fails = row.get::<i64, _>("fail_count") + 1;
-    let status = if fails >= 3 { "dead".to_string() } else { row.get::<String, _>("status") };
+    let status = if fails >= 3 {
+        "dead".to_string()
+    } else {
+        row.get::<String, _>("status")
+    };
     let error: String = error.chars().take(200).collect();
     let _ = sqlx::query("UPDATE proxies SET status = ?, fail_count = ?, last_fail_at = ?, last_error = ? WHERE id = ?")
         .bind(status)
@@ -280,8 +330,14 @@ pub async fn note(db: &Db, proxy_id: Option<i64>, ok: bool, error: &str) {
         .await;
 }
 
-pub fn http_agent(proxy: Option<&str>, connect: std::time::Duration, read: std::time::Duration) -> Result<ureq::Agent, String> {
-    let mut builder = ureq::AgentBuilder::new().timeout_connect(connect).timeout_read(read);
+pub fn http_agent(
+    proxy: Option<&str>,
+    connect: std::time::Duration,
+    read: std::time::Duration,
+) -> Result<ureq::Agent, String> {
+    let mut builder = ureq::AgentBuilder::new()
+        .timeout_connect(connect)
+        .timeout_read(read);
     if let Some(url) = proxy {
         builder = builder.proxy(ureq::Proxy::new(url).map_err(|err| err.to_string())?);
     }
@@ -290,7 +346,9 @@ pub fn http_agent(proxy: Option<&str>, connect: std::time::Duration, read: std::
 
 pub async fn routes(db: &Db) -> Result<Value, sqlx::Error> {
     let raw = db.setting(ROUTES_KEY).await?.unwrap_or_default();
-    Ok(normalize(&serde_json::from_str(&raw).unwrap_or(Value::Null)))
+    Ok(normalize(
+        &serde_json::from_str(&raw).unwrap_or(Value::Null),
+    ))
 }
 
 pub async fn save_routes(db: &Db, body: &Value) -> Result<Value, AdminError> {
@@ -305,25 +363,34 @@ pub async fn save_routes(db: &Db, body: &Value) -> Result<Value, AdminError> {
             return Err(bad("mode 须为 direct / pool / proxy"));
         }
         if mode == "pool" {
-            let id = route.get("pool_id").and_then(Value::as_i64).ok_or_else(|| bad("代理池不存在"))?;
+            let id = route
+                .get("pool_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| bad("代理池不存在"))?;
             if one_pool(db, id).await.is_err() {
                 return Err(bad("代理池不存在"));
             }
         }
         if mode == "proxy" {
-            let id = route.get("proxy_id").and_then(Value::as_i64).ok_or_else(|| bad("指定代理不存在"))?;
+            let id = route
+                .get("proxy_id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| bad("指定代理不存在"))?;
             if proxy_row(db, id).await.is_err() {
                 return Err(bad("指定代理不存在"));
             }
         }
     }
     let normalized = normalize(body);
-    db.set_setting(ROUTES_KEY, &normalized.to_string()).await.map_err(|_| fail(500, "保存出口失败"))?;
+    db.set_setting(ROUTES_KEY, &normalized.to_string())
+        .await
+        .map_err(|_| fail(500, "保存出口失败"))?;
     Ok(normalized)
 }
 
 pub fn live_get(url: &str) -> Result<String, String> {
     let response = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(20))
         .redirects(0)
@@ -335,7 +402,11 @@ pub fn live_get(url: &str) -> Result<String, String> {
         return Err(format!("提取 HTTP {}", response.status()));
     }
     let mut buf = Vec::new();
-    response.into_reader().take(1_048_576).read_to_end(&mut buf).map_err(|err| err.to_string())?;
+    response
+        .into_reader()
+        .take(1_048_576)
+        .read_to_end(&mut buf)
+        .map_err(|err| err.to_string())?;
     String::from_utf8(buf).map_err(|_| "提取结果不是文本".to_string())
 }
 
@@ -403,17 +474,21 @@ async fn one_pool(db: &Db, id: i64) -> Result<Value, AdminError> {
     .fetch_optional(db.pool())
     .await
     .map_err(|_| fail(500, "读取代理池失败"))?;
-    row.as_ref().map(pool_json).ok_or_else(|| missing("代理池不存在"))
+    row.as_ref()
+        .map(pool_json)
+        .ok_or_else(|| missing("代理池不存在"))
 }
 
 async fn load_exit(db: &Db, id: i64, now: i64) -> Result<Exit, String> {
     use sqlx::Row;
-    let row = sqlx::query("SELECT id, protocol, host, port, username, password, expires_at FROM proxies WHERE id = ?")
-        .bind(id)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|err| err.to_string())?
-        .ok_or("指定代理不存在")?;
+    let row = sqlx::query(
+        "SELECT id, protocol, host, port, username, password, expires_at FROM proxies WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|err| err.to_string())?
+    .ok_or("指定代理不存在")?;
     if expired(row.try_get("expires_at").ok(), now) {
         return Err("指定代理已过期".into());
     }
@@ -444,7 +519,10 @@ fn exit_from(row: &sqlx::sqlite::SqliteRow) -> Exit {
         username: row.get("username"),
         password: row.get("password"),
     };
-    Exit { id: row.get("id"), url: endpoint(&node) }
+    Exit {
+        id: row.get("id"),
+        url: endpoint(&node),
+    }
 }
 
 fn expired(expires_at: Option<i64>, now: i64) -> bool {
@@ -453,12 +531,13 @@ fn expired(expires_at: Option<i64>, now: i64) -> bool {
 
 async fn proxy_row(db: &Db, id: i64) -> Result<Node, AdminError> {
     use sqlx::Row;
-    let row = sqlx::query("SELECT protocol, host, port, username, password FROM proxies WHERE id = ?")
-        .bind(id)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| fail(500, "读取代理失败"))?
-        .ok_or_else(|| missing("代理不存在"))?;
+    let row =
+        sqlx::query("SELECT protocol, host, port, username, password FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_optional(db.pool())
+            .await
+            .map_err(|_| fail(500, "读取代理失败"))?
+            .ok_or_else(|| missing("代理不存在"))?;
     Ok(Node {
         protocol: row.get("protocol"),
         host: row.get("host"),
@@ -468,7 +547,13 @@ async fn proxy_row(db: &Db, id: i64) -> Result<Node, AdminError> {
     })
 }
 
-async fn upsert(db: &Db, pool_id: i64, node: &Node, source: &str, expires_at: Option<i64>) -> Result<i64, AdminError> {
+async fn upsert(
+    db: &Db,
+    pool_id: i64,
+    node: &Node,
+    source: &str,
+    expires_at: Option<i64>,
+) -> Result<i64, AdminError> {
     let row = sqlx::query(
         "INSERT INTO proxies (pool_id, protocol, host, port, username, password, source, expires_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -492,7 +577,11 @@ async fn upsert(db: &Db, pool_id: i64, node: &Node, source: &str, expires_at: Op
 }
 
 fn endpoint(node: &Node) -> String {
-    let scheme = if node.protocol == "socks5" { "socks5" } else { "http" };
+    let scheme = if node.protocol == "socks5" {
+        "socks5"
+    } else {
+        "http"
+    };
     if node.username.is_empty() && node.password.is_empty() {
         format!("{scheme}://{}:{}", node.host, node.port)
     } else {
@@ -523,13 +612,26 @@ fn normalize(raw: &Value) -> Value {
     for platform in PLATFORMS {
         out.insert(platform.to_string(), json!({"mode": "direct"}));
     }
-    let Some(obj) = raw.as_object() else { return Value::Object(out) };
+    let Some(obj) = raw.as_object() else {
+        return Value::Object(out);
+    };
     for platform in PLATFORMS {
-        let Some(route) = obj.get(platform).and_then(Value::as_object) else { continue };
-        let mode = route.get("mode").and_then(Value::as_str).unwrap_or("direct");
+        let Some(route) = obj.get(platform).and_then(Value::as_object) else {
+            continue;
+        };
+        let mode = route
+            .get("mode")
+            .and_then(Value::as_str)
+            .unwrap_or("direct");
         let item = match mode {
-            "pool" => route.get("pool_id").and_then(Value::as_i64).map(|id| json!({"mode": "pool", "pool_id": id})),
-            "proxy" => route.get("proxy_id").and_then(Value::as_i64).map(|id| json!({"mode": "proxy", "proxy_id": id})),
+            "pool" => route
+                .get("pool_id")
+                .and_then(Value::as_i64)
+                .map(|id| json!({"mode": "pool", "pool_id": id})),
+            "proxy" => route
+                .get("proxy_id")
+                .and_then(Value::as_i64)
+                .map(|id| json!({"mode": "proxy", "proxy_id": id})),
             "direct" => Some(json!({"mode": "direct"})),
             _ => None,
         };
@@ -564,62 +666,122 @@ fn parse_extract(text: &str) -> Vec<String> {
 }
 
 fn from_list(items: &[Value]) -> Vec<String> {
-    items.iter().filter_map(|item| match item {
-        Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
-        Value::Object(_) => obj_line(item),
-        _ => None,
-    }).collect()
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Value::String(text) if !text.trim().is_empty() => Some(text.trim().to_string()),
+            Value::Object(_) => obj_line(item),
+            _ => None,
+        })
+        .collect()
 }
 
 fn obj_line(item: &Value) -> Option<String> {
-    let host = item.get("ip").or_else(|| item.get("host")).or_else(|| item.get("addr")).and_then(Value::as_str)?;
-    let port = item.get("port").and_then(|value| value.as_i64().or_else(|| value.as_str().and_then(|text| text.parse().ok())))?;
-    if host.is_empty() { None } else { Some(format!("{host}:{port}")) }
+    let host = item
+        .get("ip")
+        .or_else(|| item.get("host"))
+        .or_else(|| item.get("addr"))
+        .and_then(Value::as_str)?;
+    let port = item.get("port").and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })?;
+    if host.is_empty() {
+        None
+    } else {
+        Some(format!("{host}:{port}"))
+    }
 }
 
 fn plain_lines(text: &str) -> Vec<String> {
-    text.lines().map(str::trim).filter(|line| !line.is_empty() && !line.starts_with('#')).map(str::to_string).collect()
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_lines(text: &str, default_protocol: &str) -> Vec<Node> {
-    plain_lines(text).into_iter().filter_map(|line| parse_one(&line, default_protocol)).collect()
+    plain_lines(text)
+        .into_iter()
+        .filter_map(|line| parse_one(&line, default_protocol))
+        .collect()
 }
 
 fn parse_one(line: &str, default_protocol: &str) -> Option<Node> {
     if let Some((scheme, rest)) = line.split_once("://") {
         let protocol = norm_protocol(scheme);
-        if protocol.is_empty() { return None; }
+        if protocol.is_empty() {
+            return None;
+        }
         let (auth, hostport) = match rest.rsplit_once('@') {
             Some((auth, hostport)) => (Some(auth), hostport),
             None => (None, rest),
         };
         let (host, port) = split_host_port(hostport)?;
         let (username, password) = auth.map(split_user_pass).unwrap_or_default();
-        return Some(Node { protocol, host, port, username, password });
+        return Some(Node {
+            protocol,
+            host,
+            port,
+            username,
+            password,
+        });
     }
     if let Some((left, right)) = line.rsplit_once('@') {
         if let Some((host, port)) = split_host_port(right) {
             let (username, password) = split_user_pass(left);
-            return Some(Node { protocol: norm_protocol(default_protocol), host, port, username, password });
+            return Some(Node {
+                protocol: norm_protocol(default_protocol),
+                host,
+                port,
+                username,
+                password,
+            });
         }
     }
     let parts: Vec<&str> = line.split(':').collect();
     if parts.len() >= 2 {
-        let port = parts[1].parse::<i64>().ok().filter(|port| (1..=65535).contains(port))?;
+        let port = parts[1]
+            .parse::<i64>()
+            .ok()
+            .filter(|port| (1..=65535).contains(port))?;
         let host = parts[0].trim().to_string();
-        if !host_ok(&host) { return None; }
-        let username = if parts.len() >= 3 { decode(parts[2]) } else { String::new() };
-        let password = if parts.len() >= 4 { decode(&parts[3..].join(":")) } else { String::new() };
-        return Some(Node { protocol: norm_protocol(default_protocol), host, port, username, password });
+        if !host_ok(&host) {
+            return None;
+        }
+        let username = if parts.len() >= 3 {
+            decode(parts[2])
+        } else {
+            String::new()
+        };
+        let password = if parts.len() >= 4 {
+            decode(&parts[3..].join(":"))
+        } else {
+            String::new()
+        };
+        return Some(Node {
+            protocol: norm_protocol(default_protocol),
+            host,
+            port,
+            username,
+            password,
+        });
     }
     None
 }
 
 fn split_host_port(text: &str) -> Option<(String, i64)> {
     let (host, port) = text.rsplit_once(':')?;
-    let port = port.parse::<i64>().ok().filter(|port| (1..=65535).contains(port))?;
+    let port = port
+        .parse::<i64>()
+        .ok()
+        .filter(|port| (1..=65535).contains(port))?;
     let host = host.trim().to_string();
-    if !host_ok(&host) { return None; }
+    if !host_ok(&host) {
+        return None;
+    }
     Some((host, port))
 }
 
@@ -660,30 +822,16 @@ fn check_pool(kind: &str, protocol: &str, extract_url: &str) -> Result<(), Admin
 }
 
 fn check_extract_url(url: &str) -> Result<(), AdminError> {
-    let Some((scheme, rest)) = url.trim().split_once("://") else {
-        return Err(bad("提取 URL 仅支持 http/https"));
-    };
-    if !matches!(scheme, "http" | "https") || rest.is_empty() {
-        return Err(bad("提取 URL 仅支持 http/https"));
-    }
-    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if hostport.contains('@') || hostport.is_empty() {
+    let scheme = url
+        .trim()
+        .split_once("://")
+        .map(|(scheme, _)| scheme)
+        .unwrap_or("");
+    if !matches!(scheme, "http" | "https") {
         return Err(bad("提取 URL 仅支持 http/https"));
     }
-    let host = hostport.rsplit_once(':').map(|(host, _)| host).unwrap_or(hostport);
-    if private_host(host) {
-        return Err(bad("提取 URL 不能指向本机或内网"));
-    }
-    Ok(())
-}
-
-fn private_host(host: &str) -> bool {
-    let host = host.trim_matches(['[', ']']).to_ascii_lowercase();
-    if host == "localhost" || host.ends_with(".local") || host == "::1" {
-        return true;
-    }
-    let Some(ip) = host.parse::<std::net::Ipv4Addr>().ok() else { return false };
-    ip.is_private() || ip.is_loopback() || ip.is_link_local() || ip.is_unspecified() || ip.is_broadcast()
+    crate::url_guard::validate_url(url.trim(), scheme)
+        .map_err(|_| bad("提取 URL 不能指向本机或内网"))
 }
 
 fn mask_url(url: &str) -> String {
@@ -712,19 +860,31 @@ fn decode(value: &str) -> String {
 }
 
 fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 fn bad(detail: &str) -> AdminError {
-    AdminError { status: 400, detail: detail.to_string() }
+    AdminError {
+        status: 400,
+        detail: detail.to_string(),
+    }
 }
 
 fn missing(detail: &str) -> AdminError {
-    AdminError { status: 404, detail: detail.to_string() }
+    AdminError {
+        status: 404,
+        detail: detail.to_string(),
+    }
 }
 
 fn fail(status: u16, detail: &str) -> AdminError {
-    AdminError { status, detail: detail.to_string() }
+    AdminError {
+        status,
+        detail: detail.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -735,7 +895,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-proxy-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         (Db::open(&path).await.unwrap(), path)
     }
@@ -743,7 +906,9 @@ mod tests {
     #[tokio::test]
     async fn import_masks_password_and_dedupes() {
         let (db, path) = db().await;
-        let pool = create_pool(&db, "海外", "static", "socks5", "", 0, 0).await.unwrap();
+        let pool = create_pool(&db, "海外", "static", "socks5", "", 0, 0)
+            .await
+            .unwrap();
         let id = pool["id"].as_i64().unwrap();
         let imported = import_text(
             &db,
@@ -759,36 +924,91 @@ mod tests {
         assert!(!body.contains("s3cret-token"));
         assert!(body.contains("***"));
         assert_eq!(listed["items"].as_array().unwrap().len(), 2);
-        delete_proxy(&db, listed["items"][0]["id"].as_i64().unwrap()).await.unwrap();
+        delete_proxy(&db, listed["items"][0]["id"].as_i64().unwrap())
+            .await
+            .unwrap();
         delete_pool(&db, id).await.unwrap();
-        assert!(pools(&db).await.unwrap()["items"].as_array().unwrap().is_empty());
+        assert!(pools(&db).await.unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .is_empty());
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn extract_stores_nodes_without_echoing_the_vendor_key() {
         let (db, path) = db().await;
-        let err = create_pool(&db, "坏", "extract", "http", "http://127.0.0.1/get?token=secret", 300, 180).await.unwrap_err();
+        let err = create_pool(
+            &db,
+            "坏",
+            "extract",
+            "http",
+            "http://127.0.0.1/get?token=secret",
+            300,
+            180,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.detail, "提取 URL 不能指向本机或内网");
-        let pool = create_pool(&db, "提取", "extract", "http", "https://vendor.example/get?token=vendor-secret", 300, 180).await.unwrap();
+        let pool = create_pool(
+            &db,
+            "提取",
+            "extract",
+            "http",
+            "https://vendor.example/get?token=vendor-secret",
+            300,
+            180,
+        )
+        .await
+        .unwrap();
         assert!(!pool.to_string().contains("vendor-secret"));
         let id = pool["id"].as_i64().unwrap();
-        let stored = store_extracted(&db, id, r#"{"data":[{"ip":"9.9.9.9","port":8000}]}"#, 1_700_000_000).await.unwrap();
+        let stored = store_extracted(
+            &db,
+            id,
+            r#"{"data":[{"ip":"9.9.9.9","port":8000}]}"#,
+            1_700_000_000,
+        )
+        .await
+        .unwrap();
         assert_eq!(stored["imported"], 1);
         let listed = proxies(&db).await.unwrap();
         assert_eq!(listed["items"][0]["source"], "extract");
         assert_eq!(listed["items"][0]["expires_at"], 1_700_000_300);
-        let failed = finish_probe(&db, listed["items"][0]["id"].as_i64().unwrap(), false, None, "连接被拒绝").await.unwrap();
+        let failed = finish_probe(
+            &db,
+            listed["items"][0]["id"].as_i64().unwrap(),
+            false,
+            None,
+            "连接被拒绝",
+        )
+        .await
+        .unwrap();
         assert_eq!(failed["ok"], false);
         assert_eq!(proxies(&db).await.unwrap()["items"][0]["status"], "fail");
-        let saved = save_routes(&db, &json!({"xueqiu": {"mode": "pool", "pool_id": id}})).await.unwrap();
+        let saved = save_routes(&db, &json!({"xueqiu": {"mode": "pool", "pool_id": id}}))
+            .await
+            .unwrap();
         assert_eq!(saved["xueqiu"]["pool_id"], id);
         assert_eq!(saved["weibo"]["mode"], "direct");
-        assert!(save_routes(&db, &json!({"xueqiu": {"mode": "pool", "pool_id": 999}})).await.is_err());
-        let fresh = create_pool(&db, "可用", "static", "http", "", 0, 0).await.unwrap();
+        assert!(
+            save_routes(&db, &json!({"xueqiu": {"mode": "pool", "pool_id": 999}}))
+                .await
+                .is_err()
+        );
+        let fresh = create_pool(&db, "可用", "static", "http", "", 0, 0)
+            .await
+            .unwrap();
         let fresh_id = fresh["id"].as_i64().unwrap();
-        import_text(&db, fresh_id, "9.9.9.9:8000", None).await.unwrap();
-        save_routes(&db, &json!({"xueqiu": {"mode": "pool", "pool_id": fresh_id}})).await.unwrap();
+        import_text(&db, fresh_id, "9.9.9.9:8000", None)
+            .await
+            .unwrap();
+        save_routes(
+            &db,
+            &json!({"xueqiu": {"mode": "pool", "pool_id": fresh_id}}),
+        )
+        .await
+        .unwrap();
         let chosen = acquire(&db, "xueqiu").await.unwrap().unwrap();
         assert!(chosen.url.contains("9.9.9.9:8000"));
         note(&db, Some(chosen.id), false, "超时").await;

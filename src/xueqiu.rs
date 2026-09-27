@@ -98,7 +98,10 @@ pub async fn rotate_app_cookie(db: &Db) -> Result<String, String> {
 
 fn enabled() -> bool {
     !matches!(
-        std::env::var("XUEQIU_APP_IDENTITY").ok().as_deref().map(str::trim),
+        std::env::var("XUEQIU_APP_IDENTITY")
+            .ok()
+            .as_deref()
+            .map(str::trim),
         Some("0" | "false" | "no" | "off")
     ) && !matches!(
         std::env::var("VPUSH_FETCH").ok().as_deref().map(str::trim),
@@ -115,7 +118,10 @@ fn poll_secs() -> u64 {
 }
 
 async fn poll(db: &Db, streak: &mut HashMap<i64, u32>) -> Result<(), String> {
-    let kols = db.kols_to_fetch("xueqiu").await.map_err(|e| e.to_string())?;
+    let kols = db
+        .kols_to_fetch("xueqiu")
+        .await
+        .map_err(|e| e.to_string())?;
     if kols.is_empty() {
         return Ok(());
     }
@@ -153,7 +159,9 @@ async fn poll(db: &Db, streak: &mut HashMap<i64, u32>) -> Result<(), String> {
 
 async fn save(db: &Db, kol_id: i64, kol_name: &str, batch: Batch) -> Result<(), String> {
     if !batch.avatar.is_empty() {
-        db.set_avatar(kol_id, &batch.avatar).await.map_err(|e| e.to_string())?;
+        db.set_avatar(kol_id, &batch.avatar)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     for post in batch.posts {
         let is_new = !db
@@ -216,15 +224,24 @@ async fn pull(
         let probe_uid = uid.clone();
         let probe_cookie = cookie.clone();
         let probe_proxy = proxy.clone();
-        let data = block(move || timeline(&probe_cookie, &probe_uid, 1, 1, probe_proxy.as_deref())).await?;
+        let data = block(move || timeline(&probe_cookie, &probe_uid, 1, 1, probe_proxy.as_deref()))
+            .await?;
         let newest = data["statuses"]
             .as_array()
             .and_then(|rows| rows.first())
             .map(field)
             .unwrap_or_default();
-        if !newest.is_empty() && db.has_post("xueqiu", &newest).await.map_err(|e| PullErr::Other(e.to_string()))? {
+        if !newest.is_empty()
+            && db
+                .has_post("xueqiu", &newest)
+                .await
+                .map_err(|e| PullErr::Other(e.to_string()))?
+        {
             *streak.entry(kol_id).or_insert(0) += 1;
-            return Ok(Batch { posts: Vec::new(), avatar: String::new() });
+            return Ok(Batch {
+                posts: Vec::new(),
+                avatar: String::new(),
+            });
         }
     }
     streak.insert(kol_id, 0);
@@ -232,12 +249,12 @@ async fn pull(
     Ok(parse_timeline(&data))
 }
 
-fn block<T: Send + 'static>(f: impl FnOnce() -> Result<T, PullErr> + Send + 'static) -> impl std::future::Future<Output = Result<T, PullErr>> {
-    async move {
-        match tokio::task::spawn_blocking(f).await {
-            Ok(result) => result,
-            Err(err) => Err(PullErr::Other(err.to_string())),
-        }
+async fn block<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, PullErr> + Send + 'static,
+) -> Result<T, PullErr> {
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(err) => Err(PullErr::Other(err.to_string())),
     }
 }
 
@@ -282,20 +299,29 @@ fn rotate_clock() -> &'static std::sync::Mutex<u64> {
 }
 
 fn rotate_due() -> bool {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     let last = rotate_clock().lock().unwrap_or_else(|err| err.into_inner());
     now.saturating_sub(*last) >= 600
 }
 
 fn mark_rotated() {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     *rotate_clock().lock().unwrap_or_else(|err| err.into_inner()) = now;
 }
 
 fn new_device() -> String {
     let mut buf = [0u8; 16];
     getrandom::getrandom(&mut buf).ok();
-    format!("1ONEPLUS{}", hex::encode(Md5::digest(hex::encode(buf).as_bytes())))
+    format!(
+        "1ONEPLUS{}",
+        hex::encode(Md5::digest(hex::encode(buf).as_bytes()))
+    )
 }
 
 fn device_id() -> String {
@@ -314,7 +340,10 @@ fn empty_sign() -> String {
 }
 
 fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0)
 }
 
 fn register(device: &str) -> Result<Identity, String> {
@@ -337,7 +366,9 @@ fn register(device: &str) -> Result<Identity, String> {
         return Err(format!("密钥协商 HTTP {status}"));
     }
     let payload: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let server_pub = payload["data"]["public_key"].as_str().ok_or_else(|| format!("密钥协商失败: {text}"))?;
+    let server_pub = payload["data"]["public_key"]
+        .as_str()
+        .ok_or_else(|| format!("密钥协商失败: {text}"))?;
     let shared = ecdh_shared_hex(&secret, &decode_public_key(server_pub)?)?;
     let sm4_key = derive_sm4_key(&shared);
     let form = format!(
@@ -378,10 +409,20 @@ fn identity_from(value: &Value, device: &str) -> Option<Identity> {
     }
     let device_id = {
         let saved = field_str(value, "device_id");
-        if saved.is_empty() { device.to_string() } else { saved }
+        if saved.is_empty() {
+            device.to_string()
+        } else {
+            saved
+        }
     };
     let cookie = format!("xq_a_token={access_token};xq_id_token={id_token};u={uid}");
-    Some(Identity { access_token, id_token, uid, device_id, cookie })
+    Some(Identity {
+        access_token,
+        id_token,
+        uid,
+        device_id,
+        cookie,
+    })
 }
 
 fn send(
@@ -393,7 +434,11 @@ fn send(
     body: Option<&str>,
     encrypted: bool,
 ) -> Result<(u16, String), String> {
-    let mut req = if method == "POST" { agent.post(url) } else { agent.get(url) };
+    let mut req = if method == "POST" {
+        agent.post(url)
+    } else {
+        agent.get(url)
+    };
     for (key, value) in query {
         req = req.query(key, value);
     }
@@ -406,7 +451,10 @@ fn send(
         .set("Cookie", "xq_a_token=;xq_id_token=;u=0;session_id=;xid=0");
     let result = if let Some(body) = body {
         let req = if encrypted {
-            req.set("isenc", "1").set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
+            req.set("isenc", "1").set(
+                "Content-Type",
+                "application/x-www-form-urlencoded; charset=utf-8",
+            )
         } else {
             req.set("Content-Type", "application/json;charset=UTF-8")
         };
@@ -431,8 +479,16 @@ pub(crate) fn probe_keepalive(cookie: &str, uid: &str) -> Keepalive {
     }
 }
 
-fn timeline(cookie: &str, uid: &str, page: i64, count: i64, proxy: Option<&str>) -> Result<Value, PullErr> {
-    let agent = crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20)).map_err(PullErr::Other)?;
+fn timeline(
+    cookie: &str,
+    uid: &str,
+    page: i64,
+    count: i64,
+    proxy: Option<&str>,
+) -> Result<Value, PullErr> {
+    let agent =
+        crate::proxy_admin::http_agent(proxy, Duration::from_secs(15), Duration::from_secs(20))
+            .map_err(PullErr::Other)?;
     let req = agent
         .get(TIMELINE)
         .query("user_id", uid)
@@ -463,11 +519,14 @@ fn read_response(result: Result<ureq::Response, ureq::Error>) -> Result<(u16, St
     match result {
         Ok(resp) => {
             let status = resp.status();
-            resp.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
+            resp.into_string()
+                .map(|text| (status, text))
+                .map_err(|e| e.to_string())
         }
-        Err(ureq::Error::Status(status, resp)) => {
-            resp.into_string().map(|text| (status, text)).map_err(|e| e.to_string())
-        }
+        Err(ureq::Error::Status(status, resp)) => resp
+            .into_string()
+            .map(|text| (status, text))
+            .map_err(|e| e.to_string()),
         Err(err) => Err(err.to_string()),
     }
 }
@@ -484,7 +543,16 @@ fn session_dead(value: &Value) -> bool {
         field_str(value, "message")
     )
     .to_lowercase();
-    ["重新登录", "请登录", "登录帐号", "登录账号", "login", "cookie"].iter().any(|m| text.contains(m))
+    [
+        "重新登录",
+        "请登录",
+        "登录帐号",
+        "登录账号",
+        "login",
+        "cookie",
+    ]
+    .iter()
+    .any(|m| text.contains(m))
 }
 
 fn parse_timeline(data: &Value) -> Batch {
@@ -584,8 +652,17 @@ fn push_image(out: &mut Vec<String>, raw: &str) {
 fn avatar_of(status: &Value) -> String {
     let user = &status["user"];
     let domain = user["photo_domain"].as_str().unwrap_or("");
-    let variants: Vec<&str> = user["profile_image_url"].as_str().unwrap_or("").split(',').collect();
-    let first = variants.get(1).copied().filter(|s| !s.is_empty()).or(variants.first().copied()).unwrap_or("");
+    let variants: Vec<&str> = user["profile_image_url"]
+        .as_str()
+        .unwrap_or("")
+        .split(',')
+        .collect();
+    let first = variants
+        .get(1)
+        .copied()
+        .filter(|s| !s.is_empty())
+        .or(variants.first().copied())
+        .unwrap_or("");
     if first.is_empty() {
         return String::new();
     }
@@ -625,18 +702,30 @@ pub(crate) fn published_of(value: &Value) -> String {
     match value {
         Value::Number(n) => format_unix(n.as_i64().unwrap_or(0)),
         Value::String(s) => {
-            if let Ok(n) = s.parse::<i64>() { format_unix(n) } else { s.clone() }
+            if let Ok(n) = s.parse::<i64>() {
+                format_unix(n)
+            } else {
+                s.clone()
+            }
         }
         _ => String::new(),
     }
 }
 
 fn format_unix(raw: i64) -> String {
-    let secs = if raw > 1_000_000_000_000 { raw / 1000 } else { raw } + 8 * 3600;
+    let secs = if raw > 1_000_000_000_000 {
+        raw / 1000
+    } else {
+        raw
+    } + 8 * 3600;
     let days = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400) as u32;
     let (y, m, d) = civil_from_days(days);
-    format!("{y:04}-{m:02}-{d:02} {:02}:{:02}", tod / 3600, (tod % 3600) / 60)
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02}",
+        tod / 3600,
+        (tod % 3600) / 60
+    )
 }
 
 fn civil_from_days(days: i64) -> (i32, u32, u32) {
@@ -673,11 +762,16 @@ pub fn strip_html(input: &str) -> String {
             || lower.starts_with("</li")
             || lower.starts_with("</tr")
             || lower.starts_with("</blockquote")
-            || (lower.starts_with("</h") && lower.as_bytes().get(3).is_some_and(|b| b.is_ascii_digit()))
+            || (lower.starts_with("</h")
+                && lower.as_bytes().get(3).is_some_and(|b| b.is_ascii_digit()))
         {
             out.push_str("\n\n");
         }
-        rest = if tag.contains('>') { &tag[end + 1..] } else { "" };
+        rest = if tag.contains('>') {
+            &tag[end + 1..]
+        } else {
+            ""
+        };
     }
     out.push_str(rest);
     let out = out
@@ -737,7 +831,9 @@ fn uuid() -> String {
 
 async fn store_identity(db: &Db, ident: &Identity) -> Result<(), String> {
     let raw = serde_json::to_string(ident).map_err(|e| e.to_string())?;
-    db.set_setting(IDENTITY_KEY, &raw).await.map_err(|e| e.to_string())
+    db.set_setting(IDENTITY_KEY, &raw)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
@@ -767,12 +863,21 @@ mod tests {
         assert_eq!(batch.posts[0].post_type, "post");
         assert_eq!(batch.posts[0].content, "正文\n第二行完整");
         assert_eq!(batch.posts[0].url, "https://xueqiu.com/123/11");
-        assert_eq!(batch.posts[0].images, vec!["https://xqimg.imedao.com/a.jpg".to_string(), "https://xqimg.imedao.com/b.jpg".to_string()]);
+        assert_eq!(
+            batch.posts[0].images,
+            vec![
+                "https://xqimg.imedao.com/a.jpg".to_string(),
+                "https://xqimg.imedao.com/b.jpg".to_string()
+            ]
+        );
         assert_eq!(batch.posts[0].published_at, "2024-03-10 00:00");
         assert_eq!(batch.avatar, "https://xavatar.imedao.com/b");
         assert_eq!(batch.posts[1].post_type, "reply");
         assert_eq!(batch.posts[1].content, "回复@foo: 好");
         assert_eq!(empty_sign(), "9667ca");
-        assert_eq!(normalize_id("https://xueqiu.com/u/4514680565"), "4514680565");
+        assert_eq!(
+            normalize_id("https://xueqiu.com/u/4514680565"),
+            "4514680565"
+        );
     }
 }

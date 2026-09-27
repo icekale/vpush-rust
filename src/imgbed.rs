@@ -50,41 +50,72 @@ pub async fn status(db: &Db) -> Result<Value, sqlx::Error> {
     }))
 }
 
-pub async fn save(db: &Db, input: Input<'_>, probe: fn(&str) -> String) -> Result<Value, ImgbedError> {
-    let current = status(db).await.map_err(|_| fail(500, "保存图床设置失败"))?;
+pub async fn save(
+    db: &Db,
+    input: Input<'_>,
+    probe: fn(&str) -> String,
+) -> Result<Value, ImgbedError> {
+    let current = status(db)
+        .await
+        .map_err(|_| fail(500, "保存图床设置失败"))?;
     let base_url = if input.base_url.trim().is_empty() {
         current["base_url"].as_str().unwrap_or("").to_string()
     } else {
         normalize_base(input.base_url)?
     };
     let token = if input.token.trim().is_empty() {
-        let stored = text(db, "imgbed_token").await.map_err(|_| fail(500, "保存图床设置失败"))?;
-        if !stored.is_empty() { stored } else { env_text("IMGBED_TOKEN") }
+        let stored = text(db, "imgbed_token")
+            .await
+            .map_err(|_| fail(500, "保存图床设置失败"))?;
+        if !stored.is_empty() {
+            stored
+        } else {
+            env_text("IMGBED_TOKEN")
+        }
     } else {
         clean_token(input.token)?
     };
     if token.is_empty() {
         return Err(fail(400, "请填写 API 密钥"));
     }
-    let channel_name = label(input.channel_name, current["channel_name"].as_str().unwrap_or("vpush-imgbed"), "vpush-imgbed")?;
-    let folder = label(input.folder.trim().trim_matches('/'), current["folder"].as_str().unwrap_or("vpush"), "vpush")?;
+    let channel_name = label(
+        input.channel_name,
+        current["channel_name"].as_str().unwrap_or("vpush-imgbed"),
+        "vpush-imgbed",
+    )?;
+    let folder = label(
+        input.folder.trim().trim_matches('/'),
+        current["folder"].as_str().unwrap_or("vpush"),
+        "vpush",
+    )?;
     if folder.contains("..") {
         return Err(fail(400, "目录无效"));
     }
-    let channel = current["channel"].as_str().filter(|value| !value.is_empty()).unwrap_or("telegram").to_string();
+    let channel = current["channel"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .unwrap_or("telegram")
+        .to_string();
     if let Some(days) = input.retention_days {
         if !(0..=MAX_RETENTION).contains(&days) {
             return Err(fail(400, "图片保留天数须在 0–3650"));
         }
-        db.set_setting("imgbed_retention_days", &days.to_string()).await.map_err(|_| fail(500, "保存图床设置失败"))?;
+        db.set_setting("imgbed_retention_days", &days.to_string())
+            .await
+            .map_err(|_| fail(500, "保存图床设置失败"))?;
     }
     let check = if base_url.is_empty() {
         "未配置图床地址".to_string()
     } else {
         let url = base_url.clone();
-        tokio::task::spawn_blocking(move || probe(&url)).await.unwrap_or_else(|_| "连通检查失败".into())
+        tokio::task::spawn_blocking(move || probe(&url))
+            .await
+            .unwrap_or_else(|_| "连通检查失败".into())
     };
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     for (key, value) in [
         ("imgbed_base_url", base_url.as_str()),
         ("imgbed_token", token.as_str()),
@@ -94,15 +125,22 @@ pub async fn save(db: &Db, input: Input<'_>, probe: fn(&str) -> String) -> Resul
         ("imgbed_updated_at", &now.to_string()),
         ("imgbed_last_check_error", check.as_str()),
     ] {
-        db.set_setting(key, value).await.map_err(|_| fail(500, "保存图床设置失败"))?;
+        db.set_setting(key, value)
+            .await
+            .map_err(|_| fail(500, "保存图床设置失败"))?;
     }
     status(db).await.map_err(|_| fail(500, "保存图床设置失败"))
 }
 
 pub async fn clear(db: &Db) -> Result<Value, sqlx::Error> {
     for key in [
-        "imgbed_base_url", "imgbed_token", "imgbed_channel", "imgbed_channel_name",
-        "imgbed_folder", "imgbed_updated_at", "imgbed_last_check_error",
+        "imgbed_base_url",
+        "imgbed_token",
+        "imgbed_channel",
+        "imgbed_channel_name",
+        "imgbed_folder",
+        "imgbed_updated_at",
+        "imgbed_last_check_error",
     ] {
         db.set_setting(key, "").await?;
     }
@@ -115,7 +153,8 @@ pub fn normalize_base(raw: &str) -> Result<String, ImgbedError> {
         return Err(fail(400, "图床地址须为 https 域名，不要带账号密码"));
     }
     let authority = raw[8..].split(['/', '?', '#']).next().unwrap_or("");
-    let (host, port) = split_host(authority).ok_or(fail(400, "图床地址须为 https 域名，不要带账号密码"))?;
+    let (host, port) =
+        split_host(authority).ok_or(fail(400, "图床地址须为 https 域名，不要带账号密码"))?;
     if !host_ok(&host) {
         return Err(fail(400, "图床地址不可用"));
     }
@@ -126,8 +165,17 @@ pub fn normalize_base(raw: &str) -> Result<String, ImgbedError> {
 }
 
 pub fn probe(base_url: &str) -> String {
-    let host = base_url.trim_start_matches("https://").split(['/', ':']).next().unwrap_or("");
-    if host.parse::<IpAddr>().map(|ip| !img_proxy::ip_allowed(ip)).unwrap_or(false) || !public_name(host) {
+    let host = base_url
+        .trim_start_matches("https://")
+        .split(['/', ':'])
+        .next()
+        .unwrap_or("");
+    if host
+        .parse::<IpAddr>()
+        .map(|ip| !img_proxy::ip_allowed(ip))
+        .unwrap_or(false)
+        || !public_name(host)
+    {
         return "图床地址不可用".into();
     }
     let ips = img_proxy::resolve(host);
@@ -135,6 +183,7 @@ pub fn probe(base_url: &str) -> String {
         return "图床地址不可用".into();
     }
     let agent = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(5))
         .redirects(0)
@@ -159,7 +208,9 @@ fn host_ok(host: &str) -> bool {
 }
 
 fn public_name(host: &str) -> bool {
-    let host = host.trim_matches(|c| c == '[' || c == ']').to_ascii_lowercase();
+    let host = host
+        .trim_matches(|c| c == '[' || c == ']')
+        .to_ascii_lowercase();
     !host.is_empty()
         && host != "localhost"
         && !host.ends_with(".local")
@@ -173,14 +224,20 @@ fn split_host(authority: &str) -> Option<(String, Option<u16>)> {
         (host.to_ascii_lowercase(), port)
     } else {
         match authority.rsplit_once(':') {
-            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => (host.to_ascii_lowercase(), port),
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => {
+                (host.to_ascii_lowercase(), port)
+            }
             _ => (authority.to_ascii_lowercase(), ""),
         }
     };
     if host.is_empty() || host.contains(':') {
         return None;
     }
-    let port = if port.is_empty() { None } else { Some(port.parse().ok()?) };
+    let port = if port.is_empty() {
+        None
+    } else {
+        Some(port.parse().ok()?)
+    };
     if port.is_some_and(|port| port == 0) {
         return None;
     }
@@ -197,19 +254,36 @@ fn clean_token(raw: &str) -> Result<String, ImgbedError> {
 
 fn label(raw: &str, current: &str, default: &str) -> Result<String, ImgbedError> {
     let value = raw.trim();
-    let value = if value.is_empty() { if current.is_empty() { default } else { current } } else { value };
-    if value.len() > 64 || value.chars().any(|c| c.is_control() || c == '/' || c == '\\') {
+    let value = if value.is_empty() {
+        if current.is_empty() {
+            default
+        } else {
+            current
+        }
+    } else {
+        value
+    };
+    if value.len() > 64
+        || value
+            .chars()
+            .any(|c| c.is_control() || c == '/' || c == '\\')
+    {
         return Err(fail(400, "图床渠道或目录无效"));
     }
     Ok(value.to_string())
 }
 
 fn retention(raw: &str) -> i64 {
-    raw.parse::<i64>().ok().filter(|days| (0..=MAX_RETENTION).contains(days)).unwrap_or(30)
+    raw.parse::<i64>()
+        .ok()
+        .filter(|days| (0..=MAX_RETENTION).contains(days))
+        .unwrap_or(30)
 }
 
 fn fallback(stored: &str, env: &str, default: &str) -> String {
-    nonempty(stored).or_else(|| nonempty(env)).unwrap_or_else(|| default.to_string())
+    nonempty(stored)
+        .or_else(|| nonempty(env))
+        .unwrap_or_else(|| default.to_string())
 }
 
 fn nonempty(value: &str) -> Option<String> {
@@ -244,15 +318,29 @@ pub async fn runtime(db: &Db) -> Option<Runtime> {
     if current["enabled"] != true {
         return None;
     }
-    let token = text(db, "imgbed_token").await.ok().filter(|value| !value.is_empty()).unwrap_or_else(env_token);
+    let token = text(db, "imgbed_token")
+        .await
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(env_token);
     if token.is_empty() {
         return None;
     }
     Some(Runtime {
-        base_url: current["base_url"].as_str().unwrap_or("").trim_end_matches('/').to_string(),
+        base_url: current["base_url"]
+            .as_str()
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .to_string(),
         token,
-        channel: current["channel"].as_str().unwrap_or("telegram").to_string(),
-        channel_name: current["channel_name"].as_str().unwrap_or("vpush-imgbed").to_string(),
+        channel: current["channel"]
+            .as_str()
+            .unwrap_or("telegram")
+            .to_string(),
+        channel_name: current["channel_name"]
+            .as_str()
+            .unwrap_or("vpush-imgbed")
+            .to_string(),
         folder: current["folder"].as_str().unwrap_or("vpush").to_string(),
         retention_days: current["retention_days"].as_i64().unwrap_or(30),
     })
@@ -262,7 +350,13 @@ fn env_token() -> String {
     env_text("IMGBED_TOKEN")
 }
 
-pub async fn process_due<D, U, R>(db: &Db, retention_days: i64, mut download: D, mut upload: U, mut remove: R) -> Result<usize, sqlx::Error>
+pub async fn process_due<D, U, R>(
+    db: &Db,
+    retention_days: i64,
+    mut download: D,
+    mut upload: U,
+    mut remove: R,
+) -> Result<usize, sqlx::Error>
 where
     D: FnMut(&str) -> Result<(Vec<u8>, String), String>,
     U: FnMut(&str, &[u8], &str) -> Result<String, String>,
@@ -281,7 +375,10 @@ where
         for row in expired {
             let hosted: String = row.get("hosted_url");
             if remove(hosted.as_str()) {
-                sqlx::query("DELETE FROM hosted_images WHERE source_url = ?").bind(row.get::<String, _>("source_url")).execute(db.pool()).await?;
+                sqlx::query("DELETE FROM hosted_images WHERE source_url = ?")
+                    .bind(row.get::<String, _>("source_url"))
+                    .execute(db.pool())
+                    .await?;
             }
         }
     }
@@ -355,6 +452,7 @@ pub fn live_download(url: &str) -> Result<(Vec<u8>, String), String> {
         return Err("源图下载失败".into());
     }
     let response = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
         .timeout(std::time::Duration::from_secs(15))
         .redirects(0)
         .build()
@@ -365,11 +463,28 @@ pub fn live_download(url: &str) -> Result<(Vec<u8>, String), String> {
             ureq::Error::Status(code, _) => format!("源图下载失败 HTTP {code}"),
             _ => "源图下载失败".into(),
         })?;
-    let kind = response.content_type().split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    let max = if kind == "video/mp4" { 50_000_000 } else { 8_000_000 };
+    let kind = response
+        .content_type()
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let max = if kind == "video/mp4" {
+        50_000_000
+    } else {
+        8_000_000
+    };
     let mut bytes = Vec::new();
-    response.into_reader().take(max).read_to_end(&mut bytes).map_err(|_| "源图下载失败".to_string())?;
-    if !matches!(kind.as_str(), "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4") {
+    response
+        .into_reader()
+        .take(max)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "源图下载失败".to_string())?;
+    if !matches!(
+        kind.as_str(),
+        "image/jpeg" | "image/png" | "image/gif" | "image/webp" | "video/mp4"
+    ) {
         return Err(format!("非图片内容 {kind}"));
     }
     if bytes.len() <= 2048 {
@@ -378,7 +493,12 @@ pub fn live_download(url: &str) -> Result<(Vec<u8>, String), String> {
     Ok((bytes, kind))
 }
 
-pub fn live_upload(cfg: &Runtime, source_url: &str, bytes: &[u8], kind: &str) -> Result<String, String> {
+pub fn live_upload(
+    cfg: &Runtime,
+    source_url: &str,
+    bytes: &[u8],
+    kind: &str,
+) -> Result<String, String> {
     use sha2::{Digest, Sha256};
     let ext = match kind {
         "image/jpeg" => "jpg",
@@ -388,7 +508,10 @@ pub fn live_upload(cfg: &Runtime, source_url: &str, bytes: &[u8], kind: &str) ->
         "video/mp4" => "mp4",
         _ => return Err("非图片内容".into()),
     };
-    let name = format!("{}.{ext}", &hex::encode(Sha256::digest(source_url.as_bytes()))[..16]);
+    let name = format!(
+        "{}.{ext}",
+        &hex::encode(Sha256::digest(source_url.as_bytes()))[..16]
+    );
     let boundary = "vpushimgbedboundary";
     let mut body = Vec::new();
     body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: {kind}\r\n\r\n").as_bytes());
@@ -402,20 +525,27 @@ pub fn live_upload(cfg: &Runtime, source_url: &str, bytes: &[u8], kind: &str) ->
         urlencoding(&cfg.folder)
     );
     let response = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
         .timeout(std::time::Duration::from_secs(30))
         .redirects(0)
         .build()
         .post(&url)
         .set("Authorization", &format!("Bearer {}", cfg.token))
-        .set("Content-Type", &format!("multipart/form-data; boundary={boundary}"))
+        .set(
+            "Content-Type",
+            &format!("multipart/form-data; boundary={boundary}"),
+        )
         .set("Origin", &cfg.base_url)
         .send_bytes(&body)
         .map_err(|err| match err {
             ureq::Error::Status(code, _) => format!("图床上传失败 HTTP {code}"),
             _ => "图床上传失败".into(),
         })?;
-    let text = response.into_string().map_err(|_| "图床上传响应不是 JSON".to_string())?;
-    let payload: Value = serde_json::from_str(&text).map_err(|_| "图床上传响应不是 JSON".to_string())?;
+    let text = response
+        .into_string()
+        .map_err(|_| "图床上传响应不是 JSON".to_string())?;
+    let payload: Value =
+        serde_json::from_str(&text).map_err(|_| "图床上传响应不是 JSON".to_string())?;
     let hosted = hosted_url(&payload, &cfg.base_url);
     if hosted.is_empty() {
         return Err("图床上传未返回公开地址".into());
@@ -427,10 +557,17 @@ pub fn live_upload(cfg: &Runtime, source_url: &str, bytes: &[u8], kind: &str) ->
 }
 
 fn hosted_url(payload: &Value, base_url: &str) -> String {
-    let items = payload.as_array().map(|items| items.as_slice()).unwrap_or(std::slice::from_ref(payload));
+    let items = payload
+        .as_array()
+        .map(|items| items.as_slice())
+        .unwrap_or(std::slice::from_ref(payload));
     for item in items {
         for key in ["publicUrl", "src"] {
-            let raw = item.get(key).and_then(|value| value.as_str()).unwrap_or("").trim();
+            let raw = item
+                .get(key)
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim();
             if raw.is_empty() {
                 continue;
             }
@@ -452,8 +589,20 @@ pub fn live_delete(cfg: &Runtime, hosted_url: &str) -> bool {
     if path.is_empty() {
         return true;
     }
-    let url = format!("{}/api/manage/delete/{}", cfg.base_url, urlencoding_path(path));
-    match ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).redirects(0).build().get(&url).set("Authorization", &format!("Bearer {}", cfg.token)).call() {
+    let url = format!(
+        "{}/api/manage/delete/{}",
+        cfg.base_url,
+        urlencoding_path(path)
+    );
+    match ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
+        .timeout(std::time::Duration::from_secs(15))
+        .redirects(0)
+        .build()
+        .get(&url)
+        .set("Authorization", &format!("Bearer {}", cfg.token))
+        .call()
+    {
         Ok(_) => true,
         Err(ureq::Error::Status(code, _)) if code == 404 || code == 410 => true,
         _ => false,
@@ -473,7 +622,11 @@ fn urlencoding(value: &str) -> String {
 }
 
 fn urlencoding_path(value: &str) -> String {
-    value.split('/').map(urlencoding).collect::<Vec<_>>().join("/")
+    value
+        .split('/')
+        .map(urlencoding)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -496,7 +649,10 @@ mod tests {
         assert!(normalize_base("https://10.1.2.3").is_err());
         assert!(normalize_base("https://169.254.169.254").is_err());
         assert!(normalize_base("https://localhost").is_err());
-        assert_eq!(normalize_base("https://img.example.com/path").unwrap(), "https://img.example.com");
+        assert_eq!(
+            normalize_base("https://img.example.com/path").unwrap(),
+            "https://img.example.com"
+        );
     }
 
     #[tokio::test]
@@ -504,12 +660,30 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-imgbed-{}-{}.db",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
-        let input = Input { base_url: "https://img.example.com", token: "", channel_name: "", folder: "", retention_days: Some(30) };
-        assert_eq!(save(&db, input, quiet).await.unwrap_err().detail, "请填写 API 密钥");
-        let input = Input { base_url: "https://img.example.com/app", token: "secret-token", channel_name: "desk", folder: "vpush", retention_days: Some(7) };
+        let input = Input {
+            base_url: "https://img.example.com",
+            token: "",
+            channel_name: "",
+            folder: "",
+            retention_days: Some(30),
+        };
+        assert_eq!(
+            save(&db, input, quiet).await.unwrap_err().detail,
+            "请填写 API 密钥"
+        );
+        let input = Input {
+            base_url: "https://img.example.com/app",
+            token: "secret-token",
+            channel_name: "desk",
+            folder: "vpush",
+            retention_days: Some(7),
+        };
         let saved = save(&db, input, down).await.unwrap();
         let body = saved.to_string();
         assert!(!body.contains("secret-token"));
@@ -519,11 +693,37 @@ mod tests {
         assert_eq!(saved["last_check_error"], "图床返回 HTTP 503");
         assert_eq!(saved["retention_days"], 7);
         assert_eq!(saved["channel_name"], "desk");
-        let kept = save(&db, Input { base_url: "", token: "", channel_name: "", folder: "", retention_days: None }, quiet).await.unwrap();
+        let kept = save(
+            &db,
+            Input {
+                base_url: "",
+                token: "",
+                channel_name: "",
+                folder: "",
+                retention_days: None,
+            },
+            quiet,
+        )
+        .await
+        .unwrap();
         assert_eq!(kept["token_set"], true);
         assert_eq!(kept["last_check_error"], "");
-        assert!(save(&db, Input { base_url: "https://img.example.com", token: "x", channel_name: "", folder: "", retention_days: Some(3651) }, quiet).await.is_err());
-        db.note_hosted_image("https://pbs.twimg.com/a.jpg", "failed").await.unwrap();
+        assert!(save(
+            &db,
+            Input {
+                base_url: "https://img.example.com",
+                token: "x",
+                channel_name: "",
+                folder: "",
+                retention_days: Some(3651)
+            },
+            quiet
+        )
+        .await
+        .is_err());
+        db.note_hosted_image("https://pbs.twimg.com/a.jpg", "failed")
+            .await
+            .unwrap();
         let cleared = clear(&db).await.unwrap();
         assert_eq!(cleared["enabled"], false);
         assert_eq!(cleared["failed_count"], 1);
@@ -535,7 +735,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-mirror-{}-{}.db",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         sqlx::query(
@@ -559,9 +762,11 @@ mod tests {
             &db,
             1,
             |url| {
-                if url.ends_with("same.jpg") { Ok((bytes.clone(), "image/jpeg".into())) }
-                else if url.ends_with("new.jpg") { Ok((bytes.clone(), "image/jpeg".into())) }
-                else { Err("超时".into()) }
+                if url.ends_with("same.jpg") || url.ends_with("new.jpg") {
+                    Ok((bytes.clone(), "image/jpeg".into()))
+                } else {
+                    Err("超时".into())
+                }
             },
             |url, _, _| {
                 uploads += 1;
@@ -579,11 +784,29 @@ mod tests {
         assert_eq!(removed, 1);
         let reused: String = sqlx::query_scalar("SELECT hosted_url FROM hosted_images WHERE source_url = 'https://cdn.example/same.jpg'").fetch_one(db.pool()).await.unwrap();
         assert!(reused.contains("new.jpg") || reused.contains("same.jpg"));
-        let waiting: i64 = sqlx::query_scalar("SELECT attempts FROM hosted_images WHERE source_url = 'https://cdn.example/soon.jpg'").fetch_one(db.pool()).await.unwrap();
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT attempts FROM hosted_images WHERE source_url = 'https://cdn.example/soon.jpg'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(waiting, 1);
-        let gone: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hosted_images WHERE source_url = 'https://cdn.example/old.jpg'").fetch_one(db.pool()).await.unwrap();
+        let gone: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM hosted_images WHERE source_url = 'https://cdn.example/old.jpg'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
         assert_eq!(gone, 0);
-        let kept = process_due(&db, 1, |_| Err("远端拒绝".into()), |_, _, _| Ok(String::new()), |_| false).await.unwrap();
+        let kept = process_due(
+            &db,
+            1,
+            |_| Err("远端拒绝".into()),
+            |_, _, _| Ok(String::new()),
+            |_| false,
+        )
+        .await
+        .unwrap();
         assert_eq!(kept, 0);
         let error: String = sqlx::query_scalar("SELECT last_error FROM hosted_images WHERE source_url = 'https://cdn.example/soon.jpg'").fetch_one(db.pool()).await.unwrap();
         assert!(error.is_empty());

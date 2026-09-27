@@ -19,9 +19,21 @@ pub async fn credentials(db: &Db) -> Result<Value, sqlx::Error> {
     let cookie = saved(db, "ima_cookie").await?;
     let client_id = saved(db, "ima_openapi_clientid").await?;
     let api_key = saved(db, "ima_openapi_apikey").await?;
-    let cookie_value = if cookie.is_empty() { env_text("IMA_COOKIE") } else { cookie.clone() };
-    let client_value = if client_id.is_empty() { env_text("IMA_OPENAPI_CLIENTID") } else { client_id.clone() };
-    let key_value = if api_key.is_empty() { env_text("IMA_OPENAPI_APIKEY") } else { api_key };
+    let cookie_value = if cookie.is_empty() {
+        env_text("IMA_COOKIE")
+    } else {
+        cookie.clone()
+    };
+    let client_value = if client_id.is_empty() {
+        env_text("IMA_OPENAPI_CLIENTID")
+    } else {
+        client_id.clone()
+    };
+    let key_value = if api_key.is_empty() {
+        env_text("IMA_OPENAPI_APIKEY")
+    } else {
+        api_key
+    };
     let mode = if !client_value.is_empty() && !key_value.is_empty() {
         "openapi"
     } else if !cookie_value.is_empty() {
@@ -42,23 +54,38 @@ pub async fn credentials(db: &Db) -> Result<Value, sqlx::Error> {
     }))
 }
 
-pub async fn save_credentials(db: &Db, cookie: &str, client_id: &str, api_key: &str) -> Result<(), AdminError> {
+pub async fn save_credentials(
+    db: &Db,
+    cookie: &str,
+    client_id: &str,
+    api_key: &str,
+) -> Result<(), AdminError> {
     let cookie = clean(cookie, 8192, "Cookie 无效")?;
     let client_id = clean(client_id, 256, "OpenAPI clientid 无效")?;
     let api_key = clean(api_key, 256, "OpenAPI apikey 无效")?;
     if cookie.is_empty() && (client_id.is_empty() || api_key.is_empty()) {
-        return Err(bad("需至少提供 ima Cookie 或 OpenAPI 凭证（clientid + apikey）"));
+        return Err(bad(
+            "需至少提供 ima Cookie 或 OpenAPI 凭证（clientid + apikey）",
+        ));
     }
     if client_id.is_empty() != api_key.is_empty() {
         return Err(bad("OpenAPI 凭证需同时提供 clientid 与 apikey"));
     }
     if !cookie.is_empty() {
-        db.set_setting("ima_cookie", &cookie).await.map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
-        db.set_setting("ima_cookie_updated_at", &now_secs().to_string()).await.map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
+        db.set_setting("ima_cookie", &cookie)
+            .await
+            .map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
+        db.set_setting("ima_cookie_updated_at", &now_secs().to_string())
+            .await
+            .map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
     }
     if !client_id.is_empty() {
-        db.set_setting("ima_openapi_clientid", &client_id).await.map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
-        db.set_setting("ima_openapi_apikey", &api_key).await.map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
+        db.set_setting("ima_openapi_clientid", &client_id)
+            .await
+            .map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
+        db.set_setting("ima_openapi_apikey", &api_key)
+            .await
+            .map_err(|_| fail(500, "保存 IMA 凭证失败"))?;
     }
     Ok(())
 }
@@ -88,7 +115,9 @@ pub async fn scan(db: &Db, archive: &Path) -> Result<Value, AdminError> {
     let mut libraries = Vec::new();
     for entry in found.flatten() {
         let path = entry.path();
-        let Ok(kind) = entry.file_type() else { continue };
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
         if !kind.is_dir() || kind.is_symlink() {
             continue;
         }
@@ -100,7 +129,12 @@ pub async fn scan(db: &Db, archive: &Path) -> Result<Value, AdminError> {
             libraries.push(item);
         }
     }
-    libraries.sort_by(|left, right| left["slug"].as_str().unwrap_or("").cmp(right["slug"].as_str().unwrap_or("")));
+    libraries.sort_by(|left, right| {
+        left["slug"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(right["slug"].as_str().unwrap_or(""))
+    });
     let payload = json!({"scanned_at": iso_now(), "status": "finished", "libraries": libraries});
     save_libraries(db, &payload).await?;
     let mut payload = payload;
@@ -108,7 +142,13 @@ pub async fn scan(db: &Db, archive: &Path) -> Result<Value, AdminError> {
     Ok(payload)
 }
 
-pub async fn create(db: &Db, archive: &Path, slug: &str, name: &str, tags: &[String]) -> Result<Value, AdminError> {
+pub async fn create(
+    db: &Db,
+    archive: &Path,
+    slug: &str,
+    name: &str,
+    tags: &[String],
+) -> Result<Value, AdminError> {
     let slug = slug.trim().to_ascii_lowercase();
     if !slug_ok(&slug) {
         return Err(bad("slug 需为小写字母/数字/短横线（1-47 位）"));
@@ -123,7 +163,10 @@ pub async fn create(db: &Db, archive: &Path, slug: &str, name: &str, tags: &[Str
     match fs::create_dir(&dir) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(AdminError { status: 409, detail: format!("本地库已存在：{slug}") });
+            return Err(AdminError {
+                status: 409,
+                detail: format!("本地库已存在：{slug}"),
+            });
         }
         Err(_) => return Err(fail(502, "存储归档写入失败")),
     }
@@ -131,7 +174,12 @@ pub async fn create(db: &Db, archive: &Path, slug: &str, name: &str, tags: &[Str
     scan(db, archive).await
 }
 
-pub async fn set_enabled(db: &Db, archive: &Path, slug: &str, enabled: bool) -> Result<Value, AdminError> {
+pub async fn set_enabled(
+    db: &Db,
+    archive: &Path,
+    slug: &str,
+    enabled: bool,
+) -> Result<Value, AdminError> {
     let dir = library_dir(archive, slug)?;
     let mut marker = read_marker(&dir)?;
     marker["enabled"] = json!(enabled);
@@ -139,7 +187,13 @@ pub async fn set_enabled(db: &Db, archive: &Path, slug: &str, enabled: bool) -> 
     scan(db, archive).await
 }
 
-pub async fn update(db: &Db, archive: &Path, slug: &str, name: Option<&str>, tags: Option<&[String]>) -> Result<Value, AdminError> {
+pub async fn update(
+    db: &Db,
+    archive: &Path,
+    slug: &str,
+    name: Option<&str>,
+    tags: Option<&[String]>,
+) -> Result<Value, AdminError> {
     if name.is_none() && tags.is_none() {
         return Err(bad("name 与 tags 至少填一项"));
     }
@@ -201,9 +255,18 @@ fn read_library(path: &Path, slug: &str) -> Option<Value> {
     }
     item["name"] = json!(name);
     item["enabled"] = json!(marker["enabled"] == true);
-    item["tags"] = marker["tags"].as_array().map(|tags| {
-        Value::Array(tags.iter().filter_map(|tag| tag.as_str().map(str::trim)).filter(|tag| !tag.is_empty()).map(|tag| json!(tag)).collect())
-    }).unwrap_or(json!([]));
+    item["tags"] = marker["tags"]
+        .as_array()
+        .map(|tags| {
+            Value::Array(
+                tags.iter()
+                    .filter_map(|tag| tag.as_str().map(str::trim))
+                    .filter(|tag| !tag.is_empty())
+                    .map(|tag| json!(tag))
+                    .collect(),
+            )
+        })
+        .unwrap_or(json!([]));
     item["pdf_count"] = json!(count_pdfs(path));
     Some(item)
 }
@@ -212,9 +275,13 @@ fn count_pdfs(root: &Path) -> i64 {
     let mut count = 0_i64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
-            let Ok(kind) = entry.file_type() else { continue };
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
             if kind.is_symlink() {
                 continue;
             }
@@ -235,11 +302,17 @@ fn count_pdfs(root: &Path) -> i64 {
 
 fn library_dir(archive: &Path, slug: &str) -> Result<PathBuf, AdminError> {
     if !slug_ok(slug) {
-        return Err(AdminError { status: 404, detail: "本地库不存在".into() });
+        return Err(AdminError {
+            status: 404,
+            detail: "本地库不存在".into(),
+        });
     }
     let dir = archive.join("local").join(slug);
     if !dir.join(MARKER).is_file() {
-        return Err(AdminError { status: 404, detail: "本地库不存在".into() });
+        return Err(AdminError {
+            status: 404,
+            detail: "本地库不存在".into(),
+        });
     }
     Ok(dir)
 }
@@ -250,7 +323,10 @@ fn read_marker(dir: &Path) -> Result<Value, AdminError> {
 }
 
 fn write_marker(dir: &Path, name: &str, enabled: bool, tags: &[String]) -> Result<(), AdminError> {
-    write_marker_value(dir, &json!({"name": name, "enabled": enabled, "tags": tags}))
+    write_marker_value(
+        dir,
+        &json!({"name": name, "enabled": enabled, "tags": tags}),
+    )
 }
 
 fn write_marker_value(dir: &Path, marker: &Value) -> Result<(), AdminError> {
@@ -260,8 +336,13 @@ fn write_marker_value(dir: &Path, marker: &Value) -> Result<(), AdminError> {
 }
 
 async fn stored(db: &Db) -> Result<Value, AdminError> {
-    let raw = db.setting(SETTING).await.map_err(|_| fail(500, "读取本地库失败"))?.unwrap_or_default();
-    let mut payload = serde_json::from_str::<Value>(&raw).unwrap_or_else(|_| json!({"scanned_at": "", "libraries": []}));
+    let raw = db
+        .setting(SETTING)
+        .await
+        .map_err(|_| fail(500, "读取本地库失败"))?
+        .unwrap_or_default();
+    let mut payload = serde_json::from_str::<Value>(&raw)
+        .unwrap_or_else(|_| json!({"scanned_at": "", "libraries": []}));
     if !payload["libraries"].is_array() {
         payload["libraries"] = json!([]);
     }
@@ -274,14 +355,21 @@ async fn stored(db: &Db) -> Result<Value, AdminError> {
 async fn save_libraries(db: &Db, payload: &Value) -> Result<(), AdminError> {
     let mut stored = payload.clone();
     stored.as_object_mut().map(|obj| obj.remove("status"));
-    db.set_setting(SETTING, &stored.to_string()).await.map_err(|_| fail(500, "保存本地库失败"))
+    db.set_setting(SETTING, &stored.to_string())
+        .await
+        .map_err(|_| fail(500, "保存本地库失败"))
 }
 
 async fn attach_acl(db: &Db, payload: &mut Value) -> Result<(), AdminError> {
-    let Some(rows) = payload["libraries"].as_array_mut() else { return Ok(()) };
+    let Some(rows) = payload["libraries"].as_array_mut() else {
+        return Ok(());
+    };
     for row in rows {
         let group = row["group_id"].as_str().unwrap_or("").to_string();
-        let names = db.ima_kb_acl_usernames(&group).await.map_err(|_| fail(500, "读取本地库失败"))?;
+        let names = db
+            .ima_kb_acl_usernames(&group)
+            .await
+            .map_err(|_| fail(500, "读取本地库失败"))?;
         row["acl_usernames"] = json!(names);
     }
     Ok(())
@@ -289,10 +377,14 @@ async fn attach_acl(db: &Db, payload: &mut Value) -> Result<(), AdminError> {
 
 fn slug_ok(slug: &str) -> bool {
     let mut chars = slug.chars();
-    let Some(first) = chars.next() else { return false };
+    let Some(first) = chars.next() else {
+        return false;
+    };
     (first.is_ascii_lowercase() || first.is_ascii_digit())
         && slug.len() <= 47
-        && slug.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && slug
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
 fn clean_tags(tags: &[String]) -> Result<Vec<String>, AdminError> {
@@ -339,7 +431,10 @@ fn env_text(key: &str) -> String {
 }
 
 fn now_secs() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn iso_now() -> String {
@@ -351,7 +446,12 @@ fn chrono_lite(secs: u64) -> String {
     let days = secs / 86_400;
     let rem = secs % 86_400;
     let (year, month, day) = civil_date(days);
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z", rem / 3600, (rem % 3600) / 60, rem % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 fn civil_date(days: u64) -> (i32, u32, u32) {
@@ -373,7 +473,10 @@ fn bad(detail: &'static str) -> AdminError {
 }
 
 fn fail(status: u16, detail: &'static str) -> AdminError {
-    AdminError { status, detail: detail.into() }
+    AdminError {
+        status,
+        detail: detail.into(),
+    }
 }
 
 #[cfg(test)]
@@ -384,7 +487,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-ima-admin-{}-{}.db",
             std::process::id(),
-            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         (Db::open(&path).await.unwrap(), path)
     }
@@ -393,10 +499,22 @@ mod tests {
     async fn credentials_are_saved_but_not_returned() {
         let (db, path) = db().await;
         let err = save_credentials(&db, "", "only-id", "").await.unwrap_err();
-        assert_eq!(err.detail, "需至少提供 ima Cookie 或 OpenAPI 凭证（clientid + apikey）");
-        let err = save_credentials(&db, "IMA-TOKEN=secret", "only-id", "").await.unwrap_err();
+        assert_eq!(
+            err.detail,
+            "需至少提供 ima Cookie 或 OpenAPI 凭证（clientid + apikey）"
+        );
+        let err = save_credentials(&db, "IMA-TOKEN=secret", "only-id", "")
+            .await
+            .unwrap_err();
         assert_eq!(err.detail, "OpenAPI 凭证需同时提供 clientid 与 apikey");
-        save_credentials(&db, "IMA-TOKEN=secret", "client-id-preview", "api-key-secret").await.unwrap();
+        save_credentials(
+            &db,
+            "IMA-TOKEN=secret",
+            "client-id-preview",
+            "api-key-secret",
+        )
+        .await
+        .unwrap();
         let view = credentials(&db).await.unwrap();
         let body = view.to_string();
         assert!(!body.contains("secret"));
@@ -412,8 +530,20 @@ mod tests {
     #[tokio::test]
     async fn local_library_round_trip_counts_pdfs() {
         let (db, db_path) = db().await;
-        let root = std::env::temp_dir().join(format!("vpush-ima-libs-{}-{}", std::process::id(), now_secs()));
-        let created = create(&db, &root, "My-Papers", "论文库", &["研报".into(), "研报".into()]).await.unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "vpush-ima-libs-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let created = create(
+            &db,
+            &root,
+            "My-Papers",
+            "论文库",
+            &["研报".into(), "研报".into()],
+        )
+        .await
+        .unwrap();
         let lib = &created["libraries"][0];
         assert_eq!(lib["slug"], "my-papers");
         assert_eq!(lib["name"], "论文库");
@@ -422,7 +552,9 @@ mod tests {
         assert_eq!(lib["tags"], json!(["研报"]));
         fs::write(root.join("local/my-papers/note.pdf"), b"%PDF").unwrap();
         fs::write(root.join("local/my-papers/skip.txt"), b"no").unwrap();
-        let updated = update(&db, &root, "my-papers", Some("新论文库"), None).await.unwrap();
+        let updated = update(&db, &root, "my-papers", Some("新论文库"), None)
+            .await
+            .unwrap();
         assert_eq!(updated["libraries"][0]["name"], "新论文库");
         assert_eq!(updated["libraries"][0]["pdf_count"], 1);
         let enabled = set_enabled(&db, &root, "my-papers", true).await.unwrap();

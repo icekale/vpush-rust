@@ -6,7 +6,9 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD};
+#[cfg(test)]
+use base64::engine::general_purpose::URL_SAFE;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -17,7 +19,8 @@ use crate::feishu_personal::{credential_key, open_app_secret, seal};
 
 const AUTHORIZE: &str = "https://accounts.feishu.cn/open-apis/authen/v1/authorize";
 const TOKEN_URL: &str = "https://open.feishu.cn/open-apis/authen/v2/oauth/token";
-const DEFAULT_SCOPES: &str = "wiki:node:read docx:document:readonly docs:document.media:download offline_access";
+const DEFAULT_SCOPES: &str =
+    "wiki:node:read docx:document:readonly docs:document.media:download offline_access";
 
 #[derive(Debug)]
 pub struct Fail {
@@ -27,15 +30,29 @@ pub struct Fail {
 
 pub fn parse_url(raw: &str) -> Result<Parsed, Fail> {
     let raw = raw.trim();
-    let rest = raw.strip_prefix("https://").ok_or(fail(400, "只支持飞书或 Lark 的 HTTPS 文档链接"))?;
-    let (host, path) = rest.split_once('/').ok_or(fail(400, "链接必须是 /wiki/{token} 或 /docx/{token}"))?;
-    let host = host.split(':').next().unwrap_or("").trim_end_matches('.').to_ascii_lowercase();
+    let rest = raw
+        .strip_prefix("https://")
+        .ok_or(fail(400, "只支持飞书或 Lark 的 HTTPS 文档链接"))?;
+    let (host, path) = rest
+        .split_once('/')
+        .ok_or(fail(400, "链接必须是 /wiki/{token} 或 /docx/{token}"))?;
+    let host = host
+        .split(':')
+        .next()
+        .unwrap_or("")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     if !trusted_host(&host) {
         return Err(fail(400, "只支持飞书或 Lark 的 HTTPS 文档链接"));
     }
     let mut parts = path.split('/').filter(|part| !part.is_empty());
     let kind = parts.next().unwrap_or("");
-    let token = parts.next().unwrap_or("").split(['?', '#']).next().unwrap_or("");
+    let token = parts
+        .next()
+        .unwrap_or("")
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("");
     if parts.next().is_some() || (kind != "wiki" && kind != "docx") || !valid_token(token) {
         return Err(fail(400, "链接必须是 /wiki/{token} 或 /docx/{token}"));
     }
@@ -93,16 +110,24 @@ pub async fn save_config(db: &Db, input: Save<'_>) -> Result<Value, Fail> {
         if app_id != previous {
             changed_credentials = true;
         }
-        db.set_setting("feishu_docs_app_id", app_id).await.map_err(|_| fail(400, "飞书文档配置保存失败"))?;
+        db.set_setting("feishu_docs_app_id", app_id)
+            .await
+            .map_err(|_| fail(400, "飞书文档配置保存失败"))?;
         wrote = true;
     }
-    if let Some(secret) = input.app_secret.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(secret) = input
+        .app_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         if secret.len() > 256 {
             return Err(fail(400, "App Secret 过长"));
         }
         let key = credential_key().ok_or(fail(400, "未配置 FEISHU_CREDENTIAL_KEY"))?;
         let sealed = seal(&key, secret).map_err(|_| fail(400, "无法加密 App Secret"))?;
-        db.set_setting("feishu_docs_app_secret", &sealed).await.map_err(|_| fail(400, "飞书文档配置保存失败"))?;
+        db.set_setting("feishu_docs_app_secret", &sealed)
+            .await
+            .map_err(|_| fail(400, "飞书文档配置保存失败"))?;
         changed_credentials = true;
         wrote = true;
     }
@@ -114,7 +139,9 @@ pub async fn save_config(db: &Db, input: Save<'_>) -> Result<Value, Fail> {
         if redirect.len() > 512 {
             return Err(fail(400, "回调地址过长"));
         }
-        db.set_setting("feishu_docs_redirect_uri", redirect).await.map_err(|_| fail(400, "飞书文档配置保存失败"))?;
+        db.set_setting("feishu_docs_redirect_uri", redirect)
+            .await
+            .map_err(|_| fail(400, "飞书文档配置保存失败"))?;
         wrote = true;
     }
     if let Some(scopes) = input.scopes {
@@ -125,14 +152,18 @@ pub async fn save_config(db: &Db, input: Save<'_>) -> Result<Value, Fail> {
         if scopes.len() > 500 {
             return Err(fail(400, "授权权限列表过长"));
         }
-        db.set_setting("feishu_docs_scopes", &scopes).await.map_err(|_| fail(400, "飞书文档配置保存失败"))?;
+        db.set_setting("feishu_docs_scopes", &scopes)
+            .await
+            .map_err(|_| fail(400, "飞书文档配置保存失败"))?;
         wrote = true;
     }
     if let Some(interval) = input.interval_seconds {
         if !(15..=86400).contains(&interval) {
             return Err(fail(400, "检查间隔需在 15–86400 秒之间"));
         }
-        db.set_setting("feishu_docs_interval_seconds", &interval.to_string()).await.map_err(|_| fail(400, "飞书文档配置保存失败"))?;
+        db.set_setting("feishu_docs_interval_seconds", &interval.to_string())
+            .await
+            .map_err(|_| fail(400, "飞书文档配置保存失败"))?;
         wrote = true;
     }
     if !wrote {
@@ -140,7 +171,10 @@ pub async fn save_config(db: &Db, input: Save<'_>) -> Result<Value, Fail> {
     }
     let had_credential = credential_live(db).await?;
     if changed_credentials && had_credential {
-        sqlx::query("DELETE FROM feishu_oauth_credentials").execute(db.pool()).await.map_err(|_| fail(400, "飞书文档配置保存失败"))?;
+        sqlx::query("DELETE FROM feishu_oauth_credentials")
+            .execute(db.pool())
+            .await
+            .map_err(|_| fail(400, "飞书文档配置保存失败"))?;
     }
     let cfg = config(db).await?;
     Ok(json!({
@@ -185,20 +219,31 @@ pub async fn take_session(db: &Db, state: &str, cookie_hash: &str) -> Result<Str
     if state.is_empty() || cookie_hash != state_hash {
         return Err(fail(400, "飞书授权请求已过期或已使用"));
     }
-    let row = sqlx::query("SELECT user_id, code_verifier, expires_at FROM feishu_oauth_sessions WHERE state_hash = ?")
-        .bind(&state_hash)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| fail(400, "飞书授权失败"))?;
-    let Some(row) = row else { return Err(fail(400, "飞书授权请求已过期或已使用")); };
+    let row = sqlx::query(
+        "SELECT user_id, code_verifier, expires_at FROM feishu_oauth_sessions WHERE state_hash = ?",
+    )
+    .bind(&state_hash)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|_| fail(400, "飞书授权失败"))?;
+    let Some(row) = row else {
+        return Err(fail(400, "飞书授权请求已过期或已使用"));
+    };
     let expires: i64 = row.get("expires_at");
     let user_id: i64 = row.get("user_id");
     let verifier: String = row.get("code_verifier");
-    sqlx::query("DELETE FROM feishu_oauth_sessions WHERE state_hash = ?").bind(&state_hash).execute(db.pool()).await.map_err(|_| fail(400, "飞书授权失败"))?;
+    sqlx::query("DELETE FROM feishu_oauth_sessions WHERE state_hash = ?")
+        .bind(&state_hash)
+        .execute(db.pool())
+        .await
+        .map_err(|_| fail(400, "飞书授权失败"))?;
     if expires <= now() as i64 {
         return Err(fail(400, "飞书授权请求已过期或已使用"));
     }
-    let admin = db.user_by_id(user_id).await.map_err(|_| fail(400, "飞书授权失败"))?;
+    let admin = db
+        .user_by_id(user_id)
+        .await
+        .map_err(|_| fail(400, "飞书授权失败"))?;
     if !admin.is_some_and(|user| user.is_admin) {
         return Err(fail(403, "授权发起账号不是管理员"));
     }
@@ -224,7 +269,13 @@ pub async fn save_token(db: &Db, token_body: &str) -> Result<(), Fail> {
     Ok(())
 }
 
-pub fn exchange_code(app_id: &str, secret: &str, redirect: &str, code: &str, verifier: &str) -> Result<String, Fail> {
+pub fn exchange_code(
+    app_id: &str,
+    secret: &str,
+    redirect: &str,
+    code: &str,
+    verifier: &str,
+) -> Result<String, Fail> {
     let body = json!({
         "grant_type": "authorization_code",
         "code": code,
@@ -238,7 +289,9 @@ pub fn exchange_code(app_id: &str, secret: &str, redirect: &str, code: &str, ver
         .timeout(std::time::Duration::from_secs(20))
         .send_string(&body.to_string())
         .map_err(|_| fail(400, "飞书授权失败"))?;
-    response.into_string().map_err(|_| fail(400, "飞书授权失败"))
+    response
+        .into_string()
+        .map_err(|_| fail(400, "飞书授权失败"))
 }
 
 pub async fn preview_url(db: &Db, url: &str) -> Result<Value, Fail> {
@@ -290,17 +343,34 @@ pub async fn sync_source(db: &Db, id: i64) -> Result<Value, Fail> {
     };
     let mut timeline = normalize_blocks(&blocks);
     let display = row.get::<String, _>("display_name");
-    let title = if display.trim().is_empty() { meta["title"].as_str().unwrap_or("飞书文档") } else { display.trim() };
+    let title = if display.trim().is_empty() {
+        meta["title"].as_str().unwrap_or("飞书文档")
+    } else {
+        display.trim()
+    };
     let title = clip(title, 200);
-    let (timeline_path, txt_path, asset_root) = match publish_files(&archive_root()?, &row.get::<String, _>("source_key_hash"), &title, &mut timeline, &mut |token| download_media(token, &access)) {
+    let (timeline_path, txt_path, asset_root) = match publish_files(
+        &archive_root()?,
+        &row.get::<String, _>("source_key_hash"),
+        &title,
+        &mut timeline,
+        &mut |token| download_media(token, &access),
+    ) {
         Ok(paths) => paths,
         Err(err) => {
             mark_failed(db, id, err.detail).await?;
             return Err(err);
         }
     };
-    let count = timeline["entries"].as_array().map(|items| items.len() as i64).unwrap_or(0);
-    let day = timeline["entries"].as_array().and_then(|items| items.last()).and_then(|item| item["day"].as_str()).unwrap_or("");
+    let count = timeline["entries"]
+        .as_array()
+        .map(|items| items.len() as i64)
+        .unwrap_or(0);
+    let day = timeline["entries"]
+        .as_array()
+        .and_then(|items| items.last())
+        .and_then(|item| item["day"].as_str())
+        .unwrap_or("");
     let now = chrono_like_now();
     sqlx::query(
         "UPDATE feishu_document_sources
@@ -377,11 +447,12 @@ pub async fn preview(db: &Db, url: &str, meta: Option<Value>) -> Result<Value, F
 
 pub async fn add_source(db: &Db, url: &str) -> Result<Value, Fail> {
     let parsed = parse_url(url)?;
-    let existing = sqlx::query("SELECT id, deleted_at FROM feishu_document_sources WHERE source_key_hash = ?")
-        .bind(&parsed.source_key_hash)
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| fail(400, "添加飞书文档失败"))?;
+    let existing =
+        sqlx::query("SELECT id, deleted_at FROM feishu_document_sources WHERE source_key_hash = ?")
+            .bind(&parsed.source_key_hash)
+            .fetch_optional(db.pool())
+            .await
+            .map_err(|_| fail(400, "添加飞书文档失败"))?;
     if let Some(row) = existing {
         let id: i64 = row.get("id");
         if row.get::<Option<String>, _>("deleted_at").is_some() {
@@ -411,7 +482,13 @@ pub async fn add_source(db: &Db, url: &str) -> Result<Value, Fail> {
     source_json(db, id).await
 }
 
-pub async fn update_source(db: &Db, id: i64, enabled: Option<bool>, display_mode: Option<&str>, display_name: Option<&str>) -> Result<Value, Fail> {
+pub async fn update_source(
+    db: &Db,
+    id: i64,
+    enabled: Option<bool>,
+    display_mode: Option<&str>,
+    display_name: Option<&str>,
+) -> Result<Value, Fail> {
     if enabled.is_none() && display_mode.is_none() && display_name.is_none() {
         return Err(fail(400, "没有要更新的字段"));
     }
@@ -465,6 +542,7 @@ pub async fn remove_source(db: &Db, id: i64) -> Result<(), Fail> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn note_sync(db: &Db, id: i64, meta: Option<Value>) -> Result<Value, Fail> {
     let row = source_row(db, id).await?;
     if row.get::<i64, _>("enabled") == 0 {
@@ -502,7 +580,13 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     let document_id = if source_type == "docx" {
         url_or_token.to_string()
     } else {
-        let body = get_json(&format!("https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={}", encode(url_or_token)), &token)?;
+        let body = get_json(
+            &format!(
+                "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={}",
+                encode(url_or_token)
+            ),
+            &token,
+        )?;
         let node = body.get("node").cloned().unwrap_or(body);
         if node["obj_type"].as_str() != Some("docx") {
             return Err(fail(400, "当前仅支持飞书新版文档"));
@@ -512,7 +596,10 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     if document_id.is_empty() {
         return Err(fail(400, "Wiki 节点没有对应文档"));
     }
-    let body = get_json(&format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"), &token)?;
+    let body = get_json(
+        &format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"),
+        &token,
+    )?;
     let document = body.get("document").cloned().unwrap_or(body);
     Ok(json!({
         "document_id": document_id,
@@ -528,7 +615,9 @@ fn fetch_blocks(document_id: &str, token: &str) -> Result<Vec<Value>, Fail> {
     let mut output = Vec::new();
     let mut page = String::new();
     for _ in 0..20 {
-        let mut url = format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks?page_size=500");
+        let mut url = format!(
+            "https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}/blocks?page_size=500"
+        );
         if !page.is_empty() {
             url.push_str("&page_token=");
             url.push_str(&encode(&page));
@@ -580,16 +669,28 @@ fn normalize_blocks(blocks: &[Value]) -> Value {
                 "blocks": [],
             }));
             current = Some(entries.len() - 1);
-            let remainder = format!("{}{}", &text[..start], &text[end..]).trim().to_string();
+            let remainder = format!("{}{}", &text[..start], &text[end..])
+                .trim()
+                .to_string();
             if !remainder.is_empty() || !assets.is_empty() {
-                push_item(&mut notices, &mut entries, current, text_item(block_id, &remainder, assets));
+                push_item(
+                    &mut notices,
+                    &mut entries,
+                    current,
+                    text_item(block_id, &remainder, assets),
+                );
             }
             continue;
         }
         if text.is_empty() && assets.is_empty() {
             continue;
         }
-        push_item(&mut notices, &mut entries, current, text_item(block_id, &text, assets));
+        push_item(
+            &mut notices,
+            &mut entries,
+            current,
+            text_item(block_id, &text, assets),
+        );
     }
     json!({"notices": notices, "entries": entries})
 }
@@ -624,11 +725,18 @@ fn speaker_parts(text: &str) -> Option<(String, String, String)> {
     if left.is_empty() || left.chars().count() > 40 || left.contains('\n') {
         return None;
     }
-    let (speaker, reply) = left.split_once(" 回复 ").map(|(a, b)| (a.trim(), b.trim())).unwrap_or((left.trim(), ""));
+    let (speaker, reply) = left
+        .split_once(" 回复 ")
+        .map(|(a, b)| (a.trim(), b.trim()))
+        .unwrap_or((left.trim(), ""));
     if speaker.is_empty() || speaker.chars().count() > 40 || reply.chars().count() > 40 {
         return None;
     }
-    Some((speaker.to_string(), reply.to_string(), right.trim().to_string()))
+    Some((
+        speaker.to_string(),
+        reply.to_string(),
+        right.trim().to_string(),
+    ))
 }
 
 fn find_time(text: &str) -> Option<(String, usize, usize)> {
@@ -647,7 +755,7 @@ fn time_at(text: &str, chars: &[(usize, char)], index: usize) -> Option<(String,
     }
     let mut cursor = index;
     let year = take_digits(chars, &mut cursor, 4)?;
-    if year < 2000 || year > 2099 {
+    if !(2000..=2099).contains(&year) {
         return None;
     }
     take_sep(chars, &mut cursor)?;
@@ -673,11 +781,20 @@ fn time_at(text: &str, chars: &[(usize, char)], index: usize) -> Option<(String,
         return None;
     }
     let minute = take_digits(chars, &mut cursor, 2)?;
-    if !(0..=23).contains(&hour) || !(0..=59).contains(&minute) || chars.get(cursor).is_some_and(|item| item.1.is_ascii_digit()) {
+    if !(0..=23).contains(&hour)
+        || !(0..=59).contains(&minute)
+        || chars
+            .get(cursor)
+            .is_some_and(|item| item.1.is_ascii_digit())
+    {
         return None;
     }
     let end = chars.get(cursor).map(|item| item.0).unwrap_or(text.len());
-    Some((format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:00+08:00"), chars[index].0, end))
+    Some((
+        format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:00+08:00"),
+        chars[index].0,
+        end,
+    ))
 }
 
 fn take_digits(chars: &[(usize, char)], cursor: &mut usize, max: usize) -> Option<u32> {
@@ -688,7 +805,12 @@ fn take_digits(chars: &[(usize, char)], cursor: &mut usize, max: usize) -> Optio
     if *cursor == start {
         return None;
     }
-    chars[start..*cursor].iter().map(|item| item.1).collect::<String>().parse().ok()
+    chars[start..*cursor]
+        .iter()
+        .map(|item| item.1)
+        .collect::<String>()
+        .parse()
+        .ok()
 }
 
 fn take_sep(chars: &[(usize, char)], cursor: &mut usize) -> Option<()> {
@@ -721,9 +843,17 @@ fn walk_text(value: &Value, parts: &mut Vec<String>) {
     match value {
         Value::Array(items) => items.iter().for_each(|item| walk_text(item, parts)),
         Value::Object(map) => {
-            if let Some(text) = map.get("text_run").and_then(|item| item.get("content")).and_then(|item| item.as_str()) {
+            if let Some(text) = map
+                .get("text_run")
+                .and_then(|item| item.get("content"))
+                .and_then(|item| item.as_str())
+            {
                 parts.push(text.to_string());
-            } else if let Some(text) = map.get("equation").and_then(|item| item.get("content")).and_then(|item| item.as_str()) {
+            } else if let Some(text) = map
+                .get("equation")
+                .and_then(|item| item.get("content"))
+                .and_then(|item| item.as_str())
+            {
                 parts.push(text.to_string());
             }
             map.values().for_each(|item| walk_text(item, parts));
@@ -743,8 +873,14 @@ fn walk_assets(value: &Value, output: &mut Vec<Value>) {
         Value::Array(items) => items.iter().for_each(|item| walk_assets(item, output)),
         Value::Object(map) => {
             for (field, kind) in [("image", "image"), ("file", "file"), ("media", "file")] {
-                let Some(media) = map.get(field).filter(|item| item.is_object()) else { continue };
-                let token = media["token"].as_str().or_else(|| media["file_token"].as_str()).unwrap_or("").trim();
+                let Some(media) = map.get(field).filter(|item| item.is_object()) else {
+                    continue;
+                };
+                let token = media["token"]
+                    .as_str()
+                    .or_else(|| media["file_token"].as_str())
+                    .unwrap_or("")
+                    .trim();
                 if valid_token(token) && !output.iter().any(|item| item["token"] == token) {
                     output.push(json!({"token": token, "name": clip(media["name"].as_str().or_else(|| media["file_name"].as_str()).unwrap_or(""), 200), "kind": kind}));
                 }
@@ -757,9 +893,20 @@ fn walk_assets(value: &Value, output: &mut Vec<Value>) {
 
 fn table_item(block: &Value, blocks: &[Value]) -> Option<(Value, Vec<String>)> {
     let table = block.get("table")?.as_object()?;
-    let rows = table.get("property").and_then(|item| item.get("row_size")).and_then(|item| item.as_i64())? as usize;
-    let columns = table.get("property").and_then(|item| item.get("column_size")).and_then(|item| item.as_i64())? as usize;
-    let cells: Vec<String> = table.get("cells")?.as_array()?.iter().filter_map(|item| item.as_str().map(|text| text.to_string())).collect();
+    let rows = table
+        .get("property")
+        .and_then(|item| item.get("row_size"))
+        .and_then(|item| item.as_i64())? as usize;
+    let columns = table
+        .get("property")
+        .and_then(|item| item.get("column_size"))
+        .and_then(|item| item.as_i64())? as usize;
+    let cells: Vec<String> = table
+        .get("cells")?
+        .as_array()?
+        .iter()
+        .filter_map(|item| item.as_str().map(|text| text.to_string()))
+        .collect();
     if rows == 0 || columns == 0 || rows * columns != cells.len() {
         return None;
     }
@@ -768,10 +915,22 @@ fn table_item(block: &Value, blocks: &[Value]) -> Option<(Value, Vec<String>)> {
     for row in cells.chunks(columns) {
         let mut line = Vec::new();
         for cell_id in row {
-            let cell = blocks.iter().find(|item| item["block_id"].as_str() == Some(cell_id));
-            let children: Vec<&Value> = cell.and_then(|item| item["children"].as_array()).map(|ids| {
-                ids.iter().filter_map(|id| id.as_str()).filter_map(|id| blocks.iter().find(|item| item["block_id"].as_str() == Some(id))).collect()
-            }).unwrap_or_default();
+            let cell = blocks
+                .iter()
+                .find(|item| item["block_id"].as_str() == Some(cell_id));
+            let children: Vec<&Value> = cell
+                .and_then(|item| item["children"].as_array())
+                .map(|ids| {
+                    ids.iter()
+                        .filter_map(|id| id.as_str())
+                        .filter_map(|id| {
+                            blocks
+                                .iter()
+                                .find(|item| item["block_id"].as_str() == Some(id))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
             for child in &children {
                 if let Some(id) = child["block_id"].as_str() {
                     used.push(id.to_string());
@@ -780,12 +939,20 @@ fn table_item(block: &Value, blocks: &[Value]) -> Option<(Value, Vec<String>)> {
             let text = if children.is_empty() {
                 cell.map(block_text).unwrap_or_default()
             } else {
-                children.iter().map(|item| block_text(item)).filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n")
+                children
+                    .iter()
+                    .map(|item| block_text(item))
+                    .filter(|text| !text.is_empty())
+                    .collect::<Vec<_>>()
+                    .join("\n")
             };
             let assets = if children.is_empty() {
                 cell.map(asset_tokens).unwrap_or_default()
             } else {
-                children.iter().flat_map(|item| asset_tokens(item)).collect()
+                children
+                    .iter()
+                    .flat_map(|item| asset_tokens(item))
+                    .collect()
             };
             let mut cell_value = json!({"text": text});
             if !assets.is_empty() {
@@ -795,7 +962,10 @@ fn table_item(block: &Value, blocks: &[Value]) -> Option<(Value, Vec<String>)> {
         }
         grid.push(line);
     }
-    Some((json!({"type": "table", "block_id": block["block_id"].as_str().unwrap_or(""), "rows": grid, "columns": columns}), used))
+    Some((
+        json!({"type": "table", "block_id": block["block_id"].as_str().unwrap_or(""), "rows": grid, "columns": columns}),
+        used,
+    ))
 }
 
 fn plain_text(title: &str, timeline: &Value) -> String {
@@ -818,7 +988,16 @@ fn plain_text(title: &str, timeline: &Value) -> String {
 fn push_plain(lines: &mut Vec<String>, item: &Value) {
     if item["type"] == "table" {
         for row in item["rows"].as_array().into_iter().flatten() {
-            let cells = row.as_array().map(|cells| cells.iter().map(|cell| cell["text"].as_str().unwrap_or("")).collect::<Vec<_>>().join("\t")).unwrap_or_default();
+            let cells = row
+                .as_array()
+                .map(|cells| {
+                    cells
+                        .iter()
+                        .map(|cell| cell["text"].as_str().unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\t")
+                })
+                .unwrap_or_default();
             lines.push(cells);
         }
         return;
@@ -858,28 +1037,47 @@ fn publish_files(
         return Err(fail(400, "飞书文档读取失败"));
     }
     let stored = store_assets(timeline, fetch)?;
-    let root = root.canonicalize().map_err(|_| fail(503, "当前部署未挂载存储归档"))?;
+    let root = root
+        .canonicalize()
+        .map_err(|_| fail(503, "当前部署未挂载存储归档"))?;
     let digest = hex::encode(Sha256::digest(format!("{title}:{timeline}").as_bytes()));
-    let version = root.join("feishu-documents").join(key_hash).join("versions").join(&digest);
+    let version = root
+        .join("feishu-documents")
+        .join(key_hash)
+        .join("versions")
+        .join(&digest);
     if !version.exists() {
         let temp = version.with_file_name(format!(".{digest}.tmp"));
         fs::create_dir_all(temp.join("assets")).map_err(|_| fail(503, "知识库存储当前不可写"))?;
         for asset in &stored {
-            fs::write(temp.join("assets").join(&asset.filename), &asset.bytes).map_err(|_| fail(503, "知识库存储当前不可写"))?;
+            fs::write(temp.join("assets").join(&asset.filename), &asset.bytes)
+                .map_err(|_| fail(503, "知识库存储当前不可写"))?;
         }
-        fs::write(temp.join("timeline.json"), timeline.to_string()).map_err(|_| fail(503, "知识库存储当前不可写"))?;
-        fs::write(temp.join("content.txt"), plain_text(title, timeline)).map_err(|_| fail(503, "知识库存储当前不可写"))?;
+        fs::write(temp.join("timeline.json"), timeline.to_string())
+            .map_err(|_| fail(503, "知识库存储当前不可写"))?;
+        fs::write(temp.join("content.txt"), plain_text(title, timeline))
+            .map_err(|_| fail(503, "知识库存储当前不可写"))?;
         fs::rename(&temp, &version).map_err(|_| fail(503, "知识库存储当前不可写"))?;
     }
-    let timeline_path = version.join("timeline.json").canonicalize().map_err(|_| fail(400, "飞书文档读取失败"))?;
+    let timeline_path = version
+        .join("timeline.json")
+        .canonicalize()
+        .map_err(|_| fail(400, "飞书文档读取失败"))?;
     if !timeline_path.starts_with(&root) {
         return Err(fail(400, "飞书文档读取失败"));
     }
     let relative = |name: &str| format!("feishu-documents/{key_hash}/versions/{digest}/{name}");
-    Ok((relative("timeline.json"), relative("content.txt"), relative("assets")))
+    Ok((
+        relative("timeline.json"),
+        relative("content.txt"),
+        relative("assets"),
+    ))
 }
 
-fn store_assets(timeline: &mut Value, fetch: &mut dyn FnMut(&str) -> Result<Option<MediaFile>, Fail>) -> Result<Vec<StoredAsset>, Fail> {
+fn store_assets(
+    timeline: &mut Value,
+    fetch: &mut dyn FnMut(&str) -> Result<Option<MediaFile>, Fail>,
+) -> Result<Vec<StoredAsset>, Fail> {
     let mut tokens = Vec::new();
     collect_tokens(timeline, &mut tokens);
     let mut stored = Vec::new();
@@ -902,7 +1100,11 @@ fn store_assets(timeline: &mut Value, fetch: &mut dyn FnMut(&str) -> Result<Opti
         let id = hex::encode(Sha256::digest(&file.bytes));
         let filename = format!("{id}{}", media_extension(&file.mime, &file.name));
         mark_asset(timeline, &token, &id, &file.mime, &file.name, false);
-        stored.push(StoredAsset { name: token, filename, bytes: file.bytes });
+        stored.push(StoredAsset {
+            name: token,
+            filename,
+            bytes: file.bytes,
+        });
     }
     Ok(stored)
 }
@@ -927,7 +1129,9 @@ fn collect_tokens(value: &Value, tokens: &mut Vec<String>) {
 
 fn mark_asset(value: &mut Value, token: &str, id: &str, mime: &str, name: &str, unavailable: bool) {
     match value {
-        Value::Array(items) => items.iter_mut().for_each(|item| mark_asset(item, token, id, mime, name, unavailable)),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| mark_asset(item, token, id, mime, name, unavailable)),
         Value::Object(map) => {
             if let Some(assets) = map.get_mut("assets").and_then(|item| item.as_array_mut()) {
                 for asset in assets.iter_mut() {
@@ -944,7 +1148,8 @@ fn mark_asset(value: &mut Value, token: &str, id: &str, mime: &str, name: &str, 
                     }
                 }
             }
-            map.values_mut().for_each(|item| mark_asset(item, token, id, mime, name, unavailable));
+            map.values_mut()
+                .for_each(|item| mark_asset(item, token, id, mime, name, unavailable));
         }
         _ => {}
     }
@@ -962,7 +1167,13 @@ fn media_extension(mime: &str, name: &str) -> &'static str {
 }
 
 fn name_extension(name: &str) -> &'static str {
-    match name.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "jpg" | "jpeg" => ".jpg",
         "png" => ".png",
         "gif" => ".gif",
@@ -976,27 +1187,45 @@ fn download_media(token: &str, access: &str) -> Result<Option<MediaFile>, Fail> 
     if !valid_token(token) {
         return Ok(None);
     }
-    let response = ureq::get(&format!("https://open.feishu.cn/open-apis/drive/v1/medias/{token}/download"))
-        .set("Authorization", &format!("Bearer {access}"))
-        .timeout(std::time::Duration::from_secs(30))
-        .call();
+    let response = ureq::get(&format!(
+        "https://open.feishu.cn/open-apis/drive/v1/medias/{token}/download"
+    ))
+    .set("Authorization", &format!("Bearer {access}"))
+    .timeout(std::time::Duration::from_secs(30))
+    .call();
     let response = match response {
         Ok(response) => response,
         Err(ureq::Error::Status(401, _)) => return Err(fail(400, "飞书授权已失效")),
         Err(_) => return Ok(None),
     };
-    let mime = response.header("content-type").unwrap_or("application/octet-stream").to_string();
-    let disposition = response.header("content-disposition").unwrap_or("").to_string();
+    let mime = response
+        .header("content-type")
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let disposition = response
+        .header("content-disposition")
+        .unwrap_or("")
+        .to_string();
     let mut bytes = Vec::new();
-    response.into_reader().take(50 * 1024 * 1024 + 1).read_to_end(&mut bytes).map_err(|_| fail(400, "飞书媒体下载失败"))?;
+    response
+        .into_reader()
+        .take(50 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| fail(400, "飞书媒体下载失败"))?;
     if bytes.len() > 50 * 1024 * 1024 {
         return Err(fail(400, "飞书媒体文件超过 50 MB 限制"));
     }
-    Ok(Some(MediaFile { bytes, mime, name: disposition_name(&disposition) }))
+    Ok(Some(MediaFile {
+        bytes,
+        mime,
+        name: disposition_name(&disposition),
+    }))
 }
 
 fn disposition_name(header: &str) -> String {
-    let Some(start) = header.to_ascii_lowercase().find("filename=") else { return String::new() };
+    let Some(start) = header.to_ascii_lowercase().find("filename=") else {
+        return String::new();
+    };
     let raw = header[start + "filename=".len()..].trim().trim_matches('"');
     clip(raw.split(';').next().unwrap_or("").trim(), 200)
 }
@@ -1031,10 +1260,22 @@ async fn config(db: &Db) -> Result<Cfg, Fail> {
     let redirect = first(db, "feishu_docs_redirect_uri", "FEISHU_DOCS_REDIRECT_URI").await?;
     let scopes = {
         let stored = first(db, "feishu_docs_scopes", "FEISHU_DOCS_SCOPES").await?;
-        if stored.is_empty() { DEFAULT_SCOPES.to_string() } else { stored }
+        if stored.is_empty() {
+            DEFAULT_SCOPES.to_string()
+        } else {
+            stored
+        }
     };
-    let interval = first(db, "feishu_docs_interval_seconds", "FEISHU_DOCS_INTERVAL").await?.parse::<i64>().unwrap_or(60).clamp(15, 86400);
-    let path_ok = redirect.split('?').next().unwrap_or("").ends_with("/api/admin/feishu-documents/oauth/callback");
+    let interval = first(db, "feishu_docs_interval_seconds", "FEISHU_DOCS_INTERVAL")
+        .await?
+        .parse::<i64>()
+        .unwrap_or(60)
+        .clamp(15, 86400);
+    let path_ok = redirect
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .ends_with("/api/admin/feishu-documents/oauth/callback");
     let stored = text(db, "feishu_docs_app_id").await?;
     let source = if !stored.is_empty() {
         "db"
@@ -1053,7 +1294,14 @@ async fn config(db: &Db) -> Result<Cfg, Fail> {
         "interval_seconds": interval,
         "config_source": source,
     });
-    Ok(Cfg { configured, app_id, redirect, scopes, interval, public })
+    Ok(Cfg {
+        configured,
+        app_id,
+        redirect,
+        scopes,
+        interval,
+        public,
+    })
 }
 
 async fn secret(db: &Db) -> Result<String, Fail> {
@@ -1066,17 +1314,21 @@ async fn secret(db: &Db) -> Result<String, Fail> {
 }
 
 async fn access_token(db: &Db) -> Result<String, Fail> {
-    let row = sqlx::query("SELECT access_token, expires_at FROM feishu_oauth_credentials WHERE id = 1")
-        .fetch_optional(db.pool())
-        .await
-        .map_err(|_| fail(400, "飞书授权失败"))?;
-    let Some(row) = row else { return Err(fail(400, "请先授权飞书文档")); };
+    let row =
+        sqlx::query("SELECT access_token, expires_at FROM feishu_oauth_credentials WHERE id = 1")
+            .fetch_optional(db.pool())
+            .await
+            .map_err(|_| fail(400, "飞书授权失败"))?;
+    let Some(row) = row else {
+        return Err(fail(400, "请先授权飞书文档"));
+    };
     let expires: i64 = row.get("expires_at");
     if expires <= now() as i64 + 60 {
         return Err(fail(400, "飞书授权已过期，请重新授权"));
     }
     let key = credential_key().ok_or(fail(400, "未配置 FEISHU_CREDENTIAL_KEY"))?;
-    open_app_secret(&key, &row.get::<String, _>("access_token")).map_err(|_| fail(400, "飞书授权无法解密"))
+    open_app_secret(&key, &row.get::<String, _>("access_token"))
+        .map_err(|_| fail(400, "飞书授权无法解密"))
 }
 
 async fn credential_live(db: &Db) -> Result<bool, Fail> {
@@ -1098,7 +1350,10 @@ async fn list_sources(db: &Db, interval: i64) -> Result<Vec<Value>, Fail> {
     .fetch_all(db.pool())
     .await
     .map_err(|_| fail(400, "读取飞书文档失败"))?;
-    Ok(rows.iter().map(|row| public_source(row, interval)).collect())
+    Ok(rows
+        .iter()
+        .map(|row| public_source(row, interval))
+        .collect())
 }
 
 async fn source_json(db: &Db, id: i64) -> Result<Value, Fail> {
@@ -1123,10 +1378,18 @@ async fn source_row(db: &Db, id: i64) -> Result<sqlx::sqlite::SqliteRow, Fail> {
 fn public_source(row: &sqlx::sqlite::SqliteRow, interval: i64) -> Value {
     let enabled = row.get::<i64, _>("enabled") != 0;
     let last_checked = row.get::<String, _>("last_checked_at");
-    let next = if enabled && !last_checked.is_empty() { next_check(&last_checked, interval) } else { String::new() };
+    let next = if enabled && !last_checked.is_empty() {
+        next_check(&last_checked, interval)
+    } else {
+        String::new()
+    };
     let error = row.get::<String, _>("last_error");
     let title = row.get::<String, _>("title");
-    let title = if title.is_empty() { "待首次同步".to_string() } else { title };
+    let title = if title.is_empty() {
+        "待首次同步".to_string()
+    } else {
+        title
+    };
     json!({
         "id": row.get::<i64, _>("id"),
         "source_type": row.get::<String, _>("source_type"),
@@ -1154,15 +1417,25 @@ fn parse_token(text: &str) -> Result<Token, Fail> {
     if code != 0 {
         return Err(fail(400, "飞书授权失败"));
     }
-    let access = data["access_token"].as_str().unwrap_or("").trim().to_string();
+    let access = data["access_token"]
+        .as_str()
+        .unwrap_or("")
+        .trim()
+        .to_string();
     if access.is_empty() {
         return Err(fail(400, "飞书授权返回缺少访问令牌"));
     }
     Ok(Token {
         access,
         refresh: data["refresh_token"].as_str().unwrap_or("").to_string(),
-        expires_in: data["expires_in"].as_i64().unwrap_or(7200).clamp(60, 86_400),
-        refresh_expires_in: data["refresh_expires_in"].as_i64().unwrap_or(2_592_000).clamp(60, 31_536_000),
+        expires_in: data["expires_in"]
+            .as_i64()
+            .unwrap_or(7200)
+            .clamp(60, 86_400),
+        refresh_expires_in: data["refresh_expires_in"]
+            .as_i64()
+            .unwrap_or(2_592_000)
+            .clamp(60, 31_536_000),
     })
 }
 
@@ -1175,7 +1448,10 @@ fn get_json(url: &str, token: &str) -> Result<Value, Fail> {
         .into_string()
         .map_err(|_| fail(400, "飞书文档读取失败"))?;
     let value: Value = serde_json::from_str(&text).map_err(|_| fail(400, "飞书返回了无效数据"))?;
-    let code = value.get("code").and_then(|item| item.as_i64()).unwrap_or(0);
+    let code = value
+        .get("code")
+        .and_then(|item| item.as_i64())
+        .unwrap_or(0);
     if matches!(code, 99991661 | 99991663 | 99991668) {
         return Err(fail(400, "飞书授权已失效"));
     }
@@ -1186,20 +1462,32 @@ fn get_json(url: &str, token: &str) -> Result<Value, Fail> {
 }
 
 async fn text(db: &Db, key: &str) -> Result<String, Fail> {
-    db.setting(key).await.map_err(|_| fail(400, "读取飞书文档配置失败")).map(|value| value.unwrap_or_default())
+    db.setting(key)
+        .await
+        .map_err(|_| fail(400, "读取飞书文档配置失败"))
+        .map(|value| value.unwrap_or_default())
 }
 
 async fn first(db: &Db, key: &str, env: &str) -> Result<String, Fail> {
     let stored = text(db, key).await?;
-    if stored.is_empty() { Ok(std::env::var(env).unwrap_or_default()) } else { Ok(stored) }
+    if stored.is_empty() {
+        Ok(std::env::var(env).unwrap_or_default())
+    } else {
+        Ok(stored)
+    }
 }
 
 fn trusted_host(host: &str) -> bool {
-    ["feishu.cn", "larksuite.com"].iter().any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+    ["feishu.cn", "larksuite.com"]
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
 fn valid_token(token: &str) -> bool {
-    (8..=128).contains(&token.len()) && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    (8..=128).contains(&token.len())
+        && token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 fn random_token(n: usize) -> Result<String, Fail> {
@@ -1229,7 +1517,10 @@ fn clip(value: &str, max: usize) -> String {
 }
 
 fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn chrono_like_now() -> String {
@@ -1237,7 +1528,9 @@ fn chrono_like_now() -> String {
 }
 
 fn next_check(last: &str, interval: i64) -> String {
-    let Ok(seconds) = last.parse::<i64>() else { return String::new() };
+    let Ok(seconds) = last.parse::<i64>() else {
+        return String::new();
+    };
     (seconds + interval).to_string()
 }
 
@@ -1250,14 +1543,22 @@ mod tests {
     use super::*;
 
     async fn db() -> (Db, std::path::PathBuf) {
-        let path = std::env::temp_dir().join(format!("vpush-feishu-admin-{}-{}.db", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let path = std::env::temp_dir().join(format!(
+            "vpush-feishu-admin-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let db = Db::open(&path).await.unwrap();
         (db, path)
     }
 
     #[test]
     fn parse_accepts_wiki_and_rejects_other_hosts() {
-        let parsed = parse_url("https://example.feishu.cn/wiki/doxcnABCDEFG1234?from=share").unwrap();
+        let parsed =
+            parse_url("https://example.feishu.cn/wiki/doxcnABCDEFG1234?from=share").unwrap();
         assert_eq!(parsed.source_type, "wiki");
         assert!(parsed.group_id.starts_with("feishu-"));
         assert!(parse_url("https://example.com/wiki/doxcnABCDEFG1234").is_err());
@@ -1266,42 +1567,72 @@ mod tests {
 
     #[tokio::test]
     async fn config_hides_secret_and_source_can_be_renamed() {
+        let _env_lock = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
         let (db, path) = db().await;
         std::env::set_var("FEISHU_CREDENTIAL_KEY", URL_SAFE.encode([7u8; 32]));
-        let saved = save_config(&db, Save {
-            app_id: Some("cli_test"),
-            app_secret: Some("secret-value"),
-            redirect_uri: Some("https://vpush.example/api/admin/feishu-documents/oauth/callback"),
-            scopes: Some("wiki:node:read docx:document:readonly"),
-            interval_seconds: Some(60),
-        }).await.unwrap();
+        let saved = save_config(
+            &db,
+            Save {
+                app_id: Some("cli_test"),
+                app_secret: Some("secret-value"),
+                redirect_uri: Some(
+                    "https://vpush.example/api/admin/feishu-documents/oauth/callback",
+                ),
+                scopes: Some("wiki:node:read docx:document:readonly"),
+                interval_seconds: Some(60),
+            },
+        )
+        .await
+        .unwrap();
         let body = saved.to_string();
         assert!(!body.contains("secret-value"));
         assert_eq!(saved["config"]["app_secret_set"], true);
         assert_eq!(saved["config"]["redirect_path_ok"], true);
-        let source = add_source(&db, "https://example.feishu.cn/docx/doxcnABCDEFG1234").await.unwrap();
+        let source = add_source(&db, "https://example.feishu.cn/docx/doxcnABCDEFG1234")
+            .await
+            .unwrap();
         assert_eq!(source["sync_status"], "pending");
         let id = source["id"].as_i64().unwrap();
-        let renamed = update_source(&db, id, None, Some("document"), Some("投研纪要")).await.unwrap();
+        let renamed = update_source(&db, id, None, Some("document"), Some("投研纪要"))
+            .await
+            .unwrap();
         assert_eq!(renamed["display_name"], "投研纪要");
         assert_eq!(renamed["display_mode"], "document");
         assert!(note_sync(&db, id, None).await.is_err());
         remove_source(&db, id).await.unwrap();
-        assert!(update_source(&db, id, Some(false), None, None).await.is_err());
+        assert!(update_source(&db, id, Some(false), None, None)
+            .await
+            .is_err());
         let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
     async fn callback_rejects_a_mismatched_cookie() {
+        let _env_lock = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
         let (db, path) = db().await;
         std::env::set_var("FEISHU_CREDENTIAL_KEY", URL_SAFE.encode([9u8; 32]));
-        save_config(&db, Save {
-            app_id: Some("cli_test"),
-            app_secret: Some("secret-value"),
-            redirect_uri: Some("https://vpush.example/api/admin/feishu-documents/oauth/callback"),
-            scopes: None,
-            interval_seconds: None,
-        }).await.unwrap();
+        save_config(
+            &db,
+            Save {
+                app_id: Some("cli_test"),
+                app_secret: Some("secret-value"),
+                redirect_uri: Some(
+                    "https://vpush.example/api/admin/feishu-documents/oauth/callback",
+                ),
+                scopes: None,
+                interval_seconds: None,
+            },
+        )
+        .await
+        .unwrap();
         let (url, hash) = begin_oauth(&db, 1).await.unwrap();
         assert!(url.contains("client_id=cli_test"));
         assert!(url.contains("code_challenge_method=S256"));
@@ -1327,39 +1658,81 @@ mod tests {
     #[tokio::test]
     async fn published_timeline_can_be_read() {
         let (db, path) = db().await;
-        let root = std::env::temp_dir().join(format!("vpush-feishu-archive-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "vpush-feishu-archive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         std::env::set_var("IMA_ARCHIVE_ROOT", &root);
-        let source = add_source(&db, "https://example.feishu.cn/docx/doxcnABCDEFG1234").await.unwrap();
+        let source = add_source(&db, "https://example.feishu.cn/docx/doxcnABCDEFG1234")
+            .await
+            .unwrap();
         let id = source["id"].as_i64().unwrap();
-        let hash: String = sqlx::query_scalar("SELECT source_key_hash FROM feishu_document_sources WHERE id = ?").bind(id).fetch_one(db.pool()).await.unwrap();
-        let blocks = vec![json!({"block_id": "e1", "text": {"elements": [{"text_run": {"content": "2024-03-02 09:30 纪要正文"}}]}})];
+        let hash: String =
+            sqlx::query_scalar("SELECT source_key_hash FROM feishu_document_sources WHERE id = ?")
+                .bind(id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let blocks = vec![
+            json!({"block_id": "e1", "text": {"elements": [{"text_run": {"content": "2024-03-02 09:30 纪要正文"}}]}}),
+        ];
         let mut timeline = normalize_blocks(&blocks);
-        let (timeline_path, txt_path, _) = publish_files(&root, &hash, "投研纪要", &mut timeline, &mut |_| Ok(None)).unwrap();
+        let (timeline_path, txt_path, _) =
+            publish_files(&root, &hash, "投研纪要", &mut timeline, &mut |_| {
+                Ok(None)
+            })
+            .unwrap();
         sqlx::query("UPDATE feishu_document_sources SET title = '投研纪要', timeline_path = ?, sync_status = 'succeeded' WHERE id = ?")
             .bind(&timeline_path)
             .bind(id)
             .execute(db.pool())
             .await
             .unwrap();
-        let page = crate::feishu_docs::timeline_all(&db, &root, 0, true, "", "latest", None, "").await.unwrap();
+        let page = crate::feishu_docs::timeline_all(&db, &root, 0, true, "", "latest", None, "")
+            .await
+            .unwrap();
         assert_eq!(page["entries"][0]["blocks"][0]["text"], "纪要正文");
-        assert!(std::fs::read_to_string(root.join(&txt_path)).unwrap().contains("纪要正文"));
+        assert!(std::fs::read_to_string(root.join(&txt_path))
+            .unwrap()
+            .contains("纪要正文"));
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn downloaded_image_is_named_by_its_hash() {
-        let root = std::env::temp_dir().join(format!("vpush-feishu-asset-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        let root = std::env::temp_dir().join(format!(
+            "vpush-feishu-asset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         std::fs::create_dir_all(&root).unwrap();
         let mut timeline = json!({
             "notices": [{"type": "asset", "text": "", "assets": [{"token": "boxcnImageToken", "name": "", "kind": "image"}]}],
             "entries": []
         });
-        let (_, _, asset_root) = publish_files(&root, "abcdef0123456789abcd", "纪要", &mut timeline, &mut |_| {
-            Ok(Some(MediaFile { bytes: b"png-bytes".to_vec(), mime: "image/png".to_string(), name: "图表.png".to_string() }))
-        }).unwrap();
+        let (_, _, asset_root) = publish_files(
+            &root,
+            "abcdef0123456789abcd",
+            "纪要",
+            &mut timeline,
+            &mut |_| {
+                Ok(Some(MediaFile {
+                    bytes: b"png-bytes".to_vec(),
+                    mime: "image/png".to_string(),
+                    name: "图表.png".to_string(),
+                }))
+            },
+        )
+        .unwrap();
         let id = timeline["notices"][0]["assets"][0]["id"].as_str().unwrap();
         assert_eq!(id.len(), 64);
         let file = root.join(&asset_root).join(format!("{id}.png"));

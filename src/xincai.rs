@@ -14,7 +14,9 @@ pub fn authorize(authorization: Option<&str>, expected: &str) -> Result<(), &'st
     if expected.is_empty() {
         return Err("未配置 XINCAI_INGEST_TOKEN");
     }
-    let token = authorization.and_then(|value| value.strip_prefix("Bearer ")).unwrap_or("");
+    let token = authorization
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .unwrap_or("");
     if token.len() != expected.len() || !bool::from(token.as_bytes().ct_eq(expected.as_bytes())) {
         return Err("令牌无效");
     }
@@ -25,16 +27,37 @@ pub async fn ingest(db: &Db, body: &Value) -> Result<Value, CatalogError> {
     let Some(body) = body.as_object() else {
         return Err(CatalogError::Bad("请求体必须是 JSON 对象"));
     };
-    let articles = body.get("articles").and_then(|value| value.as_array()).ok_or(CatalogError::Bad("articles 不能为空"))?;
+    let articles = body
+        .get("articles")
+        .and_then(|value| value.as_array())
+        .ok_or(CatalogError::Bad("articles 不能为空"))?;
     if articles.is_empty() {
         return Err(CatalogError::Bad("articles 不能为空"));
     }
     if articles.len() > MAX_BATCH {
-        return Err(CatalogError::Invalid(format!("单批最多 {MAX_BATCH} 篇，收到 {}", articles.len())));
+        return Err(CatalogError::Invalid(format!(
+            "单批最多 {MAX_BATCH} 篇，收到 {}",
+            articles.len()
+        )));
     }
-    let group = clip(body.get("group").and_then(|value| value.as_str()).unwrap_or("").trim(), 40);
-    let default_source = clip(body.get("sourceName").and_then(|value| value.as_str()).unwrap_or("").trim(), 60);
-    let hinted = body.get("sourceKind").and_then(|value| value.as_str()).unwrap_or("");
+    let group = clip(
+        body.get("group")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim(),
+        40,
+    );
+    let default_source = clip(
+        body.get("sourceName")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim(),
+        60,
+    );
+    let hinted = body
+        .get("sourceKind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
     let now = now_iso();
     let mut rows = Vec::new();
     let mut skipped = 0;
@@ -54,22 +77,72 @@ pub async fn ingest(db: &Db, body: &Value) -> Result<Value, CatalogError> {
     Ok(json!({"ok": true, "accepted": accepted, "skipped": skipped, "sources": sources}))
 }
 
-fn build_row(item: &serde_json::Map<String, Value>, default_source: &str, hinted: &str, now: &str) -> Option<XincaiRow> {
-    let external_id = clip(item.get("externalId").and_then(|value| value.as_str()).unwrap_or("").trim(), 200);
+fn build_row(
+    item: &serde_json::Map<String, Value>,
+    default_source: &str,
+    hinted: &str,
+    now: &str,
+) -> Option<XincaiRow> {
+    let external_id = clip(
+        item.get("externalId")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim(),
+        200,
+    );
     if external_id.is_empty() {
         return None;
     }
-    let mut name = clip(item.get("sourceName").and_then(|value| value.as_str()).unwrap_or("").trim(), 60);
+    let mut name = clip(
+        item.get("sourceName")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim(),
+        60,
+    );
     if name.is_empty() {
-        name = if default_source.is_empty() { "心裁".into() } else { default_source.to_string() };
+        name = if default_source.is_empty() {
+            "心裁".into()
+        } else {
+            default_source.to_string()
+        };
     }
-    let sid = clip(item.get("sourceId").and_then(|value| value.as_str()).unwrap_or("").trim(), 80);
-    let slug = if sid.is_empty() { format!("xincai-name-{}", simple_hash(&name)) } else { format!("xincai-{sid}") };
-    let key = if sid.is_empty() { name.clone() } else { sid.clone() };
-    let html = clip_bytes(item.get("html").and_then(|value| value.as_str()).unwrap_or(""), MAX_BODY);
+    let sid = clip(
+        item.get("sourceId")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim(),
+        80,
+    );
+    let slug = if sid.is_empty() {
+        format!("xincai-name-{}", simple_hash(&name))
+    } else {
+        format!("xincai-{sid}")
+    };
+    let key = if sid.is_empty() {
+        name.clone()
+    } else {
+        sid.clone()
+    };
+    let html = clip_bytes(
+        item.get("html")
+            .and_then(|value| value.as_str())
+            .unwrap_or(""),
+        MAX_BODY,
+    );
     let content = plain(&html);
-    let summary = clip(&plain(item.get("text").and_then(|value| value.as_str()).unwrap_or(content.as_str())), 2000);
-    let hint = item.get("sourceKind").and_then(|value| value.as_str()).unwrap_or(hinted);
+    let summary = clip(
+        &plain(
+            item.get("text")
+                .and_then(|value| value.as_str())
+                .unwrap_or(content.as_str()),
+        ),
+        2000,
+    );
+    let hint = item
+        .get("sourceKind")
+        .and_then(|value| value.as_str())
+        .unwrap_or(hinted);
     Some(XincaiRow {
         key,
         slug,
@@ -77,20 +150,62 @@ fn build_row(item: &serde_json::Map<String, Value>, default_source: &str, hinted
         kind: publication_kind(&name, hint),
         external_id,
         title: {
-            let title = clip(&plain(item.get("title").and_then(|value| value.as_str()).unwrap_or("")), 500);
-            if title.is_empty() { "(无标题)".into() } else { title }
+            let title = clip(
+                &plain(
+                    item.get("title")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(""),
+                ),
+                500,
+            );
+            if title.is_empty() {
+                "(无标题)".into()
+            } else {
+                title
+            }
         },
         summary,
         content,
-        url: public_url(item.get("url").and_then(|value| value.as_str()).unwrap_or("")),
-        author: clip(&plain(item.get("author").and_then(|value| value.as_str()).unwrap_or("")), 200),
-        published_at: normalize_ts(item.get("publishedAt").and_then(|value| value.as_str()).unwrap_or(""), now),
+        url: public_url(
+            item.get("url")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+        ),
+        author: clip(
+            &plain(
+                item.get("author")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+            ),
+            200,
+        ),
+        published_at: normalize_ts(
+            item.get("publishedAt")
+                .and_then(|value| value.as_str())
+                .unwrap_or(""),
+            now,
+        ),
         issue_key: issue_text(item, "issueKey", &["issueKey", "key"], 40),
         issue_label: issue_text(item, "issueLabel", &["label"], 80),
         issue_title: issue_text(item, "issueTitle", &["title"], 200),
         issue_cover: issue_text(item, "issueCover", &["cover"], 500),
-        section: clip(item.get("section").or_else(|| item.get("category")).and_then(|value| value.as_str()).unwrap_or("").trim(), 40),
-        toc_order: item.get("tocOrder").and_then(|value| value.as_i64()).unwrap_or_else(|| issue_object(item).and_then(|issue| issue.get("order")).and_then(|value| value.as_i64()).unwrap_or(0)),
+        section: clip(
+            item.get("section")
+                .or_else(|| item.get("category"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim(),
+            40,
+        ),
+        toc_order: item
+            .get("tocOrder")
+            .and_then(|value| value.as_i64())
+            .unwrap_or_else(|| {
+                issue_object(item)
+                    .and_then(|issue| issue.get("order"))
+                    .and_then(|value| value.as_i64())
+                    .unwrap_or(0)
+            }),
         images: image_urls(&html),
     })
 }
@@ -99,8 +214,17 @@ fn issue_object(item: &serde_json::Map<String, Value>) -> Option<&serde_json::Ma
     item.get("issue").and_then(|value| value.as_object())
 }
 
-fn issue_text(item: &serde_json::Map<String, Value>, flat: &str, nested: &[&str], max_chars: usize) -> String {
-    let direct = item.get(flat).and_then(|value| value.as_str()).unwrap_or("").trim();
+fn issue_text(
+    item: &serde_json::Map<String, Value>,
+    flat: &str,
+    nested: &[&str],
+    max_chars: usize,
+) -> String {
+    let direct = item
+        .get(flat)
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .trim();
     if !direct.is_empty() {
         return clip(direct, max_chars);
     }
@@ -108,7 +232,11 @@ fn issue_text(item: &serde_json::Map<String, Value>, flat: &str, nested: &[&str]
         return String::new();
     };
     for key in nested {
-        let text = issue.get(*key).and_then(|value| value.as_str()).unwrap_or("").trim();
+        let text = issue
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .trim();
         if !text.is_empty() {
             return clip(text, max_chars);
         }
@@ -120,14 +248,18 @@ fn image_urls(html: &str) -> String {
     let mut urls = Vec::new();
     let mut rest = html;
     while urls.len() < 20 {
-        let Some(start) = rest.find("src=") else { break };
+        let Some(start) = rest.find("src=") else {
+            break;
+        };
         rest = &rest[start + 4..];
         let quote = rest.chars().next();
         if quote != Some('"') && quote != Some('\'') {
             continue;
         }
         rest = &rest[1..];
-        let Some(end) = rest.find(quote.unwrap()) else { break };
+        let Some(end) = rest.find(quote.unwrap()) else {
+            break;
+        };
         let url = rest[..end].trim();
         rest = &rest[end + 1..];
         if url.starts_with("https://") && url.len() <= 2048 {
@@ -168,7 +300,10 @@ fn normalize_ts(raw: &str, fallback: &str) -> String {
 }
 
 fn now_iso() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     let days = secs.div_euclid(86400);
     let tod = secs.rem_euclid(86400);
     let z = days + 719468;
@@ -181,7 +316,12 @@ fn now_iso() -> String {
     let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     let year = if month <= 2 { y + 1 } else { y };
-    format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+00:00", tod / 3600, (tod % 3600) / 60, tod % 60)
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}+00:00",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    )
 }
 
 fn simple_hash(text: &str) -> String {
@@ -228,7 +368,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-xincai-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
@@ -250,9 +393,16 @@ mod tests {
         let listed = db.list_news(user.id, 0, "", false, 20, 0).await.unwrap();
         let items = listed["items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
-        assert_eq!(items.iter().find(|item| item["title"] == "新标题").unwrap()["url"], "https://example.com/a");
-        assert!(items.iter().any(|item| item["title"] == "越界" && item["url"] == ""));
-        let article_id = items.iter().find(|item| item["title"] == "新标题").unwrap()["id"].as_i64().unwrap();
+        assert_eq!(
+            items.iter().find(|item| item["title"] == "新标题").unwrap()["url"],
+            "https://example.com/a"
+        );
+        assert!(items
+            .iter()
+            .any(|item| item["title"] == "越界" && item["url"] == ""));
+        let article_id = items.iter().find(|item| item["title"] == "新标题").unwrap()["id"]
+            .as_i64()
+            .unwrap();
         let article = db.news_article(user.id, article_id).await.unwrap().unwrap();
         assert_eq!(article["content"], "改过");
         let sources = db.admin_news_sources().await.unwrap();
@@ -267,7 +417,10 @@ mod tests {
         let path = std::env::temp_dir().join(format!(
             "vpush-xincai-{}-{}.db",
             std::process::id(),
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let db = Db::open(&path).await.unwrap();
         db.ensure_admin("hash").await.unwrap();
@@ -279,7 +432,9 @@ mod tests {
         });
         ingest(&db, &body).await.unwrap();
         let user = db.user_by_username("admin").await.unwrap().unwrap();
-        let source_id = db.admin_news_sources().await.unwrap()[0]["id"].as_i64().unwrap();
+        let source_id = db.admin_news_sources().await.unwrap()[0]["id"]
+            .as_i64()
+            .unwrap();
         let shelf = db.magazine(user.id, source_id).await.unwrap();
         let issue = &shelf["issues"][0];
         assert_eq!(issue["label"], "第30期");
@@ -289,7 +444,10 @@ mod tests {
         assert_eq!(issue["articles"][0]["section"], "正文");
         assert_eq!(issue["articles"][1]["section"], "市场");
         let first = issue["articles"][0]["id"].as_i64().unwrap();
-        assert_eq!(db.news_image_url(user.id, first, 0).await.unwrap(), "https://img.example/a.jpg");
+        assert_eq!(
+            db.news_image_url(user.id, first, 0).await.unwrap(),
+            "https://img.example/a.jpg"
+        );
         assert!(db.news_image_url(user.id, first, 3).await.is_err());
         assert!(db.magazine(user.id, source_id + 9).await.is_err());
         let _ = std::fs::remove_file(&path);

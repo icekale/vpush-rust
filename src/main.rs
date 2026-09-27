@@ -25,8 +25,9 @@ mod push;
 mod reports;
 mod syslogs;
 mod tags;
-#[cfg(test)]
+mod telegram_adapter;
 mod telegram_bot;
+mod telegram_poll;
 mod truth;
 mod twitter;
 mod url_guard;
@@ -217,6 +218,13 @@ async fn main() {
     let static_dir = std::env::var("VPUSH_STATIC").unwrap_or_else(|_| "static".into());
     let host = std::env::var("HOST").unwrap_or_else(|_| "127.0.0.1".into());
     let db = Db::open(Path::new(&db_path)).await.expect("open sqlite");
+    if telegram_poll::enabled(
+        std::env::var("TELEGRAM_BOT_INBOUND").ok().as_deref(),
+        std::env::var("TELEGRAM_BOT_TOKEN").ok().as_deref(),
+    ) {
+        let token = std::env::var("TELEGRAM_BOT_TOKEN").expect("Telegram token checked");
+        telegram_poll::spawn(db.clone(), token);
+    }
     if let Ok(password) = std::env::var("WEB_ADMIN_PASSWORD") {
         if !password.is_empty() {
             let hash = auth::hash_password(&password, None);

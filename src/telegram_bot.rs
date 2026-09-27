@@ -1,9 +1,6 @@
 use crate::db::{CatalogError, Db, User};
 use serde_json::Value;
 
-#[path = "telegram_adapter.rs"]
-mod telegram_adapter;
-
 const PAGE_SIZE: usize = 20;
 const SEARCH_LIMIT: usize = 10;
 const MAX_INPUT_CHARS: usize = 4096;

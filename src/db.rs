@@ -154,6 +154,13 @@ CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS telegram_poll_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    owner TEXT NOT NULL DEFAULT '',
+    lease_until INTEGER NOT NULL DEFAULT 0,
+    offset INTEGER NOT NULL DEFAULT 0
+);
+INSERT OR IGNORE INTO telegram_poll_state (id, owner, lease_until, offset) VALUES (1, '', 0, 0);
 CREATE TABLE IF NOT EXISTS hosted_images (
     source_url TEXT PRIMARY KEY,
     hosted_url TEXT NOT NULL DEFAULT '',
@@ -618,6 +625,87 @@ impl Db {
         ensure_feishu_columns(&pool).await?;
         ensure_news_admin_columns(&pool).await?;
         Ok(Self { pool })
+    }
+
+    pub async fn telegram_poll_acquire(
+        &self,
+        owner: &str,
+        lease_secs: i64,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query(
+            "INSERT OR IGNORE INTO telegram_poll_state (id, owner, lease_until, offset) VALUES (1, '', 0, 0)",
+        )
+        .execute(&self.pool)
+        .await?;
+        let result = sqlx::query(
+            "UPDATE telegram_poll_state
+             SET owner = ?, lease_until = unixepoch() + ?
+             WHERE id = 1 AND (lease_until <= unixepoch() OR owner = ?)",
+        )
+        .bind(owner)
+        .bind(lease_secs)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() != 1 {
+            return Ok(None);
+        }
+        sqlx::query_scalar("SELECT offset FROM telegram_poll_state WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await
+            .map(Some)
+    }
+
+    pub async fn telegram_poll_heartbeat(
+        &self,
+        owner: &str,
+        lease_secs: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE telegram_poll_state
+             SET lease_until = unixepoch() + ?
+             WHERE id = 1 AND owner = ? AND lease_until > unixepoch()",
+        )
+        .bind(lease_secs)
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn telegram_poll_save_offset(
+        &self,
+        owner: &str,
+        offset: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE telegram_poll_state
+             SET offset = ?
+             WHERE id = 1 AND owner = ? AND lease_until > unixepoch() AND offset <= ?",
+        )
+        .bind(offset)
+        .bind(owner)
+        .bind(offset)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn telegram_poll_release(&self, owner: &str) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE telegram_poll_state SET owner = '', lease_until = 0
+             WHERE id = 1 AND owner = ?",
+        )
+        .bind(owner)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn telegram_poll_offset(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT offset FROM telegram_poll_state WHERE id = 1")
+            .fetch_one(&self.pool)
+            .await
     }
 
     pub async fn active_feishu_sources(&self) -> Result<Vec<Value>, sqlx::Error> {

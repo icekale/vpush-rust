@@ -878,7 +878,17 @@ mod tests {
         assert!(raw.contains("酱香茅台"));
         assert!(!raw.contains("垃圾指数"));
         assert!(!raw.contains("不是股票"));
-        let failed = discover(&db, |_| async { Err("超时".into()) }).await;
+        let mut failed_waits = 0;
+        let failed = loop {
+            match discover(&db, |_| async { Err("超时".into()) }).await {
+                Err(CatalogError::Conflict(_)) => {
+                    failed_waits += 1;
+                    assert!(failed_waits < 50, "标签维护锁没有释放");
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                other => break other,
+            }
+        };
         assert!(matches!(failed, Err(CatalogError::Invalid(_))));
         let _ = std::fs::remove_file(&path);
     }

@@ -30,7 +30,6 @@ pub async fn test_user(
     if picked.telegram && !user.telegram_chat_id.trim().is_empty() {
         let key = crate::feishu_personal::credential_key().unwrap_or_default();
         match telegram_secret(&user.telegram_bot_token, &key) {
-            Ok(token) if token.is_empty() => {}
             Ok(token) => results.push(outcome(
                 "telegram",
                 send_telegram(&token, &user.telegram_chat_id, &text).await,
@@ -82,10 +81,8 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
     if picked.telegram && !user.telegram_chat_id.trim().is_empty() {
         let key = crate::feishu_personal::credential_key().unwrap_or_default();
         let token = telegram_secret(&user.telegram_bot_token, &key)?;
-        if !token.is_empty() {
-            send_telegram(&token, &user.telegram_chat_id, text).await?;
-            sent = true;
-        }
+        send_telegram(&token, &user.telegram_chat_id, text).await?;
+        sent = true;
     }
     if picked.feishu && crate::feishu::configured(db).await.unwrap_or(false) {
         crate::feishu::send_text(db, text).await?;
@@ -140,7 +137,6 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
         if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
             let key = crate::feishu_personal::credential_key().unwrap_or_default();
             match telegram_secret(&target.telegram_bot_token, &key) {
-                Ok(token) if token.is_empty() => {}
                 Ok(token) => {
                     if let Err(err) =
                         send_telegram(&token, &target.telegram_chat_id, &plain(note)).await
@@ -604,23 +600,15 @@ fn chat_id_ok(chat_id: &str) -> bool {
 
 pub fn parse_telegram_bind(me_body: &str, updates_body: &str) -> Result<(String, String), String> {
     let me: serde_json::Value =
-        serde_json::from_str(me_body).map_err(|_| "token 无效：未知错误".to_string())?;
+        serde_json::from_str(me_body).map_err(|_| "token 无效：响应无效".to_string())?;
     if me.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let desc = me
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
-        return Err(format!("token 无效：{desc}"));
+        return Err("token 无效".into());
     }
     let username = me["result"]["username"].as_str().unwrap_or("").to_string();
     let updates: serde_json::Value =
-        serde_json::from_str(updates_body).map_err(|_| "获取会话失败：未知错误".to_string())?;
+        serde_json::from_str(updates_body).map_err(|_| "获取会话失败：响应无效".to_string())?;
     if updates.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-        let desc = updates
-            .get("description")
-            .and_then(|v| v.as_str())
-            .unwrap_or("未知错误");
-        return Err(format!("获取会话失败：{desc}"));
+        return Err("获取会话失败".into());
     }
     let mut chat_id = String::new();
     if let Some(items) = updates["result"].as_array() {
@@ -651,8 +639,8 @@ pub async fn resolve_telegram_bot(token: &str) -> Result<(String, String), Strin
         Ok::<_, String>((me, updates))
     })
     .await
-    .map_err(|err| redact_token(format!("无法连接 Telegram：{err}"), &token))?
-    .map_err(|err| redact_token(format!("无法连接 Telegram：{err}"), &token))?;
+    .map_err(|_| "无法连接 Telegram".to_string())?
+    .map_err(|err| format!("无法连接 Telegram：{err}"))?;
     parse_telegram_bind(&me, &updates)
 }
 
@@ -664,21 +652,74 @@ fn validate_telegram_send(token: &str, chat_id: &str) -> Result<(), String> {
     }
 }
 
-async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
-    validate_telegram_send(token, chat_id)?;
-    let body = serde_json::json!({
+fn telegram_message_body(chat_id: &str, text: &str, parse_mode: Option<&str>) -> String {
+    let mut body = serde_json::json!({
         "chat_id": chat_id,
         "text": truncate(text, 4000),
         "disable_web_page_preview": true,
-    })
-    .to_string();
+    });
+    if parse_mode == Some("HTML") {
+        body["parse_mode"] = serde_json::json!("HTML");
+    }
+    body.to_string()
+}
+
+fn parse_telegram_response(status: u16, body: &str) -> Result<(), String> {
+    let response: serde_json::Value = serde_json::from_str(body)
+        .map_err(|_| format!("Telegram HTTP {status} response invalid"))?;
+    if status == 429 {
+        let retry_after = response
+            .pointer("/parameters/retry_after")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.min(86_400));
+        return match retry_after {
+            Some(seconds) => Err(format!(
+                "Telegram HTTP 429 rate limited; retry_after={seconds}s"
+            )),
+            None => Err("Telegram HTTP 429 rate limited".into()),
+        };
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!("Telegram HTTP {status}"));
+    }
+    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(format!("Telegram HTTP {status} response rejected"))
+    }
+}
+
+fn telegram_post(token: &str, body: &str) -> Result<(), String> {
+    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(10))
+        .timeout_read(std::time::Duration::from_secs(15))
+        .build();
+    let request = agent.post(&url).set("Content-Type", "application/json");
+    let response = match request.send_string(body) {
+        Ok(response) => response,
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response
+                .into_string()
+                .map_err(|_| format!("Telegram HTTP {status} response unreadable"))?;
+            return parse_telegram_response(status, &body);
+        }
+        Err(_) => return Err("Telegram network error".into()),
+    };
+    let status = response.status();
+    let body = response
+        .into_string()
+        .map_err(|_| format!("Telegram HTTP {status} response unreadable"))?;
+    parse_telegram_response(status, &body)
+}
+
+async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
+    validate_telegram_send(token, chat_id)?;
+    let body = telegram_message_body(chat_id, text, None);
     let token = token.to_string();
-    tokio::task::spawn_blocking(move || {
-        let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-        post_json(&url, &body).map_err(|err| redact_token(err, &token))
-    })
-    .await
-    .map_err(|err| err.to_string())?
+    tokio::task::spawn_blocking(move || telegram_post(&token, &body))
+        .await
+        .map_err(|_| "Telegram network error".to_string())?
 }
 
 fn telegram_get(token: &str, method: &str) -> Result<String, String> {
@@ -687,19 +728,12 @@ fn telegram_get(token: &str, method: &str) -> Result<String, String> {
         .timeout_connect(std::time::Duration::from_secs(10))
         .timeout_read(std::time::Duration::from_secs(15))
         .build();
-    let response = match agent.get(&url).call() {
-        Ok(resp) => resp.into_string().map_err(|err| err.to_string()),
-        Err(ureq::Error::Status(_, resp)) => resp.into_string().map_err(|err| err.to_string()),
-        Err(err) => Err(err.to_string()),
-    };
-    response.map_err(|err| redact_token(err, token))
-}
-
-fn redact_token(err: String, token: &str) -> String {
-    if token.is_empty() {
-        err
-    } else {
-        err.replace(token, "<redacted>")
+    match agent.get(&url).call() {
+        Ok(resp) => resp
+            .into_string()
+            .map_err(|_| "Telegram response unreadable".into()),
+        Err(ureq::Error::Status(status, _)) => Err(format!("Telegram HTTP {status}")),
+        Err(_) => Err("Telegram network error".into()),
     }
 }
 
@@ -855,6 +889,63 @@ mod tests {
         assert!(telegram_secret("not-a-telegram-token", &key).is_err());
     }
 
+    #[test]
+    fn telegram_response_requires_success_json() {
+        assert!(
+            parse_telegram_response(200, r#"{"ok":false,"description":"secret"}"#)
+                .unwrap_err()
+                .contains("rejected")
+        );
+        assert!(parse_telegram_response(200, "not json")
+            .unwrap_err()
+            .contains("invalid"));
+        assert_eq!(parse_telegram_response(200, r#"{"ok":true}"#), Ok(()));
+    }
+
+    #[test]
+    fn telegram_rate_limit_error_is_bounded_and_redacted() {
+        let token = "123456:ABCDEFGHIJKLMNOPQRST";
+        let body = serde_json::json!({
+            "ok": false,
+            "description": format!(
+                "{token} https://api.telegram.org/bot{token} chat=-123"
+            ),
+            "parameters": {"retry_after": 17},
+        })
+        .to_string();
+        let err = parse_telegram_response(429, &body).unwrap_err();
+        assert_eq!(err, "Telegram HTTP 429 rate limited; retry_after=17s");
+        assert!(!err.contains(token));
+        assert!(!err.contains("api.telegram.org"));
+        assert_eq!(
+            parse_telegram_response(
+                429,
+                r#"{"ok":false,"parameters":{"retry_after":999999999}}"#
+            )
+            .unwrap_err(),
+            "Telegram HTTP 429 rate limited; retry_after=86400s"
+        );
+        let err = parse_telegram_response(500, &body).unwrap_err();
+        assert!(err.starts_with("Telegram HTTP 500"));
+        assert!(!err.contains(token));
+        assert!(!err.contains("api.telegram.org"));
+        assert!(!err.contains("-123"));
+    }
+
+    #[test]
+    fn telegram_message_payload_is_plain_by_default_and_truncated_safely() {
+        let body: serde_json::Value =
+            serde_json::from_str(&telegram_message_body("-123", &"字".repeat(5000), None)).unwrap();
+        assert_eq!(body["chat_id"], "-123");
+        assert!(body.get("parse_mode").is_none());
+        assert!(body["text"].as_str().unwrap().chars().count() <= 4000);
+
+        let html: serde_json::Value =
+            serde_json::from_str(&telegram_message_body("-123", "<b>text</b>", Some("HTML")))
+                .unwrap();
+        assert_eq!(html["parse_mode"], "HTML");
+    }
+
     #[tokio::test]
     async fn send_telegram_rejects_unbound_configuration() {
         assert!(send_telegram("", "", "test").await.is_err());
@@ -934,18 +1025,11 @@ mod tests {
         assert!(
             parse_telegram_bind(r#"{"ok":false,"description":"Unauthorized"}"#, silent)
                 .unwrap_err()
-                .contains("Unauthorized")
+                .contains("token 无效")
         );
         assert!(telegram_token_ok("123456:ABCDEFGHIJKLMNOPQRST"));
         assert!(!telegram_token_ok("123456:short"));
         assert!(!telegram_token_ok("bad/token:ABCDEFGHIJKLMNOPQRST"));
-        assert_eq!(
-            redact_token(
-                "https://api.telegram.org/bot123456:ABCDEFGHIJKLMNOPQRST/x".into(),
-                "123456:ABCDEFGHIJKLMNOPQRST"
-            ),
-            "https://api.telegram.org/bot<redacted>/x"
-        );
     }
 
     #[tokio::test]
@@ -1088,7 +1172,22 @@ mod tests {
             0
         );
         assert_eq!(
+            retry_due(&db, 1_060, |_, _, _| async {
+                parse_telegram_response(200, r#"{"ok":true}"#)
+            })
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_logs WHERE status = 'success'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap(),

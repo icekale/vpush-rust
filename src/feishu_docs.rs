@@ -152,7 +152,6 @@ pub async fn catalog(db: &Db, user_id: i64, is_admin: bool) -> Result<Value, &'s
         .await
         .map_err(|_| "读取文档失败")?;
     let summaries = db.ima_group_summaries().await.map_err(|_| "读取文档失败")?;
-    let mut seen = HashSet::new();
     let mut groups: Vec<Value> = Vec::new();
     for source in sources {
         let gid = source["group_id"].as_str().unwrap_or("").to_string();
@@ -160,7 +159,6 @@ pub async fn catalog(db: &Db, user_id: i64, is_admin: bool) -> Result<Value, &'s
         if gid.is_empty() || !(gate.readable(&gid) || gate.acl.contains(&gid)) {
             continue;
         }
-        seen.insert(format!("{gid}\0{media}"));
         let title = source["title"]
             .as_str()
             .filter(|text| !text.is_empty())

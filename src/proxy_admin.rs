@@ -77,6 +77,64 @@ pub async fn create_pool(
     one_pool(db, id).await
 }
 
+pub async fn pool(db: &Db, id: i64) -> Result<Value, AdminError> {
+    one_pool(db, id).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn update_pool(
+    db: &Db,
+    id: i64,
+    name: Option<&str>,
+    kind: Option<&str>,
+    protocol: Option<&str>,
+    extract_url: Option<&str>,
+    expire_seconds: Option<i64>,
+    refresh_seconds: Option<i64>,
+    enabled: Option<bool>,
+) -> Result<Value, AdminError> {
+    let current = one_pool(db, id).await?;
+    let raw_extract_url: String =
+        sqlx::query_scalar("SELECT extract_url FROM proxy_pools WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .map_err(|_| fail(500, "读取代理池失败"))?;
+    let name = name.unwrap_or_else(|| current["name"].as_str().unwrap_or(""));
+    let kind = kind.unwrap_or_else(|| current["kind"].as_str().unwrap_or("static"));
+    let protocol = protocol.unwrap_or_else(|| current["protocol"].as_str().unwrap_or("http"));
+    let extract_url = extract_url.unwrap_or("");
+    let extract_url = if extract_url.is_empty() {
+        &raw_extract_url
+    } else {
+        extract_url
+    };
+    if name.trim().is_empty() || name.chars().count() > 40 {
+        return Err(bad("名称不能为空"));
+    }
+    check_pool(kind, protocol, extract_url)?;
+    let result = sqlx::query(
+        "UPDATE proxy_pools SET name = ?, kind = ?, extract_url = ?, protocol = ?, expire_seconds = ?, refresh_interval_seconds = ?, enabled = ? WHERE id = ?",
+    )
+    .bind(name.trim())
+    .bind(kind)
+    .bind(extract_url.trim())
+    .bind(protocol)
+    .bind(expire_seconds.unwrap_or_else(|| current["expire_seconds"].as_i64().unwrap_or(0)).max(0))
+    .bind(refresh_seconds.unwrap_or_else(|| current["refresh_interval_seconds"].as_i64().unwrap_or(0)).max(0))
+    .bind(enabled.unwrap_or(current["enabled"].as_i64().unwrap_or(1) != 0))
+    .bind(id)
+    .execute(db.pool())
+    .await;
+    if let Err(err) = result {
+        if err.to_string().contains("UNIQUE") {
+            return Err(bad("代理池名称已存在"));
+        }
+        return Err(fail(500, "更新代理池失败"));
+    }
+    one_pool(db, id).await
+}
+
 pub async fn delete_pool(db: &Db, id: i64) -> Result<(), AdminError> {
     if one_pool(db, id).await.is_err() {
         return Err(missing("代理池不存在"));

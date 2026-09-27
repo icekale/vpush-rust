@@ -498,7 +498,12 @@ fn router(state: AppState) -> Router {
             "/api/admin/proxy-pools/{id}/extract",
             post(extract_proxy_pool),
         )
-        .route("/api/admin/proxy-pools/{id}", delete(delete_proxy_pool))
+        .route(
+            "/api/admin/proxy-pools/{id}",
+            get(get_proxy_pool)
+                .put(update_proxy_pool)
+                .delete(delete_proxy_pool),
+        )
         .route(
             "/api/admin/proxy-routes",
             get(proxy_routes).put(save_proxy_routes),
@@ -5896,6 +5901,16 @@ struct ProxyPoolIn {
 }
 
 #[derive(Deserialize)]
+struct ProxyPoolUpdateIn {
+    name: Option<String>,
+    kind: Option<String>,
+    protocol: Option<String>,
+    extract_url: Option<String>,
+    expire_seconds: Option<i64>,
+    refresh_interval_seconds: Option<i64>,
+    enabled: Option<bool>,
+}
+#[derive(Deserialize)]
 struct ProxyImportIn {
     text: Option<String>,
     protocol: Option<String>,
@@ -5935,6 +5950,46 @@ async fn create_proxy_pool(
             &pool["id"].to_string(),
             &body.name,
         )
+        .await;
+    Ok(Json(pool))
+}
+
+async fn get_proxy_pool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<i64>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers).await?;
+    Ok(Json(
+        proxy_admin::pool(&state.db, id)
+            .await
+            .map_err(proxy_admin_err)?,
+    ))
+}
+
+async fn update_proxy_pool(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(id): UrlPath<i64>,
+    Json(body): Json<ProxyPoolUpdateIn>,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let pool = proxy_admin::update_pool(
+        &state.db,
+        id,
+        body.name.as_deref(),
+        body.kind.as_deref(),
+        body.protocol.as_deref(),
+        body.extract_url.as_deref(),
+        body.expire_seconds,
+        body.refresh_interval_seconds,
+        body.enabled,
+    )
+    .await
+    .map_err(proxy_admin_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "update_proxy_pool", &id.to_string(), "")
         .await;
     Ok(Json(pool))
 }

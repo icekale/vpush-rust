@@ -151,7 +151,7 @@ pub async fn catalog(db: &Db, user_id: i64, is_admin: bool) -> Result<Value, &'s
         .active_feishu_sources()
         .await
         .map_err(|_| "读取文档失败")?;
-    let index = db.ima_index().await.map_err(|_| "读取文档失败")?;
+    let summaries = db.ima_group_summaries().await.map_err(|_| "读取文档失败")?;
     let mut seen = HashSet::new();
     let mut groups: Vec<Value> = Vec::new();
     for source in sources {
@@ -170,21 +170,23 @@ pub async fn catalog(db: &Db, user_id: i64, is_admin: bool) -> Result<Value, &'s
         let day = if day.len() >= 10 { &day[..10] } else { "" };
         push_catalog_group(&mut groups, &gid, &title, day, &media, 1);
     }
-    for doc in &index {
-        let gid = doc["group_id"].as_str().unwrap_or("");
-        let media = doc["media_id"].as_str().unwrap_or("");
-        if gid.is_empty()
-            || !(gate.readable(gid) || gate.acl.contains(gid))
-            || !seen.insert(format!("{gid}\0{media}"))
-        {
+    for summary in summaries {
+        let gid = summary["group_id"].as_str().unwrap_or("");
+        if gid.is_empty() || !(gate.readable(gid) || gate.acl.contains(gid)) {
             continue;
         }
-        let title = doc["name"]
+        let title = summary["group_name"]
             .as_str()
             .filter(|text| !text.is_empty())
             .unwrap_or(gid);
-        let day = doc["sort_date"].as_str().unwrap_or("");
-        push_catalog_group(&mut groups, gid, title, day, media, 1);
+        push_catalog_group(
+            &mut groups,
+            gid,
+            title,
+            summary["latest_day"].as_str().unwrap_or(""),
+            summary["latest_media_id"].as_str().unwrap_or(""),
+            summary["document_count"].as_i64().unwrap_or(0),
+        );
     }
     if is_admin {
         for group in &mut groups {

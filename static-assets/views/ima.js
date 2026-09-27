@@ -453,19 +453,11 @@ export function createImaView(dependencies) {
     } else {
       params.set("day", day);
     }
-    // 首屏只取列表：无筛选的全量列表在冷页缓存下分面聚合比列表切片慢一个量级，改由 refreshImaListFacets() 随后单独取
     if (options.facetsOnly) params.set("facets_only", "1");
-    else if (imaFacetsDeferred()) params.set("include_facets", "0");
     return `/api/ima-documents?${params.toString()}`;
   }
 
-  // 只有无筛选的默认列表才延后分面（这种全量列表的分面聚合最贵）；搜索/标签/按日路径照旧一次拿全
-  function imaFacetsDeferred() {
-    const params = routeQuery();
-    if (imaUsableSearchQuery(params.get("q") || "")) return false;
-    return !params.get("tag") && !params.get("day");
-  }
-
+  // 列表请求同时返回分面，避免打开页面时重复扫描文档索引。
   function imaDocumentsRoute(group, query, day, tag) {
     const params = new URLSearchParams();
     if (group) params.set("group", group);
@@ -872,11 +864,10 @@ export function createImaView(dependencies) {
 
   function prefetchKnowledge(mediaId = "") {
     const catalog = api("/api/ima-documents/catalog");
-    const documents = mediaId || currentImaListSnapshot() ? null : api(imaDocumentsRequestPath());
     return {
       catalog,
-      documents,
-      settled: Promise.allSettled(documents ? [catalog, documents] : [catalog]),
+      documents: null,
+      settled: Promise.allSettled([catalog]),
     };
   }
 
@@ -1162,10 +1153,7 @@ export function createImaView(dependencies) {
       _imaItems.length = 0;
       _imaItems.push(...items);
       state.imaDocumentsHasMore = !!(paged && data.has_more);
-      void refreshImaListFacets(seq);
       const body = $("#ima-docs-body");
-      if (!items.length) {
-        body.innerHTML = imaDocumentsEmptyHtml(hasFilter);
         return;
       }
       const more = state.imaDocumentsHasMore
@@ -1220,18 +1208,6 @@ export function createImaView(dependencies) {
       meta.textContent = imaDocumentsCountLabel(searchMode, data.document_count, itemCount, hasMore);
     }
     syncImaDocumentsFilterStatus();
-  }
-
-  // 列表已画完才去补分面（计数/日期/标签）；失败仅影响这几个显示，列表照常可用
-  async function refreshImaListFacets(seq) {
-    if (!imaFacetsDeferred()) return;
-    try {
-      const data = await api(imaDocumentsRequestPath({ facetsOnly: true }));
-      if (!routeStillActive(seq)) return;
-      applyImaListFacets(data, _imaItems.length, state.imaDocumentsHasMore);
-    } catch (err) {
-      console.warn("ima facets refresh failed", err);
-    }
   }
 
   function imaDocumentsFilterChipsHtml() {

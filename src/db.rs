@@ -832,6 +832,27 @@ impl Db {
         Ok((stamp, n))
     }
 
+    pub async fn ima_group_summaries(&self) -> Result<Vec<Value>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT group_id, COUNT(*) AS document_count, MAX(sort_date) AS latest_day, \
+                    MAX(media_id) AS latest_media_id, MAX(group_name) AS group_name \
+             FROM ima_document_index GROUP BY group_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "group_id": row.get::<String, _>("group_id"),
+                    "document_count": row.get::<i64, _>("document_count"),
+                    "latest_day": row.get::<Option<String>, _>("latest_day").unwrap_or_default(),
+                    "latest_media_id": row.get::<Option<String>, _>("latest_media_id").unwrap_or_default(),
+                    "group_name": row.get::<Option<String>, _>("group_name").unwrap_or_default(),
+                })
+            })
+            .collect())
+    }
     pub async fn ima_index(&self) -> Result<Vec<Value>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT group_id, media_id, day, sort_date, name, group_name, abstract, size, chars, pdf_path, txt_path, downloaded_at FROM ima_document_index",

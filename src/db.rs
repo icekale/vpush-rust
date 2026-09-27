@@ -182,7 +182,8 @@ CREATE TABLE IF NOT EXISTS users (
     llm_api_key TEXT NOT NULL DEFAULT '',
     llm_model TEXT NOT NULL DEFAULT '',
     llm_api_format TEXT NOT NULL DEFAULT 'chat',
-    wechat_openid TEXT NOT NULL DEFAULT ''
+    wechat_openid TEXT NOT NULL DEFAULT '',
+    telegram_provisional INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wechat_openid ON users(wechat_openid) WHERE wechat_openid != '';
 CREATE TABLE IF NOT EXISTS bind_codes (
@@ -2574,6 +2575,78 @@ impl Db {
         Ok(row.map(user_from_row))
     }
 
+    pub async fn user_by_telegram_chat_id(
+        &self,
+        identity: &str,
+    ) -> Result<Option<User>, sqlx::Error> {
+        if identity.trim().is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ? LIMIT 1")
+            .bind(identity.trim())
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row.map(user_from_row))
+    }
+
+    // The caller must pass true only for a private Telegram chat.
+    pub async fn get_or_create_telegram_user(
+        &self,
+        identity: &str,
+        display_name: &str,
+        is_private: bool,
+    ) -> Result<Option<User>, CatalogError> {
+        if !is_private {
+            return Ok(None);
+        }
+        let identity = identity.trim();
+        if identity.is_empty() {
+            return Err(CatalogError::Bad("绑定身份不能为空"));
+        }
+        let mut tx = self.pool.begin().await?;
+        if let Some(row) = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ? LIMIT 1")
+            .bind(identity)
+            .fetch_optional(&mut *tx)
+            .await?
+        {
+            return Ok(Some(user_from_row(row)));
+        }
+        let preferred: String = display_name.trim().chars().take(30).collect();
+        let fallback: String = format!("tg_{identity}").chars().take(30).collect();
+        for candidate in [preferred.as_str(), fallback.as_str()] {
+            if candidate.is_empty() {
+                continue;
+            }
+            let result = sqlx::query("INSERT OR IGNORE INTO users (username, telegram_chat_id, telegram_provisional) VALUES (?, ?, 1)")
+                .bind(candidate).bind(identity).execute(&mut *tx).await?;
+            if result.rows_affected() != 0 {
+                let row = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ?")
+                    .bind(identity)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                return Ok(Some(user_from_row(row)));
+            }
+        }
+        // A stable numeric suffix handles collisions with both display names and tg_<id>.
+        for n in 1..=100 {
+            let suffix = format!("_{n}");
+            let base: String = fallback.chars().take(30 - suffix.len()).collect();
+            let name = format!("{base}{suffix}");
+            let result = sqlx::query("INSERT OR IGNORE INTO users (username, telegram_chat_id, telegram_provisional) VALUES (?, ?, 1)")
+                .bind(name).bind(identity).execute(&mut *tx).await?;
+            if result.rows_affected() != 0 {
+                let row = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ?")
+                    .bind(identity)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                return Ok(Some(user_from_row(row)));
+            }
+        }
+        Err(CatalogError::Bad("无法分配 Telegram 用户名"))
+    }
+
     pub async fn user_by_openid(&self, openid: &str) -> Result<Option<User>, sqlx::Error> {
         let row =
             sqlx::query("SELECT * FROM users WHERE wechat_openid = ? AND wechat_openid != ''")
@@ -2860,8 +2933,106 @@ impl Db {
                 .await?
             }
         };
-        if owner.is_some() {
-            return Err(CatalogError::Bad("该渠道已绑定其他账号"));
+        if let Some(owner) = owner {
+            if column != "telegram_chat_id" {
+                return Err(CatalogError::Bad("该渠道已绑定其他账号"));
+            }
+            let owner_count: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM users WHERE telegram_chat_id = ? AND id != ?",
+            )
+            .bind(identity)
+            .bind(user_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if owner_count != 1 {
+                return Err(CatalogError::Bad("该渠道已绑定其他账号"));
+            }
+            // Legacy Python bot accounts have no marker; credential and associated
+            // session checks are mandatory for both legacy and new accounts.
+            let eligible: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM users WHERE id = ? AND telegram_chat_id = ?
+                 AND password_hash = '' AND is_admin = 0 AND wechat_openid = ''
+                 AND feishu_open_id = '' AND feishu_chat_id = '' AND telegram_bot_token = ''
+                 AND wecom_webhook = '' AND bark_key = '' AND llm_api_key = ''
+                 AND token_version = 0 AND last_login_at IS NULL
+                 AND NOT EXISTS (SELECT 1 FROM webpush_subscriptions WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM android_devices WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM feishu_personal_bots WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM feishu_registration_sessions WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM feishu_oauth_sessions WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM kol_acl WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM kol_requests WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM register_codes WHERE used_by = users.id OR created_by = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM ima_kb_acl WHERE user_id = users.id)
+                 AND NOT EXISTS (SELECT 1 FROM ima_kb_subscriptions WHERE user_id = users.id)"
+            ).bind(owner).bind(identity).fetch_optional(&mut *tx).await?;
+            if eligible.is_none() {
+                return Err(CatalogError::Bad("该渠道已绑定其他账号"));
+            }
+            sqlx::query(
+                "INSERT INTO subscriptions (user_id, kol_id, type, favorite, secondary, hide_images)
+                 SELECT ?, kol_id, type, favorite, secondary, hide_images FROM subscriptions WHERE user_id = ?
+                 ON CONFLICT(user_id, kol_id) DO UPDATE SET
+                   type = CASE WHEN subscriptions.type = excluded.type THEN subscriptions.type ELSE 'both' END,
+                   favorite = MAX(subscriptions.favorite, excluded.favorite),
+                   secondary = MAX(subscriptions.secondary, excluded.secondary),
+                   hide_images = MAX(subscriptions.hide_images, excluded.hide_images)"
+            ).bind(user_id).bind(owner).execute(&mut *tx).await?;
+            for table in [
+                "user_news_sources",
+                "news_reads",
+                "news_keyword_notified",
+                "knowledge_keyword_notified",
+            ] {
+                let columns = match table {
+                    "user_news_sources" => "user_id, source_id",
+                    "news_reads" => "user_id, article_id",
+                    "news_keyword_notified" => "user_id, article_id, created_at",
+                    _ => "user_id, group_id, media_id, created_at",
+                };
+                let values = match table {
+                    "user_news_sources" => "?, source_id",
+                    "news_reads" => "?, article_id",
+                    "news_keyword_notified" => "?, article_id, created_at",
+                    _ => "?, group_id, media_id, created_at",
+                };
+                sqlx::query(&format!("INSERT OR IGNORE INTO {table} ({columns}) SELECT {values} FROM {table} WHERE user_id = ?"))
+                    .bind(user_id).bind(owner).execute(&mut *tx).await?;
+            }
+            sqlx::query("INSERT INTO news_seen (user_id, seen_at) SELECT ?, seen_at FROM news_seen WHERE user_id = ? ON CONFLICT(user_id) DO UPDATE SET seen_at = MAX(news_seen.seen_at, excluded.seen_at)")
+                .bind(user_id).bind(owner).execute(&mut *tx).await?;
+            sqlx::query("UPDATE users SET telegram_chat_id = ?, news_last_seen_at = MAX(news_last_seen_at, (SELECT news_last_seen_at FROM users WHERE id = ?)) WHERE id = ?")
+                .bind(identity).bind(owner).bind(user_id).execute(&mut *tx).await?;
+            for table in [
+                "subscriptions",
+                "user_news_sources",
+                "news_reads",
+                "news_seen",
+                "news_keyword_notified",
+                "knowledge_keyword_notified",
+                "push_retries",
+                "push_logs",
+                "bind_codes",
+                "bind_quota",
+            ] {
+                if table == "bind_quota" {
+                    sqlx::query("DELETE FROM bind_quota WHERE key = ?")
+                        .bind(format!("issue:{owner}"))
+                        .execute(&mut *tx)
+                        .await?;
+                } else {
+                    sqlx::query(&format!("DELETE FROM {table} WHERE user_id = ?"))
+                        .bind(owner)
+                        .execute(&mut *tx)
+                        .await?;
+                }
+            }
+            sqlx::query("DELETE FROM users WHERE id = ?")
+                .bind(owner)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            return Ok(Some(user_id));
         }
         let sql = match column {
             "telegram_chat_id" => "UPDATE users SET telegram_chat_id = ? WHERE id = ?",
@@ -7282,6 +7453,7 @@ async fn ensure_user_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
         ("llm_model", "TEXT NOT NULL DEFAULT ''"),
         ("llm_api_format", "TEXT NOT NULL DEFAULT 'chat'"),
         ("news_last_seen_at", "TEXT NOT NULL DEFAULT ''"),
+        ("telegram_provisional", "INTEGER NOT NULL DEFAULT 0"),
         ("wechat_openid", "TEXT NOT NULL DEFAULT ''"),
     ];
     for (name, def) in columns {
@@ -8693,6 +8865,279 @@ mod tests {
             .unwrap();
         assert_eq!(still, 1);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn telegram_first_contact_and_bind_merge() {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let target: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('Alice', 'hash')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db
+            .get_or_create_telegram_user("-100", "Alice", false)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(db.user_by_telegram_chat_id("-100").await.unwrap().is_none());
+        let source = db
+            .get_or_create_telegram_user("123", "Alice", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(source.username, "tg_123");
+        let marker: i64 = sqlx::query_scalar("SELECT telegram_provisional FROM users WHERE id = ?")
+            .bind(source.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(marker, 1);
+        assert_eq!(
+            source.id,
+            db.get_or_create_telegram_user("123", "Other", true)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        );
+        sqlx::query("INSERT INTO users (username) VALUES ('tg_456')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let collision = db
+            .get_or_create_telegram_user("456", "Alice", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(collision.username, "tg_456_1");
+        assert_eq!(
+            collision.id,
+            db.get_or_create_telegram_user("456", "Alice", true)
+                .await
+                .unwrap()
+                .unwrap()
+                .id
+        );
+        let empty = db
+            .get_or_create_telegram_user("7890", "", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.username, "tg_7890");
+        assert!(db
+            .get_or_create_telegram_user("", "No ID", true)
+            .await
+            .is_err());
+        let kol = db
+            .add_kol("weibo", "a", "a", None, false, false, false)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO subscriptions (user_id, kol_id, type, secondary) VALUES (?, ?, 'post', 1)",
+        )
+        .bind(target)
+        .bind(kol)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id, type, favorite, hide_images) VALUES (?, ?, 'reply', 1, 1)")
+            .bind(source.id).bind(kol).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO user_news_sources VALUES (?, 1), (?, 2), (?, 2)")
+            .bind(target)
+            .bind(target)
+            .bind(source.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_reads VALUES (?, 4), (?, 4), (?, 5)")
+            .bind(target)
+            .bind(source.id)
+            .bind(source.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_seen VALUES (?, '2026-01-01'), (?, '2026-02-01')")
+            .bind(target)
+            .bind(source.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE users SET news_last_seen_at = '2026-02-01' WHERE id = ?")
+            .bind(source.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let (code, _) = db.issue_bind_code(target, 1000).await.unwrap();
+        assert_eq!(
+            db.consume_bind_code(&code, "telegram_chat_id", "123", 1001)
+                .await
+                .unwrap(),
+            Some(target)
+        );
+        assert_eq!(
+            db.consume_bind_code(&code, "telegram_chat_id", "123", 1001)
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(db.user_by_id(source.id).await.unwrap().is_none());
+        assert_eq!(
+            db.user_by_telegram_chat_id("123")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            target
+        );
+        let sub: (String, i64, i64, i64) = sqlx::query_as("SELECT type, favorite, secondary, hide_images FROM subscriptions WHERE user_id = ? AND kol_id = ?")
+            .bind(target).bind(kol).fetch_one(db.pool()).await.unwrap();
+        assert_eq!(sub, ("both".into(), 1, 1, 1));
+        let sources: Vec<i64> = sqlx::query_scalar(
+            "SELECT source_id FROM user_news_sources WHERE user_id = ? ORDER BY source_id",
+        )
+        .bind(target)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(sources, vec![1, 2]);
+        let reads: Vec<i64> = sqlx::query_scalar(
+            "SELECT article_id FROM news_reads WHERE user_id = ? ORDER BY article_id",
+        )
+        .bind(target)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(reads, vec![4, 5]);
+        assert_eq!(db.news_seen(target).await.unwrap(), "2026-02-01");
+        let seen: String = sqlx::query_scalar("SELECT news_last_seen_at FROM users WHERE id = ?")
+            .bind(target)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(seen, "2026-02-01");
+        let (code, _) = db.issue_bind_code(target, 1600).await.unwrap();
+        let legacy: i64 = sqlx::query_scalar("INSERT INTO users (username, telegram_chat_id) VALUES ('Legacy Name', '789') RETURNING id")
+            .fetch_one(db.pool()).await.unwrap();
+        assert_eq!(
+            db.consume_bind_code(&code, "telegram_chat_id", "789", 1601)
+                .await
+                .unwrap(),
+            Some(target)
+        );
+        assert!(db.user_by_id(legacy).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_rejects_non_provisional_owner_and_rolls_back_code() {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let target: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for (index, column) in [
+            "password_hash",
+            "is_admin",
+            "wechat_openid",
+            "feishu_open_id",
+            "telegram_bot_token",
+            "llm_api_key",
+            "wecom_webhook",
+            "bark_key",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let identity = format!("{index}");
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO users (username, telegram_chat_id) VALUES (?, ?) RETURNING id",
+            )
+            .bind(format!("owner{index}"))
+            .bind(&identity)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            if *column == "is_admin" {
+                sqlx::query("UPDATE users SET is_admin = 1 WHERE id = ?")
+                    .bind(id)
+                    .execute(db.pool())
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query(&format!(
+                    "UPDATE users SET {column} = 'credential' WHERE id = ?"
+                ))
+                .bind(id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            }
+            let (code, _) = db
+                .issue_bind_code(target, 1000 + index as i64 * 600)
+                .await
+                .unwrap();
+            assert!(matches!(
+                db.consume_bind_code(
+                    &code,
+                    "telegram_chat_id",
+                    &identity,
+                    1001 + index as i64 * 600
+                )
+                .await,
+                Err(CatalogError::Bad("该渠道已绑定其他账号"))
+            ));
+            let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bind_codes WHERE code = ?")
+                .bind(bind_code_digest(&code))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(still, 1);
+            assert_eq!(
+                db.user_by_telegram_chat_id(&identity)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                id
+            );
+        }
+        let id: i64 = sqlx::query_scalar("INSERT INTO users (username, telegram_chat_id) VALUES ('device_owner', 'device') RETURNING id")
+            .fetch_one(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO webpush_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, 'https://example.com/push', 'key', 'auth')")
+            .bind(id).execute(db.pool()).await.unwrap();
+        let (code, _) = db.issue_bind_code(target, 6000).await.unwrap();
+        assert!(matches!(
+            db.consume_bind_code(&code, "telegram_chat_id", "device", 6001)
+                .await,
+            Err(CatalogError::Bad("该渠道已绑定其他账号"))
+        ));
+        assert_eq!(
+            db.user_by_telegram_chat_id("device")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            id
+        );
+        sqlx::query("INSERT INTO users (username, telegram_chat_id) VALUES ('duplicate1', 'shared'), ('duplicate2', 'shared')")
+            .execute(db.pool()).await.unwrap();
+        let (code, _) = db.issue_bind_code(target, 6600).await.unwrap();
+        assert!(matches!(
+            db.consume_bind_code(&code, "telegram_chat_id", "shared", 6601)
+                .await,
+            Err(CatalogError::Bad("该渠道已绑定其他账号"))
+        ));
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE telegram_chat_id = 'shared'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]

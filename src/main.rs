@@ -25,6 +25,8 @@ mod push;
 mod reports;
 mod syslogs;
 mod tags;
+#[cfg(test)]
+mod telegram_bot;
 mod truth;
 mod twitter;
 mod url_guard;

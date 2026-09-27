@@ -466,7 +466,7 @@ fn router(state: AppState) -> Router {
         )
         .route(
             "/api/admin/feishu-documents/oauth/callback",
-            get(feishu_docs_oauth_callback),
+            get(feishu_docs_oauth_callback).post(feishu_docs_oauth_callback_post),
         )
         .route(
             "/api/admin/feishu-documents/preview",
@@ -528,6 +528,10 @@ fn router(state: AppState) -> Router {
         .route("/api/ima-documents/catalog", get(feishu_catalog))
         .route("/api/ima-documents", get(feishu_documents))
         .route("/api/ima-documents/timeline/all", get(feishu_timeline))
+        .route(
+            "/api/ima-documents/{media_id}/timeline",
+            get(feishu_document_timeline),
+        )
         .route("/api/ima-documents/tickers/{code}", get(ima_ticker))
         .route(
             "/api/ima-documents/{media_id}/translate",
@@ -2705,6 +2709,44 @@ async fn feishu_timeline(
         )),
         Err(msg) => Err(ApiError::new(StatusCode::BAD_REQUEST, msg)),
     }
+}
+
+async fn feishu_document_timeline(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(media_id): UrlPath<String>,
+    Query(q): Query<FeishuTimelineQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    if media_id.is_empty() || media_id.len() > 128 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "文档标识无效"));
+    }
+    let value = feishu_docs::timeline_all(
+        &state.db,
+        &archive_root(),
+        user.id,
+        user.is_admin,
+        q.group.as_deref().unwrap_or(""),
+        q.order.as_deref().unwrap_or("latest"),
+        None,
+        "",
+    )
+    .await
+    .map_err(|msg| match msg {
+        "文档不存在" => ApiError::new(StatusCode::NOT_FOUND, msg),
+        _ => ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, msg),
+    })?;
+    let matches = |item: &Value| item["source"]["media_id"] == media_id;
+    let result = json!({
+        "source": value["sources"].as_array().and_then(|items| items.iter().find(|item| item["media_id"] == media_id)).cloned().unwrap_or(Value::Null),
+        "notices": value["notices"].as_array().map(|items| items.iter().filter(|item| matches(item)).cloned().collect::<Vec<_>>()).unwrap_or_default(),
+        "entries": value["entries"].as_array().map(|items| items.iter().filter(|item| matches(item)).cloned().collect::<Vec<_>>()).unwrap_or_default(),
+        "order": q.order.as_deref().unwrap_or("latest"),
+    });
+    if result["source"].is_null() {
+        return Err(ApiError::new(StatusCode::NOT_FOUND, "飞书文档不存在"));
+    }
+    Ok(Json(result))
 }
 
 #[derive(Deserialize)]
@@ -5479,6 +5521,47 @@ async fn feishu_docs_oauth_start(
         .add_admin_log(admin.id, "start_feishu_documents_oauth", "", "")
         .await;
     Ok(response)
+}
+
+#[derive(Deserialize)]
+struct FeishuOauthBody {
+    state: String,
+    code: String,
+}
+
+async fn feishu_docs_oauth_callback_post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<FeishuOauthBody>,
+) -> Result<Json<Value>, ApiError> {
+    let admin = require_admin(&state, &headers).await?;
+    let cookie_hash = hex::encode(sha2::Sha256::digest(body.state.trim().as_bytes()));
+    let verifier = feishu_admin::take_session(&state.db, &body.state, &cookie_hash)
+        .await
+        .map_err(feishu_admin_err)?;
+    let cfg = feishu_admin::overview(&state.db)
+        .await
+        .map_err(feishu_admin_err)?;
+    let app_id = cfg["config"]["app_id"].as_str().unwrap_or("");
+    let redirect = cfg["config"]["redirect_uri"].as_str().unwrap_or("");
+    let secret = if let Some(secret) = std::env::var("FEISHU_DOCS_APP_SECRET")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        secret
+    } else {
+        feishu_secret(&state.db).await?
+    };
+    let token = feishu_admin::exchange_code(app_id, &secret, redirect, &body.code, &verifier)
+        .map_err(feishu_admin_err)?;
+    feishu_admin::save_token(&state.db, &token)
+        .await
+        .map_err(feishu_admin_err)?;
+    let _ = state
+        .db
+        .add_admin_log(admin.id, "finish_feishu_documents_oauth", "", "")
+        .await;
+    Ok(Json(json!({"ok": true})))
 }
 
 async fn feishu_docs_oauth_callback(

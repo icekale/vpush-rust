@@ -103,11 +103,6 @@ def route_table(title: str, routes: list[tuple[str, str, int]]) -> list[str]:
     return rows + [""]
 
 
-    rows = [f"## {title}", "", "| Method | Path | Line |", "|---|---|---:|"]
-    rows.extend(f"| `{method}` | `{route}` | {line} |" for method, route, line in routes)
-    return rows + [""]
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--python", type=Path, required=True)

@@ -2947,14 +2947,22 @@ impl Db {
             if owner_count != 1 {
                 return Err(CatalogError::Bad("该渠道已绑定其他账号"));
             }
-            // Legacy Python bot accounts have no marker; credential and associated
-            // session checks are mandatory for both legacy and new accounts.
+            // Only explicitly marked bot accounts with default personal settings
+            // may be absorbed; credentials and other bindings remain disqualifying.
             let eligible: Option<i64> = sqlx::query_scalar(
                 "SELECT id FROM users WHERE id = ? AND telegram_chat_id = ?
+                 AND telegram_provisional = 1
                  AND password_hash = '' AND is_admin = 0 AND wechat_openid = ''
                  AND feishu_open_id = '' AND feishu_chat_id = '' AND telegram_bot_token = ''
                  AND wecom_webhook = '' AND bark_key = '' AND llm_api_key = ''
                  AND token_version = 0 AND last_login_at IS NULL
+                 AND notify_enabled = 1 AND daily_report = 0 AND translate_twitter = 1
+                 AND push_channels = '' AND dnd_start = '' AND dnd_end = ''
+                 AND dnd_allow_favorite = 0 AND keywords = '[]'
+                 AND keywords_match_reports = 0 AND keywords_match_reports_since = ''
+                 AND keywords_match_news = 0 AND keywords_match_news_since = ''
+                 AND news_font_size = '' AND llm_api_base = '' AND llm_model = ''
+                 AND llm_api_format = 'chat'
                  AND NOT EXISTS (SELECT 1 FROM webpush_subscriptions WHERE user_id = users.id)
                  AND NOT EXISTS (SELECT 1 FROM android_devices WHERE user_id = users.id)
                  AND NOT EXISTS (SELECT 1 FROM feishu_personal_bots WHERE user_id = users.id)
@@ -3003,6 +3011,19 @@ impl Db {
                 .bind(user_id).bind(owner).execute(&mut *tx).await?;
             sqlx::query("UPDATE users SET telegram_chat_id = ?, news_last_seen_at = MAX(news_last_seen_at, (SELECT news_last_seen_at FROM users WHERE id = ?)) WHERE id = ?")
                 .bind(identity).bind(owner).bind(user_id).execute(&mut *tx).await?;
+            sqlx::query(
+                "INSERT INTO push_retries (channel, user_id, platform, external_id, post_id, attempts, next_at)
+                 SELECT channel, ?, platform, external_id, post_id, attempts, next_at
+                 FROM push_retries WHERE user_id = ?
+                 ON CONFLICT(channel, user_id, platform, external_id) DO UPDATE SET
+                   attempts = MAX(push_retries.attempts, excluded.attempts),
+                   next_at = MIN(push_retries.next_at, excluded.next_at)"
+            ).bind(user_id).bind(owner).execute(&mut *tx).await?;
+            sqlx::query("UPDATE push_logs SET user_id = ? WHERE user_id = ?")
+                .bind(user_id)
+                .bind(owner)
+                .execute(&mut *tx)
+                .await?;
             for table in [
                 "subscriptions",
                 "user_news_sources",
@@ -3011,7 +3032,6 @@ impl Db {
                 "news_keyword_notified",
                 "knowledge_keyword_notified",
                 "push_retries",
-                "push_logs",
                 "bind_codes",
                 "bind_quota",
             ] {
@@ -9023,13 +9043,163 @@ mod tests {
         let (code, _) = db.issue_bind_code(target, 1600).await.unwrap();
         let legacy: i64 = sqlx::query_scalar("INSERT INTO users (username, telegram_chat_id) VALUES ('Legacy Name', '789') RETURNING id")
             .fetch_one(db.pool()).await.unwrap();
-        assert_eq!(
+        assert!(matches!(
             db.consume_bind_code(&code, "telegram_chat_id", "789", 1601)
+                .await,
+            Err(CatalogError::Bad("该渠道已绑定其他账号"))
+        ));
+        assert!(db.user_by_id(legacy).await.unwrap().is_some());
+        let code_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bind_codes WHERE code = ?")
+            .bind(bind_code_digest(&code))
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(code_count, 1);
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_preserves_push_history_and_retry_collisions() {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let target: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let source = db
+            .get_or_create_telegram_user("history", "Bot", true)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("INSERT INTO push_logs (post_id, channel, status, error, user_id) VALUES (11, 'telegram', 'failed', 'source error', ?), (12, 'telegram', 'success', '', ?)")
+            .bind(source.id).bind(target).execute(db.pool()).await.unwrap();
+        sqlx::query("INSERT INTO push_retries (channel, user_id, platform, external_id, post_id, attempts, next_at) VALUES ('telegram', ?, 'weibo', 'collision', 11, 5, 120), ('telegram', ?, 'weibo', 'source-only', 12, 3, 130), ('telegram', ?, 'weibo', 'collision', 10, 2, 200)")
+            .bind(source.id).bind(source.id).bind(target).execute(db.pool()).await.unwrap();
+        let (code, _) = db.issue_bind_code(target, 1000).await.unwrap();
+        assert_eq!(
+            db.consume_bind_code(&code, "telegram_chat_id", "history", 1001)
                 .await
                 .unwrap(),
             Some(target)
         );
-        assert!(db.user_by_id(legacy).await.unwrap().is_none());
+        assert!(db.user_by_id(source.id).await.unwrap().is_none());
+        let logs: Vec<(i64, String, String)> = sqlx::query_as(
+            "SELECT post_id, status, error FROM push_logs WHERE user_id = ? ORDER BY post_id",
+        )
+        .bind(target)
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            logs,
+            vec![
+                (11, "failed".into(), "source error".into()),
+                (12, "success".into(), "".into())
+            ]
+        );
+        let retries: Vec<(String, i64, i64, i64)> = sqlx::query_as("SELECT external_id, post_id, attempts, next_at FROM push_retries WHERE user_id = ? ORDER BY external_id")
+            .bind(target).fetch_all(db.pool()).await.unwrap();
+        assert_eq!(
+            retries,
+            vec![
+                ("collision".into(), 10, 5, 120),
+                ("source-only".into(), 12, 3, 130)
+            ]
+        );
+        let old_logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_logs WHERE user_id = ?")
+            .bind(source.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let old_retries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM push_retries WHERE user_id = ?")
+                .bind(source.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((old_logs, old_retries), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn telegram_bind_rejects_personal_settings_without_consuming_code() {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let target: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for (index, (column, value)) in [
+            ("notify_enabled", "0"),
+            ("daily_report", "1"),
+            ("translate_twitter", "0"),
+            ("push_channels", "telegram"),
+            ("dnd_start", "22:00"),
+            ("dnd_end", "06:00"),
+            ("dnd_allow_favorite", "1"),
+            ("keywords", "[\"word\"]"),
+            ("keywords_match_reports", "1"),
+            ("keywords_match_reports_since", "yesterday"),
+            ("keywords_match_news", "1"),
+            ("keywords_match_news_since", "yesterday"),
+            ("news_font_size", "large"),
+            ("llm_api_base", "https://example.com"),
+            ("llm_model", "custom"),
+            ("llm_api_format", "other"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let identity = format!("settings{index}");
+            let source = db
+                .get_or_create_telegram_user(&identity, "Bot", true)
+                .await
+                .unwrap()
+                .unwrap();
+            sqlx::query(&format!("UPDATE users SET {column} = ? WHERE id = ?"))
+                .bind(value)
+                .bind(source.id)
+                .execute(db.pool())
+                .await
+                .unwrap();
+            let (code, _) = db
+                .issue_bind_code(target, 1000 + index as i64 * 600)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    db.consume_bind_code(
+                        &code,
+                        "telegram_chat_id",
+                        &identity,
+                        1001 + index as i64 * 600
+                    )
+                    .await,
+                    Err(CatalogError::Bad("该渠道已绑定其他账号"))
+                ),
+                "{column}"
+            );
+            let preserved: String = sqlx::query_scalar(&format!(
+                "SELECT CAST({column} AS TEXT) FROM users WHERE id = ?"
+            ))
+            .bind(source.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            assert_eq!(preserved, *value, "{column}");
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM bind_codes WHERE code = ?")
+                .bind(bind_code_digest(&code))
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(count, 1, "{column}");
+            assert_eq!(
+                db.user_by_telegram_chat_id(&identity)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+                source.id
+            );
+        }
     }
 
     #[tokio::test]
@@ -9055,7 +9225,7 @@ mod tests {
         {
             let identity = format!("{index}");
             let id: i64 = sqlx::query_scalar(
-                "INSERT INTO users (username, telegram_chat_id) VALUES (?, ?) RETURNING id",
+                "INSERT INTO users (username, telegram_chat_id, telegram_provisional) VALUES (?, ?, 1) RETURNING id",
             )
             .bind(format!("owner{index}"))
             .bind(&identity)
@@ -9106,7 +9276,7 @@ mod tests {
                 id
             );
         }
-        let id: i64 = sqlx::query_scalar("INSERT INTO users (username, telegram_chat_id) VALUES ('device_owner', 'device') RETURNING id")
+        let id: i64 = sqlx::query_scalar("INSERT INTO users (username, telegram_chat_id, telegram_provisional) VALUES ('device_owner', 'device', 1) RETURNING id")
             .fetch_one(db.pool()).await.unwrap();
         sqlx::query("INSERT INTO webpush_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, 'https://example.com/push', 'key', 'auth')")
             .bind(id).execute(db.pool()).await.unwrap();

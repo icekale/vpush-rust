@@ -7,6 +7,8 @@ const MAX_INPUT_CHARS: usize = 4096;
 const MAX_OUTPUT_CHARS: usize = 4096;
 const BIND_TRY_LIMIT: i64 = 5;
 const BIND_TRY_WINDOW_SECS: i64 = 600;
+const ASK_TRY_LIMIT: i64 = 5;
+const ASK_TRY_WINDOW_SECS: i64 = 600;
 const BIND_CODE_ALPHABET: &str = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
 
 #[allow(dead_code)]
@@ -41,9 +43,17 @@ pub struct TelegramButton {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramNotification {
+    pub chat_id: String,
+    pub text: String,
+    pub keyboard: Option<Vec<Vec<TelegramButton>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramResponse {
     pub text: String,
     pub keyboard: Option<Vec<Vec<TelegramButton>>>,
+    pub notifications: Vec<TelegramNotification>,
     pub answer_callback_query_id: Option<String>,
     pub edit_message: Option<TelegramEditMessage>,
 }
@@ -65,6 +75,7 @@ enum Command {
     Subscribe(String, String),
     Unsubscribe(String),
     MySubscriptions,
+    Ask(String, String, String),
     Bind(String),
 }
 
@@ -104,6 +115,7 @@ pub async fn handle_message(
         Some(Command::Subscribe(reference, kind)) => subscribe(db, &user, &reference, &kind).await,
         Some(Command::Unsubscribe(reference)) => unsubscribe(db, &user, &reference).await,
         Some(Command::MySubscriptions) => my_subscriptions(db, &user).await,
+        Some(Command::Ask(platform, raw, name)) => ask(db, &user, &platform, &raw, &name, now).await,
         None => Ok(response(help_text())),
     };
     let response = match result {
@@ -165,7 +177,22 @@ async fn dispatch_callback(
         "unsub" if parts.clone().count() == 1 => {
             callback_unsubscribe(db, user, parts.next().unwrap_or_default()).await
         }
-        // Rich post-card actions need the Task 8 post-card context and remain deferred here.
+        "approve" if user.is_admin && parts.clone().count() == 1 => {
+            callback_approve(db, user, parts.next().unwrap_or_default()).await
+        }
+        "apcat" if user.is_admin && parts.clone().count() == 2 => {
+            callback_approve_category(
+                db,
+                user,
+                parts.next().unwrap_or_default(),
+                parts.next().unwrap_or_default(),
+            )
+            .await
+        }
+        "reject" if user.is_admin && parts.clone().count() == 1 => {
+            callback_reject(db, user, parts.next().unwrap_or_default()).await
+        }
+        "approve" | "apcat" | "reject" => Err("仅管理员可以处理申请".into()),
         "sec" | "secundo" | "unsubundo" => Ok((response("此按钮将在富消息支持后可用。"), false)),
         _ => Ok((response("按钮已失效，请重新发送 /list。"), false)),
     }
@@ -295,6 +322,184 @@ async fn callback_unsubscribe_id(
     ))
 }
 
+async fn callback_approve(
+    db: &Db,
+    _user: &User,
+    raw_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let request_id = parse_request_id(raw_id)?;
+    if !db
+        .kol_request_pending(request_id)
+        .await
+        .map_err(|err| err.to_string())?
+    {
+        return Err("申请不存在或已处理".into());
+    }
+    let categories = db.categories().await.map_err(|err| err.to_string())?;
+    let mut rows = Vec::new();
+    for category in categories {
+        let Some(category_id) = category.get("id").and_then(Value::as_i64) else {
+            continue;
+        };
+        let name = category.get("name").and_then(Value::as_str).unwrap_or("分类");
+        let mut row = Vec::new();
+        push_button(&mut row, name, format!("apcat:{request_id}:{category_id}"));
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    let mut no_category = Vec::new();
+    push_button(&mut no_category, "不分类", format!("apcat:{request_id}:0"));
+    rows.push(no_category);
+    Ok((
+        response_with_keyboard("请选择分类后批准申请：", nonempty_keyboard(rows)),
+        true,
+    ))
+}
+
+async fn callback_approve_category(
+    db: &Db,
+    user: &User,
+    raw_request_id: &str,
+    raw_category_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let request_id = parse_request_id(raw_request_id)?;
+    let category_id = raw_category_id
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id >= 0)
+        .ok_or_else(|| "分类 ID 无效".to_string())?;
+    let effect = db
+        .approve_kol_request_as(request_id, Some(category_id), user.id)
+        .await
+        .map_err(catalog_error)?;
+    let mut result = response(format!(
+        "已批准申请 #{request_id}，{}已加入目录并自动订阅。",
+        effect.name
+    ));
+    add_applicant_notification(&mut result, &effect, true);
+    Ok((result, true))
+}
+
+async fn callback_reject(
+    db: &Db,
+    user: &User,
+    raw_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let request_id = parse_request_id(raw_id)?;
+    let effect = db
+        .reject_kol_request_as(request_id, user.id)
+        .await
+        .map_err(catalog_error)?;
+    let mut result = response(format!("已拒绝申请 #{request_id}。"));
+    add_applicant_notification(&mut result, &effect, false);
+    Ok((result, true))
+}
+
+fn parse_request_id(raw: &str) -> Result<i64, String> {
+    raw.parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| "申请 ID 无效".into())
+}
+
+fn add_applicant_notification(
+    response: &mut TelegramResponse,
+    effect: &crate::db::KolRequestEffect,
+    approved: bool,
+) {
+    if effect.applicant_chat_id.trim().is_empty() {
+        return;
+    }
+    let text = if approved {
+        format!(
+            "申请已通过：{}（{}:{}），已自动订阅。",
+            effect.name, effect.platform, effect.external_id
+        )
+    } else {
+        format!(
+            "申请未通过：{}（{}:{}）。",
+            effect.name, effect.platform, effect.external_id
+        )
+    };
+    response.notifications.push(TelegramNotification {
+        chat_id: effect.applicant_chat_id.clone(),
+        text: bounded(text),
+        keyboard: None,
+    });
+}
+
+fn response_with_notifications(
+    mut response: TelegramResponse,
+    notifications: Vec<TelegramNotification>,
+) -> TelegramResponse {
+    response.notifications = notifications;
+    response
+}
+
+fn ask_keyboard(request_id: i64) -> Option<Vec<Vec<TelegramButton>>> {
+    let mut row = Vec::new();
+    push_button(&mut row, "批准并选择分类", format!("approve:{request_id}"));
+    push_button(&mut row, "拒绝", format!("reject:{request_id}"));
+    nonempty_keyboard(vec![row])
+}
+
+async fn ask(
+    db: &Db,
+    user: &User,
+    platform: &str,
+    raw: &str,
+    name: &str,
+    now: i64,
+) -> Result<TelegramResponse, String> {
+    if !take_quota(
+        db,
+        &format!("ask:telegram:{}", user.id),
+        now,
+        ASK_TRY_LIMIT,
+        ASK_TRY_WINDOW_SECS,
+    )
+    .await?
+    {
+        return Ok(response("申请提交过于频繁，请 10 分钟后重试"));
+    }
+    let request_id = db
+        .add_kol_request_without_category(platform, raw, user.id, name)
+        .await
+        .map_err(catalog_error)?;
+    let request = db
+        .list_kol_requests("", user.id)
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .find(|item| item["id"].as_i64() == Some(request_id))
+        .ok_or_else(|| "申请已创建但读取失败".to_string())?;
+    let requester = request["requester"].as_str().unwrap_or("Telegram 用户");
+    let display = request["name"].as_str().filter(|value| !value.is_empty()).unwrap_or(raw);
+    let text = format!(
+        "收到添加申请 #{request_id}：{}（{}:{}），申请人：{}。",
+        display,
+        platform,
+        request["external_id"].as_str().unwrap_or(raw),
+        requester
+    );
+    let notifications = db
+        .telegram_admin_chat_ids()
+        .await
+        .map_err(|err| err.to_string())?
+        .into_iter()
+        .map(|chat_id| TelegramNotification {
+            chat_id,
+            text: text.clone(),
+            keyboard: ask_keyboard(request_id),
+        })
+        .collect();
+    Ok(response_with_notifications(
+        response(format!("申请已提交 #{request_id}，等待管理员处理。")),
+        notifications,
+    ))
+}
+
 fn is_subscribed(kol: &Value) -> bool {
     kol.get("subscribed")
         .and_then(Value::as_bool)
@@ -378,9 +583,30 @@ fn parse_command(text: &str) -> Option<Command> {
         }
         "unsub" => (args.len() == 1).then(|| Command::Unsubscribe(args[0].to_owned())),
         "mysubs" => args.is_empty().then_some(Command::MySubscriptions),
+        "ask" => parse_ask(&args),
         "bind" => (args.len() == 1).then(|| Command::Bind(args[0].to_owned())),
         _ => None,
     }
+}
+
+fn parse_ask(args: &[&str]) -> Option<Command> {
+    if args.is_empty() {
+        return None;
+    }
+    let (platform, raw, name_start) = match args[0].to_ascii_lowercase().as_str() {
+        "xueqiu" | "雪球" => ("xueqiu", args.get(1).copied()?, 2),
+        "weibo" | "微博" => ("weibo", args.get(1).copied()?, 2),
+        _ if args[0].contains("xueqiu.com") => ("xueqiu", args[0], 1),
+        _ if args[0].contains("weibo.com") || args[0].contains("weibo.cn") => {
+            ("weibo", args[0], 1)
+        }
+        _ => return None,
+    };
+    if raw.is_empty() || args.len() > name_start + 4 {
+        return None;
+    }
+    let name = args[name_start..].join(" ");
+    Some(Command::Ask(platform.to_owned(), raw.to_owned(), name))
 }
 
 async fn bind(
@@ -405,6 +631,43 @@ async fn bind(
         )),
         None => Ok(response("绑定码无效或已过期，请检查后重试")),
     }
+}
+
+async fn take_quota(
+    db: &Db,
+    key: &str,
+    now: i64,
+    limit: i64,
+    window_secs: i64,
+) -> Result<bool, String> {
+    let window = now.div_euclid(window_secs) * window_secs;
+    let mut tx = db.pool().begin().await.map_err(|err| err.to_string())?;
+    let quota: Option<(i64, i64)> =
+        sqlx::query_as("SELECT period_start, count FROM bind_quota WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|err| err.to_string())?;
+    let count = match quota {
+        Some((start, count)) if start == window => count,
+        _ => 0,
+    };
+    if count >= limit {
+        tx.commit().await.map_err(|err| err.to_string())?;
+        return Ok(false);
+    }
+    sqlx::query(
+        "INSERT INTO bind_quota (key, period_start, count) VALUES (?, ?, ?)
+         ON CONFLICT(key) DO UPDATE SET period_start = excluded.period_start, count = excluded.count",
+    )
+    .bind(key)
+    .bind(window)
+    .bind(count + 1)
+    .execute(&mut *tx)
+    .await
+    .map_err(|err| err.to_string())?;
+    tx.commit().await.map_err(|err| err.to_string())?;
+    Ok(true)
 }
 
 async fn take_bind_attempt(db: &Db, chat_id: &str, now: i64) -> Result<bool, String> {
@@ -752,6 +1015,7 @@ fn response_with_keyboard(
     TelegramResponse {
         text: bounded(text.into()),
         keyboard,
+        notifications: Vec::new(),
         answer_callback_query_id: None,
         edit_message: None,
     }
@@ -762,7 +1026,7 @@ fn bounded(text: String) -> String {
 }
 
 fn help_text() -> &'static str {
-    "/start  开始使用或处理绑定链接\n/help  查看帮助\n/list [页码]  查看可见订阅源\n/search 关键词  搜索订阅源\n/sub ID或URL [post|reply|both]  订阅\n/unsub ID或URL  取消订阅\n/mysubs  查看我的订阅\n/bind 绑定码  绑定网页账号"
+    "/start  开始使用或处理绑定链接\n/help  查看帮助\n/list [页码]  查看可见订阅源\n/search 关键词  搜索订阅源\n/sub ID或URL [post|reply|both]  订阅\n/unsub ID或URL  取消订阅\n/mysubs  查看我的订阅\n/ask 平台 ID或主页URL [名称]  申请添加订阅源\n/bind 绑定码  绑定网页账号"
 }
 
 fn catalog_error(error: CatalogError) -> String {
@@ -1413,5 +1677,201 @@ mod tests {
         .unwrap()
         .unwrap();
         assert!(reused.text.contains("无效") || reused.text.contains("过期"));
+    }
+
+    #[tokio::test]
+    async fn ask_and_admin_approval_cover_ids_urls_acl_categories_notifications_and_audit() {
+        let db = db().await;
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        db.set_user_text(admin.id, "telegram_chat_id", "admin-chat")
+            .await
+            .unwrap();
+        let category = db.add_category("宏观").await.unwrap();
+
+        let xueqiu = handle_message(
+            &db,
+            private("/ask xueqiu 4514680565 Alpha"),
+            1_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(xueqiu.text.contains("申请已提交"));
+        assert_eq!(xueqiu.notifications.len(), 1);
+        assert_eq!(xueqiu.notifications[0].chat_id, "admin-chat");
+        assert!(xueqiu.notifications[0]
+            .keyboard
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|button| button.callback_data.starts_with("approve:")));
+
+        let applicant = db.user_by_telegram_chat_id("42").await.unwrap().unwrap();
+        let requests = db.list_kol_requests("pending", applicant.id).await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let request_id = requests[0]["id"].as_i64().unwrap();
+        assert_eq!(requests[0]["external_id"], "4514680565");
+        assert_eq!(requests[0]["requester"], applicant.username);
+
+        let weibo = handle_message(
+            &db,
+            private("/ask https://weibo.com/u/99887766 微博源"),
+            1_001,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(weibo.text.contains("申请已提交"));
+        let all_pending = db.list_kol_requests("pending", applicant.id).await.unwrap();
+        assert_eq!(all_pending.len(), 2);
+        assert_eq!(
+            all_pending
+                .iter()
+                .find(|request| request["platform"] == "weibo")
+                .unwrap()["external_id"],
+            "99887766"
+        );
+
+        let duplicate = handle_message(
+            &db,
+            private("/ask xueqiu https://xueqiu.com/u/4514680565"),
+            1_002,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(duplicate.text.contains("处理中"));
+        for now in 1_003..1_006 {
+            let _ = handle_message(&db, private("/ask xueqiu 4514680565"), now)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        let limited = handle_message(&db, private("/ask xueqiu 4514680565"), 1_006)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(limited.text.contains("频繁"));
+
+        let unauthorized = handle_callback(
+            &db,
+            callback_for(&format!("approve:{request_id}"), "42", "42"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(unauthorized.text.contains("管理员"));
+        assert!(db.kol_request_pending(request_id).await.unwrap());
+
+        let choose_category = handle_callback(
+            &db,
+            callback_for(&format!("approve:{request_id}"), "admin-chat", "admin-chat"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(choose_category.text.contains("请选择分类"));
+        assert!(choose_category
+            .keyboard
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|button| button.callback_data == format!("apcat:{request_id}:{category}")));
+        assert!(choose_category
+            .keyboard
+            .as_ref()
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|button| button.callback_data == format!("apcat:{request_id}:0")));
+
+        let approved = handle_callback(
+            &db,
+            callback_for(
+                &format!("apcat:{request_id}:{category}"),
+                "admin-chat",
+                "admin-chat",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(approved.text.contains("已批准"));
+        assert_eq!(approved.notifications.len(), 1);
+        assert_eq!(approved.notifications[0].chat_id, "42");
+        assert!(approved.notifications[0].text.contains("自动订阅"));
+        assert!(!db.kol_request_pending(request_id).await.unwrap());
+        let subscriptions = db.my_subscriptions(applicant.id).await.unwrap();
+        assert_eq!(subscriptions.len(), 1);
+        let approved_category: Option<i64> = sqlx::query_scalar(
+            "SELECT category_id FROM kols WHERE id = (SELECT kol_id FROM subscriptions WHERE user_id = ?)",
+        )
+        .bind(applicant.id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(approved_category, Some(category));
+
+        let repeated = handle_callback(
+            &db,
+            callback_for(
+                &format!("apcat:{request_id}:0"),
+                "admin-chat",
+                "admin-chat",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(repeated.text.contains("已处理"));
+        assert_eq!(db.my_subscriptions(applicant.id).await.unwrap().len(), 1);
+        let logs = db.list_admin_logs(20).await.unwrap();
+        assert!(logs.iter().any(|log| {
+            log["user_id"] == admin.id && log["action"] == "approve_kol_request"
+        }));
+
+        let reject_applicant = handle_message(
+            &db,
+            TelegramMessage {
+                chat_id: "43".into(),
+                text: Some("/ask weibo 123456".into()),
+                ..private("/help")
+            },
+            2_000,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(reject_applicant.text.contains("申请已提交"));
+        let reject_user = db.user_by_telegram_chat_id("43").await.unwrap().unwrap();
+        let rejected_id = db.list_kol_requests("pending", reject_user.id).await.unwrap()[0]["id"]
+            .as_i64()
+            .unwrap();
+        let rejected = handle_callback(
+            &db,
+            callback_for(&format!("reject:{rejected_id}"), "admin-chat", "admin-chat"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(rejected.text.contains("已拒绝"));
+        assert_eq!(rejected.notifications[0].chat_id, "43");
+        assert_eq!(
+            db.list_kol_requests("rejected", reject_user.id)
+                .await
+                .unwrap()[0]["id"],
+            rejected_id
+        );
+        let rejected_again = handle_callback(
+            &db,
+            callback_for(&format!("reject:{rejected_id}"), "admin-chat", "admin-chat"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(rejected_again.text.contains("已处理"));
     }
 }

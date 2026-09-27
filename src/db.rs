@@ -136,6 +136,19 @@ pub struct PushTarget {
     pub telegram_bot_token: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KolRequestEffect {
+    pub request_id: i64,
+    pub kol_id: Option<i64>,
+    pub applicant_user_id: i64,
+    pub applicant_chat_id: String,
+    pub applicant_name: String,
+    pub platform: String,
+    pub external_id: String,
+    pub name: String,
+    pub category_id: Option<i64>,
+}
+
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS settings (
     key TEXT PRIMARY KEY,
@@ -6117,19 +6130,45 @@ impl Db {
         name: &str,
         category_id: Option<i64>,
     ) -> Result<i64, CatalogError> {
+        self.add_kol_request_inner(platform, raw, user_id, name, category_id, true)
+            .await
+    }
+
+    pub async fn add_kol_request_without_category(
+        &self,
+        platform: &str,
+        raw: &str,
+        user_id: i64,
+        name: &str,
+    ) -> Result<i64, CatalogError> {
+        self.add_kol_request_inner(platform, raw, user_id, name, None, false)
+            .await
+    }
+
+    async fn add_kol_request_inner(
+        &self,
+        platform: &str,
+        raw: &str,
+        user_id: i64,
+        name: &str,
+        category_id: Option<i64>,
+        require_category: bool,
+    ) -> Result<i64, CatalogError> {
         if !PLATFORMS.contains(&platform) {
             return Err(CatalogError::Invalid(format!("不支持的平台: {platform}")));
         }
         let external_id = normalize_kol_request(platform, raw).map_err(CatalogError::Invalid)?;
-        let Some(category_id) = category_id else {
+        if require_category && category_id.is_none() {
             return Err(CatalogError::Bad("请选择分类"));
-        };
-        let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
-            .bind(category_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        if found.is_none() {
-            return Err(CatalogError::Bad("分类不存在"));
+        }
+        if let Some(category_id) = category_id {
+            let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
+                .bind(category_id)
+                .fetch_optional(&self.pool)
+                .await?;
+            if found.is_none() {
+                return Err(CatalogError::Bad("分类不存在"));
+            }
         }
         let pending: Option<i64> = sqlx::query_scalar(
             "SELECT id FROM kol_requests WHERE platform = ? AND external_id = ? AND status = 'pending'",
@@ -6170,6 +6209,25 @@ impl Db {
         }
     }
 
+    pub async fn telegram_admin_chat_ids(&self) -> Result<Vec<String>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT telegram_chat_id FROM users
+             WHERE is_admin = 1 AND telegram_chat_id != ''
+             ORDER BY id",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    pub async fn kol_request_pending(&self, request_id: i64) -> Result<bool, sqlx::Error> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM kol_requests WHERE id = ?")
+                .bind(request_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(status.as_deref() == Some("pending"))
+    }
+
     pub async fn list_kol_requests(
         &self,
         status: &str,
@@ -6196,9 +6254,25 @@ impl Db {
     }
 
     pub async fn approve_kol_request(&self, request_id: i64) -> Result<i64, CatalogError> {
+        Ok(self
+            .approve_kol_request_as(request_id, None, 0)
+            .await?
+            .kol_id
+            .expect("approved request has a kol id"))
+    }
+
+    pub async fn approve_kol_request_as(
+        &self,
+        request_id: i64,
+        category_override: Option<i64>,
+        actor_id: i64,
+    ) -> Result<KolRequestEffect, CatalogError> {
         let row = sqlx::query(
-            "SELECT platform, name, external_id, user_id, category_id, status
-             FROM kol_requests WHERE id = ?",
+            "SELECT r.platform, r.name, r.external_id, r.user_id, r.category_id, r.status,
+                    COALESCE(u.telegram_chat_id, '') AS applicant_chat_id,
+                    COALESCE(u.username, '') AS applicant_name
+             FROM kol_requests r LEFT JOIN users u ON u.id = r.user_id
+             WHERE r.id = ?",
         )
         .bind(request_id)
         .fetch_optional(&self.pool)
@@ -6232,7 +6306,10 @@ impl Db {
         } else {
             given.trim().to_string()
         };
-        let category_id: Option<i64> = row.get("category_id");
+        let stored_category_id: Option<i64> = row.get("category_id");
+        let category_id = category_override
+            .map(|id| (id > 0).then_some(id))
+            .unwrap_or(stored_category_id);
         if let Some(id) = category_id {
             let found: Option<i64> = sqlx::query_scalar("SELECT id FROM categories WHERE id = ?")
                 .bind(id)
@@ -6246,9 +6323,10 @@ impl Db {
             .add_kol(&platform, &name, stored, category_id, false, false, false)
             .await?;
         let updated = sqlx::query(
-            "UPDATE kol_requests SET status = 'approved', handled_at = datetime('now')
+            "UPDATE kol_requests SET status = 'approved', category_id = ?, handled_at = datetime('now')
              WHERE id = ? AND status = 'pending'",
         )
+        .bind(category_id)
         .bind(request_id)
         .execute(&self.pool)
         .await?
@@ -6265,10 +6343,54 @@ impl Db {
         if let Err(err) = self.subscribe(user_id, is_admin != 0, kol_id, "post").await {
             tracing::warn!("审批后自动订阅失败 request={request_id}: {err:?}");
         }
-        Ok(kol_id)
+        if actor_id > 0 {
+            self.add_admin_log(
+                actor_id,
+                "approve_kol_request",
+                &request_id.to_string(),
+                &format!("kol_id={kol_id}, category_id={}", category_id.unwrap_or(0)),
+            )
+            .await?;
+        }
+        Ok(KolRequestEffect {
+            request_id,
+            kol_id: Some(kol_id),
+            applicant_user_id: user_id,
+            applicant_chat_id: row.get("applicant_chat_id"),
+            applicant_name: row.get("applicant_name"),
+            platform,
+            external_id: stored.to_string(),
+            name,
+            category_id,
+        })
     }
 
     pub async fn reject_kol_request(&self, request_id: i64) -> Result<(), CatalogError> {
+        self.reject_kol_request_as(request_id, 0).await.map(|_| ())
+    }
+
+    pub async fn reject_kol_request_as(
+        &self,
+        request_id: i64,
+        actor_id: i64,
+    ) -> Result<KolRequestEffect, CatalogError> {
+        let row = sqlx::query(
+            "SELECT r.platform, r.name, r.external_id, r.user_id, r.category_id, r.status,
+                    COALESCE(u.telegram_chat_id, '') AS applicant_chat_id,
+                    COALESCE(u.username, '') AS applicant_name
+             FROM kol_requests r LEFT JOIN users u ON u.id = r.user_id
+             WHERE r.id = ?",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some(row) = row else {
+            return Err(CatalogError::Missing("申请不存在或已处理"));
+        };
+        let status: String = row.get("status");
+        if status != "pending" {
+            return Err(CatalogError::Missing("申请不存在或已处理"));
+        }
         let updated = sqlx::query(
             "UPDATE kol_requests SET status = 'rejected', handled_at = datetime('now')
              WHERE id = ? AND status = 'pending'",
@@ -6280,7 +6402,26 @@ impl Db {
         if updated == 0 {
             return Err(CatalogError::Missing("申请不存在或已处理"));
         }
-        Ok(())
+        if actor_id > 0 {
+            self.add_admin_log(
+                actor_id,
+                "reject_kol_request",
+                &request_id.to_string(),
+                "",
+            )
+            .await?;
+        }
+        Ok(KolRequestEffect {
+            request_id,
+            kol_id: None,
+            applicant_user_id: row.get("user_id"),
+            applicant_chat_id: row.get("applicant_chat_id"),
+            applicant_name: row.get("applicant_name"),
+            platform: row.get("platform"),
+            external_id: row.get("external_id"),
+            name: row.get("name"),
+            category_id: row.get("category_id"),
+        })
     }
 
     pub async fn note_kol_fetch(

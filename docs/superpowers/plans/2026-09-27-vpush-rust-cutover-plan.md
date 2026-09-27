@@ -18,26 +18,26 @@
 - Create: `docs/superpowers/artifacts/config-inventory.md`
 - Read-only source: production `/opt/vpush/src/app/api.py`, Rust `src/main.rs`, all `src/*.rs`
 
-- [ ] **Step 1: 提取 Python 路由**
+- [x] **Step 1: 提取 Python 路由**
 
   在生产主机只读读取 `api.py`，解析 `@router.get/post/put/delete/patch`，输出方法、完整 `/api` 路径、认证依赖和源码行号。多行装饰器和带 `dependencies` 的声明必须保留。
 
-- [ ] **Step 2: 提取 Rust 路由**
+- [x] **Step 2: 提取 Rust 路由**
 
   不用脆弱的单行正则；按 Rust `.route("...")` 字符串边界提取链式 `get/post/put/delete/patch`，并把同一路径的多个方法合并。对无法解析的声明直接报错，不静默丢弃。
 
-- [ ] **Step 3: 生成差异报告**
+- [x] **Step 3: 生成差异报告**
 
   报告分成 exact match、Python-only、Rust-only、同路径不同方法，并按用户核心/管理/集成分组。每条 Python-only 必须标记“补齐”或“明确不适用”，不能直接当作缺失实现。
 
-- [ ] **Step 4: 生成配置变量报告**
+- [x] **Step 4: 生成配置变量报告**
 
   只记录变量名、生产是否存在、Rust 使用位置、必需性和验证状态；禁止记录值。检查生产 `.env` 与容器环境变量，但不复制文件。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
   ```bash
-  git add tools/route_inventory.py docs/superpowers/artifacts
+  git add tools/route_inventory.py tools/test_route_inventory.py docs/superpowers/artifacts
   git commit -m "建立 Python Rust 兼容性基线"
   ```
 

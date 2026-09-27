@@ -6,6 +6,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -48,17 +49,18 @@ class TelegramSecretMigrationTests(unittest.TestCase):
         self.tempdir.cleanup()
 
     def _create_database(self, path, tokens):
-        with sqlite3.connect(path) as connection:
-            connection.execute(
-                "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_bot_token TEXT NOT NULL)"
-            )
-            connection.executemany(
-                "INSERT INTO users (telegram_bot_token) VALUES (?)",
-                [(token,) for token in tokens],
-            )
+        with contextlib.closing(sqlite3.connect(path)) as connection:
+            with connection:
+                connection.execute(
+                    "CREATE TABLE users (id INTEGER PRIMARY KEY, telegram_bot_token TEXT NOT NULL)"
+                )
+                connection.executemany(
+                    "INSERT INTO users (telegram_bot_token) VALUES (?)",
+                    [(token,) for token in tokens],
+                )
 
     def _tokens(self, path):
-        with sqlite3.connect(path) as connection:
+        with contextlib.closing(sqlite3.connect(path)) as connection:
             return connection.execute(
                 "SELECT telegram_bot_token FROM users ORDER BY id"
             ).fetchall()
@@ -124,7 +126,7 @@ class TelegramSecretMigrationTests(unittest.TestCase):
             OTHER_VALID_TOKEN,
         )
         self.assertEqual(self._file_snapshot(self.input_path), before)
-        with sqlite3.connect(self.output_path) as connection:
+        with contextlib.closing(sqlite3.connect(self.output_path)) as connection:
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
             self.assertEqual(connection.execute("PRAGMA quick_check").fetchone()[0], "ok")
 
@@ -147,6 +149,39 @@ class TelegramSecretMigrationTests(unittest.TestCase):
         with self.assertRaises(migrate_telegram_secrets.MigrationError):
             self._run()
 
+    def test_rejects_shared_writable_output_parent(self):
+        parent = self.root / "shared"
+        parent.mkdir()
+        parent.chmod(0o777)
+
+        with self.assertRaises(migrate_telegram_secrets.MigrationError):
+            self._run(output_path=parent / "output.sqlite3")
+
+    def test_rejects_symlinked_output_parent(self):
+        real_parent = self.root / "real-parent"
+        real_parent.mkdir()
+        symlink_parent = self.root / "linked-parent"
+        symlink_parent.symlink_to(real_parent, target_is_directory=True)
+
+        with self.assertRaises(migrate_telegram_secrets.MigrationError):
+            self._run(output_path=symlink_parent / "output.sqlite3")
+
+    def test_failed_conversion_does_not_remove_replacement_file(self):
+        replacement = b"replacement-created-after-reservation"
+
+        def replace_then_fail(value, fernet):
+            self.output_path.unlink()
+            self.output_path.write_bytes(replacement)
+            raise migrate_telegram_secrets.MigrationError("forced failure")
+
+        with mock.patch.object(
+            migrate_telegram_secrets, "_decrypt_enc1", side_effect=replace_then_fail
+        ):
+            with self.assertRaises(migrate_telegram_secrets.MigrationError):
+                self._run()
+
+        self.assertEqual(self.output_path.read_bytes(), replacement)
+
     def test_wrong_fernet_key_leaves_input_and_no_partial_output(self):
         before = self._file_snapshot(self.input_path)
 
@@ -168,11 +203,12 @@ class TelegramSecretMigrationTests(unittest.TestCase):
 
     def test_invalid_decrypted_token_leaves_input_and_no_partial_output(self):
         invalid = "123:too-short"
-        with sqlite3.connect(self.input_path) as connection:
-            connection.execute(
-                "UPDATE users SET telegram_bot_token = ? WHERE id = 1",
-                ("enc1:" + Fernet(self.fernet_key).encrypt(invalid.encode()).decode(),),
-            )
+        with contextlib.closing(sqlite3.connect(self.input_path)) as connection:
+            with connection:
+                connection.execute(
+                    "UPDATE users SET telegram_bot_token = ? WHERE id = 1",
+                    ("enc1:" + Fernet(self.fernet_key).encrypt(invalid.encode()).decode(),),
+                )
         before = self._file_snapshot(self.input_path)
 
         with self.assertRaises(migrate_telegram_secrets.MigrationError):
@@ -194,11 +230,12 @@ class TelegramSecretMigrationTests(unittest.TestCase):
             )
         ):
             with self.subTest(index=index):
-                with sqlite3.connect(self.input_path) as connection:
-                    connection.execute(
-                        "UPDATE users SET telegram_bot_token = ? WHERE id = 1",
-                        (stored,),
-                    )
+                with contextlib.closing(sqlite3.connect(self.input_path)) as connection:
+                    with connection:
+                        connection.execute(
+                            "UPDATE users SET telegram_bot_token = ? WHERE id = 1",
+                            (stored,),
+                        )
                 before = self._file_snapshot(self.input_path)
 
                 with self.assertRaises(migrate_telegram_secrets.MigrationError):

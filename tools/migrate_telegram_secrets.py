@@ -11,6 +11,7 @@ import argparse
 import base64
 import os
 import sqlite3
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Sequence
@@ -137,6 +138,35 @@ def _exists(path: Path) -> bool:
     return os.path.lexists(path)
 
 
+def _validate_output_parent(path: os.PathLike[str] | str) -> Path:
+    raw = Path(os.path.expanduser(os.fspath(path)))
+    raw_parent = raw.parent
+    if not raw_parent.is_absolute():
+        raw_parent = Path.cwd() / raw_parent
+    if raw_parent.is_symlink():
+        raise MigrationError("output parent must not be a symlink")
+    parent = raw_parent.resolve()
+    try:
+        parent_stat = os.stat(parent, follow_symlinks=False)
+    except OSError as exc:
+        raise MigrationError("output parent is unavailable") from exc
+    if (
+        not stat.S_ISDIR(parent_stat.st_mode)
+        or parent_stat.st_uid != os.getuid()
+        or parent_stat.st_mode & 0o022
+    ):
+        raise MigrationError("output parent must be private to the current user")
+    return parent / raw.name
+
+
+def _same_inode(path: Path, identity: tuple[int, int]) -> bool:
+    try:
+        current = os.stat(path)
+    except OSError:
+        return False
+    return (current.st_dev, current.st_ino) == identity
+
+
 def _validate_paths(input_path: os.PathLike[str] | str, output_path: os.PathLike[str] | str | None):
     source = Path(input_path).expanduser()
     if not source.is_file():
@@ -144,7 +174,7 @@ def _validate_paths(input_path: os.PathLike[str] | str, output_path: os.PathLike
     source = source.resolve()
     if output_path is None:
         return source, None
-    output = Path(output_path).expanduser().resolve()
+    output = _validate_output_parent(output_path)
     if output == source:
         raise MigrationError("output database must differ from input")
     if any(_exists(candidate) for candidate in _output_paths(output)):
@@ -173,6 +203,7 @@ def convert_database(
     source_connection = None
     output_connection = None
     output_created = False
+    output_identity = None
     succeeded = False
     try:
         source_connection = _readonly_connection(source)
@@ -183,9 +214,15 @@ def convert_database(
             ).fetchall()
         else:
             fd = os.open(output, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-            os.close(fd)
+            try:
+                created_stat = os.fstat(fd)
+                output_identity = (created_stat.st_dev, created_stat.st_ino)
+            finally:
+                os.close(fd)
             output_created = True
             output_connection = sqlite3.connect(output)
+            if not _same_inode(output, output_identity):
+                raise MigrationError("output database changed before opening")
             source_connection.backup(output_connection)
             output_connection.execute("PRAGMA journal_mode=DELETE")
             output_connection.execute("BEGIN IMMEDIATE")
@@ -233,7 +270,13 @@ def convert_database(
             output_connection.close()
         if source_connection is not None:
             source_connection.close()
-        if output_created and output is not None and not succeeded:
+        if (
+            output_created
+            and output is not None
+            and output_identity is not None
+            and not succeeded
+            and _same_inode(output, output_identity)
+        ):
             for candidate in _output_paths(output):
                 try:
                     candidate.unlink()

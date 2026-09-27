@@ -534,6 +534,8 @@ CREATE TABLE IF NOT EXISTS ima_document_index (
     downloaded_at TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (group_id, media_id)
 );
+CREATE INDEX IF NOT EXISTS idx_ima_doc_latest ON ima_document_index(sort_date DESC, name DESC, group_id ASC, media_id ASC);
+CREATE INDEX IF NOT EXISTS idx_ima_doc_group_latest ON ima_document_index(group_id, sort_date DESC, name DESC, media_id ASC);
 CREATE TABLE IF NOT EXISTS report_extractions (
     group_id TEXT NOT NULL,
     media_id TEXT NOT NULL,

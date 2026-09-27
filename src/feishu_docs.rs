@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+use sqlx::{QueryBuilder, Row, Sqlite};
 
 use crate::db::Db;
 
@@ -216,124 +217,56 @@ pub async fn list_documents(
     offset: i64,
     facets_only: bool,
 ) -> Result<Value, &'static str> {
-    let gate = gate(db, user_id, is_admin).await?;
-    let sources = db
-        .active_feishu_sources()
-        .await
-        .map_err(|_| "读取文档失败")?;
-    let index = db.ima_index().await.map_err(|_| "读取文档失败")?;
-    let visible: Vec<Value> = sources
-        .into_iter()
-        .filter(|source| {
-            let gid = source["group_id"].as_str().unwrap_or("");
-            !gid.is_empty() && gate.readable(gid)
-        })
-        .collect();
-    let indexed: Vec<&Value> = index
-        .iter()
-        .filter(|doc| gate.readable(doc["group_id"].as_str().unwrap_or("")))
-        .collect();
-    if !group.is_empty()
-        && !visible.iter().any(|source| source["group_id"] == group)
-        && !indexed.iter().any(|doc| doc["group_id"] == group)
-    {
+    if !group.is_empty() && !document_group_visible(db, user_id, is_admin, group).await? {
         return Err("知识库不存在");
     }
+    // 标签筛选仍返回空列表，与旧实现一致。
+    if !tag.is_empty() {
+        return Ok(empty_document_page(day));
+    }
     let needle = query.to_lowercase();
-    let mut items: Vec<Value> = visible
-        .iter()
-        .filter(|source| group.is_empty() || source["group_id"] == group)
-        .filter(|_| tag.is_empty())
-        .filter(|source| {
-            needle.is_empty()
-                || source["title"]
-                    .as_str()
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains(&needle)
-        })
-        .map(|source| {
-            let raw_day = source["last_success_at"].as_str().unwrap_or("");
-            let item_day = if raw_day.len() >= 10 {
-                &raw_day[..10]
-            } else {
-                ""
-            };
-            let gid = source["group_id"].as_str().unwrap_or("");
-            let name = source["title"]
-                .as_str()
-                .filter(|text| !text.is_empty())
-                .unwrap_or(gid);
-            json!({
-                "media_id": source["media_id"],
-                "name": name,
-                "group_id": gid,
-                "group_name": name,
-                "day": item_day,
-                "sort_date": item_day,
-                "abstract": "",
-                "downloaded_at": source["last_success_at"],
-            })
-        })
-        .filter(|item| day.is_empty() || item["day"] == day)
-        .collect();
-    for doc in indexed {
-        if !group.is_empty() && doc["group_id"] != group {
-            continue;
-        }
-        if !tag.is_empty() {
-            continue;
-        }
-        let name = doc["name"].as_str().unwrap_or("");
-        if !needle.is_empty() && !name.to_lowercase().contains(&needle) {
-            continue;
-        }
-        let item_day = doc["sort_date"].as_str().unwrap_or("");
-        if !day.is_empty() && item_day != day {
-            continue;
-        }
-        let gid = doc["group_id"].as_str().unwrap_or("");
-        let media = doc["media_id"].as_str().unwrap_or("");
-        if items
-            .iter()
-            .any(|item| item["group_id"] == gid && item["media_id"] == media)
-        {
-            continue;
-        }
-        items.push(json!({
-            "media_id": media,
-            "name": name,
-            "group_id": gid,
-            "group_name": doc["group_name"],
-            "day": item_day,
-            "sort_date": item_day,
-            "abstract": doc["abstract"],
-            "downloaded_at": doc["downloaded_at"],
-            "has_pdf": !doc["pdf_path"].as_str().unwrap_or("").is_empty(),
-            "has_txt": !doc["txt_path"].as_str().unwrap_or("").is_empty(),
+    let start = offset.max(0);
+    let page_limit = limit.clamp(1, 50);
+    // 打开研报中心时没有筛选：只按索引取一页。计数和日期交给 facets_only。
+    let defer_facets = needle.is_empty() && day.is_empty();
+    if defer_facets {
+        let page = if facets_only {
+            Vec::new()
+        } else {
+            latest_document_page(db, user_id, is_admin, group, page_limit, start).await?
+        };
+        let has_more = page.len() as i64 > page_limit;
+        let page: Vec<_> = page.into_iter().take(page_limit as usize).collect();
+        let (total, days) = if facets_only {
+            (
+                latest_document_count(db, user_id, is_admin, group).await?,
+                if group.is_empty() {
+                    Vec::new()
+                } else {
+                    latest_document_days(db, user_id, is_admin, group).await?
+                },
+            )
+        } else {
+            (0, Vec::new())
+        };
+        return Ok(json!({
+            "groups": [],
+            "items": page,
+            "days": days,
+            "tags": [],
+            "tag_counts": {},
+            "document_count": total,
+            "day": day,
+            "has_more": (!facets_only && has_more),
+            "offset": if facets_only { 0 } else { start },
         }));
     }
-    items.sort_by(|a, b| {
-        b["sort_date"]
-            .as_str()
-            .unwrap_or("")
-            .cmp(a["sort_date"].as_str().unwrap_or(""))
-    });
-    let total = items.len();
-    let mut days: Vec<&str> = items
-        .iter()
-        .filter_map(|item| item["day"].as_str())
-        .filter(|day| !day.is_empty())
-        .collect();
-    days.sort_unstable();
-    days.dedup();
-    days.reverse();
-    let start = offset.max(0) as usize;
-    let limit = limit.clamp(1, 50) as usize;
-    let page = if facets_only || start >= items.len() {
+    let total = document_count(db, user_id, is_admin, group, day, &needle).await?;
+    let days = document_days(db, user_id, is_admin, group, day, &needle).await?;
+    let page = if facets_only || start >= total {
         Vec::new()
     } else {
-        items[start..items.len().min(start + limit)].to_vec()
+        document_page(db, user_id, is_admin, group, day, &needle, page_limit, start).await?
     };
     Ok(json!({
         "groups": [],
@@ -343,9 +276,362 @@ pub async fn list_documents(
         "tag_counts": {},
         "document_count": total,
         "day": day,
-        "has_more": !facets_only && start + page.len() < total,
+        "has_more": (!facets_only && start + (page.len() as i64) < total),
         "offset": if facets_only { 0 } else { start },
     }))
+}
+
+async fn latest_document_page(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>, &'static str> {
+    let index = if group.is_empty() {
+        "idx_ima_doc_latest"
+    } else {
+        "idx_ima_doc_group_latest"
+    };
+    let mut qb = QueryBuilder::new(format!(
+        "SELECT d.media_id, d.name, d.group_id, d.group_name, d.day, d.sort_date, d.abstract, d.downloaded_at, d.pdf_path, d.txt_path FROM ima_document_index d INDEXED BY {index} WHERE "
+    ));
+    push_visible(&mut qb, "d.group_id", is_admin, user_id);
+    if !group.is_empty() {
+        qb.push(" AND d.group_id = ");
+        qb.push_bind(group.to_string());
+    }
+    qb.push(" ORDER BY d.sort_date DESC, d.name DESC, d.group_id ASC, d.media_id ASC LIMIT ");
+    qb.push_bind(limit + 1);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+    let rows = qb
+        .build()
+        .fetch_all(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")?;
+    let mut items: Vec<Value> = rows
+        .iter()
+        .map(|row| {
+            let pdf = row.get::<String, _>("pdf_path");
+            let txt = row.get::<String, _>("txt_path");
+            let mut item = json!({
+                "media_id": row.get::<String, _>("media_id"),
+                "name": row.get::<String, _>("name"),
+                "group_id": row.get::<String, _>("group_id"),
+                "group_name": row.get::<String, _>("group_name"),
+                "day": row.get::<String, _>("day"),
+                "sort_date": row.get::<String, _>("sort_date"),
+                "abstract": row.get::<String, _>("abstract"),
+                "downloaded_at": row.get::<String, _>("downloaded_at"),
+            });
+            if !pdf.is_empty() || !txt.is_empty() {
+                item["has_pdf"] = json!(!pdf.is_empty());
+                item["has_txt"] = json!(!txt.is_empty());
+            }
+            item
+        })
+        .collect();
+    if offset == 0 {
+        // ponytail: 飞书源只有几条，只并进第一页；更老的源不会出现在后续页。
+        let sources = db
+            .active_feishu_sources()
+            .await
+            .map_err(|_| "读取文档失败")?;
+        for source in sources {
+            let gid = source["group_id"].as_str().unwrap_or("");
+            if gid.is_empty() || (!group.is_empty() && gid != group) {
+                continue;
+            }
+            if !is_admin && !gid.starts_with("feishu-") {
+                let allowed = source_visible(db, user_id, gid).await?;
+                if !allowed {
+                    continue;
+                }
+            }
+            let media = source["media_id"].as_str().unwrap_or("");
+            if items.iter().any(|item| {
+                item["group_id"] == gid && item["media_id"] == media
+            }) {
+                continue;
+            }
+            let raw_day = source["last_success_at"].as_str().unwrap_or("");
+            let item_day = if raw_day.len() >= 10 { &raw_day[..10] } else { "" };
+            let name = source["title"]
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .unwrap_or(gid);
+            items.push(json!({
+                "media_id": media,
+                "name": name,
+                "group_id": gid,
+                "group_name": name,
+                "day": item_day,
+                "sort_date": item_day,
+                "abstract": "",
+                "downloaded_at": source["last_success_at"],
+            }));
+        }
+        items.sort_by(|a, b| {
+            b["sort_date"]
+                .as_str()
+                .unwrap_or("")
+                .cmp(a["sort_date"].as_str().unwrap_or(""))
+        });
+    }
+    Ok(items)
+}
+
+async fn source_visible(db: &Db, user_id: i64, group: &str) -> Result<bool, &'static str> {
+    let allowed = sqlx::query(
+        "SELECT 1 FROM ima_kb_acl a JOIN ima_kb_subscriptions s ON s.group_id = a.group_id AND s.user_id = a.user_id WHERE a.user_id = ? AND a.group_id = ? LIMIT 1",
+    )
+    .bind(user_id)
+    .bind(group)
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|_| "读取文档失败")?;
+    Ok(allowed.is_some())
+}
+
+async fn latest_document_count(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+) -> Result<i64, &'static str> {
+    let mut qb = QueryBuilder::new("SELECT COUNT(*) FROM ima_document_index d WHERE ");
+    push_visible(&mut qb, "d.group_id", is_admin, user_id);
+    if !group.is_empty() {
+        qb.push(" AND d.group_id = ");
+        qb.push_bind(group.to_string());
+    }
+    qb.build_query_scalar()
+        .fetch_one(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")
+}
+
+async fn latest_document_days(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+) -> Result<Vec<String>, &'static str> {
+    let mut qb = QueryBuilder::new(
+        "SELECT DISTINCT d.day FROM ima_document_index d WHERE d.day != '' AND ",
+    );
+    push_visible(&mut qb, "d.group_id", is_admin, user_id);
+    qb.push(" AND d.group_id = ");
+    qb.push_bind(group.to_string());
+    qb.push(" ORDER BY d.day DESC");
+    qb.build_query_scalar()
+        .fetch_all(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")
+}
+
+fn empty_document_page(day: &str) -> Value {
+    json!({
+        "groups": [],
+        "items": [],
+        "days": [],
+        "tags": [],
+        "tag_counts": {},
+        "document_count": 0,
+        "day": day,
+        "has_more": false,
+        "offset": 0,
+    })
+}
+
+fn push_visible(qb: &mut QueryBuilder<'_, Sqlite>, column: &str, admin: bool, user_id: i64) {
+    if admin {
+        qb.push("1 = 1");
+        return;
+    }
+    qb.push(format!(
+        "({column} LIKE 'feishu-%' OR {column} IN (SELECT a.group_id FROM ima_kb_acl a JOIN ima_kb_subscriptions s ON s.group_id = a.group_id AND s.user_id = a.user_id WHERE a.user_id = "
+    ));
+    qb.push_bind(user_id);
+    qb.push("))");
+}
+
+fn push_match(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    group_col: &str,
+    day_expr: &str,
+    name_expr: &str,
+    group: &str,
+    day: &str,
+    needle: &str,
+) {
+    qb.push(" AND ");
+    if group.is_empty() {
+        qb.push("1 = 1");
+    } else {
+        qb.push(format!("{group_col} = "));
+        qb.push_bind(group.to_string());
+    }
+    qb.push(" AND ");
+    if day.is_empty() {
+        qb.push("1 = 1");
+    } else {
+        qb.push(format!("{day_expr} = "));
+        qb.push_bind(day.to_string());
+    }
+    qb.push(" AND ");
+    if needle.is_empty() {
+        qb.push("1 = 1");
+    } else {
+        qb.push(format!("instr(lower({name_expr}), "));
+        qb.push_bind(needle.to_string());
+        qb.push(") > 0");
+    }
+}
+
+fn push_document_union(
+    qb: &mut QueryBuilder<'_, Sqlite>,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+    day: &str,
+    needle: &str,
+) {
+    let source_day = "CASE WHEN length(s.last_success_at) >= 10 THEN substr(s.last_success_at, 1, 10) ELSE '' END";
+    let source_name = "CASE WHEN s.title != '' THEN s.title ELSE s.group_id END";
+    qb.push(
+        "SELECT media_id, name, group_id, group_name, day, sort_date, abstract, downloaded_at, has_pdf, has_txt FROM (",
+    );
+    qb.push(
+        "SELECT d.media_id, d.name, d.group_id, d.group_name, d.sort_date AS day, d.sort_date, d.abstract, d.downloaded_at, CASE WHEN d.pdf_path != '' THEN 1 ELSE 0 END AS has_pdf, CASE WHEN d.txt_path != '' THEN 1 ELSE 0 END AS has_txt FROM ima_document_index d WHERE ",
+    );
+    push_visible(qb, "d.group_id", is_admin, user_id);
+    push_match(qb, "d.group_id", "d.sort_date", "d.name", group, day, needle);
+    qb.push(
+        " AND NOT EXISTS (SELECT 1 FROM feishu_document_sources s WHERE s.enabled = 1 AND s.deleted_at IS NULL AND s.timeline_path != '' AND s.group_id = d.group_id AND s.media_id = d.media_id AND ",
+    );
+    push_visible(qb, "s.group_id", is_admin, user_id);
+    push_match(qb, "s.group_id", source_day, source_name, group, day, needle);
+    qb.push(" ) UNION ALL SELECT s.media_id, ");
+    qb.push(source_name);
+    qb.push(", s.group_id, ");
+    qb.push(source_name);
+    qb.push(", ");
+    qb.push(source_day);
+    qb.push(", ");
+    qb.push(source_day);
+    qb.push(
+        ", '', s.last_success_at, 0, 0 FROM feishu_document_sources s WHERE s.enabled = 1 AND s.deleted_at IS NULL AND s.timeline_path != '' AND ",
+    );
+    push_visible(qb, "s.group_id", is_admin, user_id);
+    push_match(qb, "s.group_id", source_day, source_name, group, day, needle);
+    qb.push(")");
+}
+
+async fn document_group_visible(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+) -> Result<bool, &'static str> {
+    let mut qb = QueryBuilder::new(
+        "SELECT 1 FROM ima_document_index d WHERE d.group_id = ",
+    );
+    qb.push_bind(group.to_string());
+    qb.push(" AND ");
+    push_visible(&mut qb, "d.group_id", is_admin, user_id);
+    qb.push(" UNION ALL SELECT 1 FROM feishu_document_sources s WHERE s.enabled = 1 AND s.deleted_at IS NULL AND s.timeline_path != '' AND s.group_id = ");
+    qb.push_bind(group.to_string());
+    qb.push(" AND ");
+    push_visible(&mut qb, "s.group_id", is_admin, user_id);
+    qb.push(" LIMIT 1");
+    let row = qb
+        .build()
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")?;
+    Ok(row.is_some())
+}
+
+async fn document_count(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+    day: &str,
+    needle: &str,
+) -> Result<i64, &'static str> {
+    let mut qb = QueryBuilder::new("SELECT COUNT(*) FROM (");
+    push_document_union(&mut qb, user_id, is_admin, group, day, needle);
+    qb.push(")");
+    qb.build_query_scalar()
+        .fetch_one(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")
+}
+
+async fn document_days(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+    day: &str,
+    needle: &str,
+) -> Result<Vec<String>, &'static str> {
+    let mut qb = QueryBuilder::new("SELECT DISTINCT day FROM (");
+    push_document_union(&mut qb, user_id, is_admin, group, day, needle);
+    qb.push(") WHERE day != '' ORDER BY day DESC");
+    qb.build_query_scalar()
+        .fetch_all(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")
+}
+
+async fn document_page(
+    db: &Db,
+    user_id: i64,
+    is_admin: bool,
+    group: &str,
+    day: &str,
+    needle: &str,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>, &'static str> {
+    let mut qb = QueryBuilder::new("SELECT * FROM (");
+    push_document_union(&mut qb, user_id, is_admin, group, day, needle);
+    qb.push(") ORDER BY sort_date DESC LIMIT ");
+    qb.push_bind(limit);
+    qb.push(" OFFSET ");
+    qb.push_bind(offset);
+    let rows = qb
+        .build()
+        .fetch_all(db.pool())
+        .await
+        .map_err(|_| "读取文档失败")?;
+    Ok(rows
+        .iter()
+        .map(|row| {
+            let has_pdf: i64 = row.try_get("has_pdf").unwrap_or(0);
+            let has_txt: i64 = row.try_get("has_txt").unwrap_or(0);
+            let mut item = json!({
+                "media_id": row.get::<String, _>("media_id"),
+                "name": row.get::<String, _>("name"),
+                "group_id": row.get::<String, _>("group_id"),
+                "group_name": row.get::<String, _>("group_name"),
+                "day": row.get::<String, _>("day"),
+                "sort_date": row.get::<String, _>("sort_date"),
+                "abstract": row.get::<String, _>("abstract"),
+                "downloaded_at": row.get::<String, _>("downloaded_at"),
+            });
+            if has_pdf != 0 || has_txt != 0 {
+                item["has_pdf"] = json!(has_pdf != 0);
+                item["has_txt"] = json!(has_txt != 0);
+            }
+            item
+        })
+        .collect())
 }
 
 pub async fn document_meta(
@@ -1169,5 +1455,25 @@ mod tests {
         });
         assert!(kept.await.is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn default_list_returns_one_indexed_page() {
+        let dir = std::env::temp_dir().join(format!("vpush-ima-page-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("t.db")).await.unwrap();
+        for (id, day, name) in [("old", "2024-01-01", "旧"), ("mid", "2024-06-01", "中"), ("new", "2024-12-01", "新")] {
+            db.insert_ima_document("reports", id, name, day, "", "").await.unwrap();
+        }
+        let page = list_documents(&db, 1, true, "", "", "", "", 1, 0, false).await.unwrap();
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert_eq!(page["items"][0]["name"], "新");
+        assert_eq!(page["has_more"], true);
+        assert_eq!(page["document_count"], 0);
+        let facets = list_documents(&db, 1, true, "", "", "", "", 1, 0, true).await.unwrap();
+        assert!(facets["items"].as_array().unwrap().is_empty());
+        assert_eq!(facets["document_count"], 3);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

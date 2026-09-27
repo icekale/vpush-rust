@@ -457,7 +457,13 @@ export function createImaView(dependencies) {
     return `/api/ima-documents?${params.toString()}`;
   }
 
-  // 列表请求同时返回分面，避免打开页面时重复扫描文档索引。
+  // 无筛选的默认列表先画一页，计数和日期由 refreshImaListFacets() 补。
+  function imaFacetsDeferred() {
+    const params = routeQuery();
+    if (imaUsableSearchQuery(params.get("q") || "")) return false;
+    return !params.get("tag") && !params.get("day");
+  }
+
   function imaDocumentsRoute(group, query, day, tag) {
     const params = new URLSearchParams();
     if (group) params.set("group", group);
@@ -1153,7 +1159,10 @@ export function createImaView(dependencies) {
       _imaItems.length = 0;
       _imaItems.push(...items);
       state.imaDocumentsHasMore = !!(paged && data.has_more);
+      if (imaFacetsDeferred()) void refreshImaListFacets(seq);
       const body = $("#ima-docs-body");
+      if (!items.length) {
+        body.innerHTML = imaDocumentsEmptyHtml(hasFilter);
         return;
       }
       const more = state.imaDocumentsHasMore
@@ -1208,6 +1217,17 @@ export function createImaView(dependencies) {
       meta.textContent = imaDocumentsCountLabel(searchMode, data.document_count, itemCount, hasMore);
     }
     syncImaDocumentsFilterStatus();
+  }
+
+  async function refreshImaListFacets(seq) {
+    if (!imaFacetsDeferred()) return;
+    try {
+      const data = await api(imaDocumentsRequestPath({ facetsOnly: true }));
+      if (!routeStillActive(seq)) return;
+      applyImaListFacets(data, _imaItems.length, state.imaDocumentsHasMore);
+    } catch (err) {
+      console.warn("ima facets refresh failed", err);
+    }
   }
 
   function imaDocumentsFilterChipsHtml() {

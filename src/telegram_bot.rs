@@ -1874,4 +1874,52 @@ mod tests {
         .unwrap();
         assert!(rejected_again.text.contains("已处理"));
     }
+
+    #[tokio::test]
+    async fn duplicate_telegram_chat_owners_fail_closed_for_admin_callbacks() {
+        let db = db().await;
+        db.ensure_admin("hash").await.unwrap();
+        let applicant = db
+            .get_or_create_telegram_user("applicant", "Applicant", true)
+            .await
+            .unwrap()
+            .unwrap();
+        let request = db
+            .add_kol_request_without_category("xueqiu", "777", applicant.id, "")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin, telegram_chat_id)
+             VALUES ('duplicate-admin', 'x', 1, 'duplicate-chat'),
+                    ('duplicate-reader', 'x', 0, 'duplicate-chat')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db.user_by_telegram_chat_id("duplicate-chat").await.unwrap().is_none());
+        assert!(db
+            .get_or_create_telegram_user("duplicate-chat", "Duplicate", true)
+            .await
+            .is_err());
+        let callback = handle_callback(
+            &db,
+            callback_for(
+                &format!("approve:{request}"),
+                "duplicate-chat",
+                "duplicate-chat",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(callback.text.contains("身份无效"));
+        assert!(db.kol_request_pending(request).await.unwrap());
+        assert!(db
+            .list_kol_requests("pending", applicant.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == request));
+    }
 }

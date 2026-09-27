@@ -2595,11 +2595,11 @@ impl Db {
         if identity.trim().is_empty() {
             return Ok(None);
         }
-        let row = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ? LIMIT 1")
+        let rows = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ? LIMIT 2")
             .bind(identity.trim())
-            .fetch_optional(&self.pool)
+            .fetch_all(&self.pool)
             .await?;
-        Ok(row.map(user_from_row))
+        Ok((rows.len() == 1).then(|| user_from_row(rows.into_iter().next().unwrap())))
     }
 
     // The caller must pass true only for a private Telegram chat.
@@ -2617,11 +2617,14 @@ impl Db {
             return Err(CatalogError::Bad("绑定身份不能为空"));
         }
         let mut tx = self.pool.begin().await?;
-        if let Some(row) = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ? LIMIT 1")
+        let existing = sqlx::query("SELECT * FROM users WHERE telegram_chat_id = ? LIMIT 2")
             .bind(identity)
-            .fetch_optional(&mut *tx)
-            .await?
-        {
+            .fetch_all(&mut *tx)
+            .await?;
+        if existing.len() > 1 {
+            return Err(CatalogError::Bad("Telegram 身份重复"));
+        }
+        if let Some(row) = existing.into_iter().next() {
             return Ok(Some(user_from_row(row)));
         }
         let preferred: String = display_name.trim().chars().take(30).collect();
@@ -6319,39 +6322,61 @@ impl Db {
                 return Err(CatalogError::Bad("分类不存在"));
             }
         }
-        let kol_id = self
-            .add_kol(&platform, &name, stored, category_id, false, false, false)
-            .await?;
+        let mut tx = self.pool.begin().await?;
         let updated = sqlx::query(
             "UPDATE kol_requests SET status = 'approved', category_id = ?, handled_at = datetime('now')
              WHERE id = ? AND status = 'pending'",
         )
         .bind(category_id)
         .bind(request_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if updated == 0 {
             return Err(CatalogError::Missing("申请不存在或已处理"));
         }
+        let kol_id = match sqlx::query(
+            "INSERT INTO kols
+                (platform, name, external_id, category_id, priority, secondary, original_only)
+             VALUES (?, ?, ?, ?, 0, 0, 0)",
+        )
+        .bind(&platform)
+        .bind(&name)
+        .bind(stored)
+        .bind(category_id)
+        .execute(&mut *tx)
+        .await
+        {
+            Ok(result) => result.last_insert_rowid(),
+            Err(sqlx::Error::Database(error)) if error.is_unique_violation() => {
+                return Err(CatalogError::Bad("该大V已在目录中"));
+            }
+            Err(error) => return Err(error.into()),
+        };
         let user_id: i64 = row.get("user_id");
-        let is_admin: i64 = sqlx::query_scalar("SELECT is_admin FROM users WHERE id = ?")
-            .bind(user_id)
-            .fetch_optional(&self.pool)
-            .await?
-            .unwrap_or(0);
-        if let Err(err) = self.subscribe(user_id, is_admin != 0, kol_id, "post").await {
-            tracing::warn!("审批后自动订阅失败 request={request_id}: {err:?}");
-        }
+        sqlx::query(
+            "INSERT INTO subscriptions (user_id, kol_id, type) VALUES (?, ?, 'post')
+             ON CONFLICT(user_id, kol_id) DO UPDATE SET type = excluded.type",
+        )
+        .bind(user_id)
+        .bind(kol_id)
+        .execute(&mut *tx)
+        .await?;
         if actor_id > 0 {
-            self.add_admin_log(
-                actor_id,
-                "approve_kol_request",
-                &request_id.to_string(),
-                &format!("kol_id={kol_id}, category_id={}", category_id.unwrap_or(0)),
+            sqlx::query(
+                "INSERT INTO admin_logs (user_id, action, target, detail)
+                 VALUES (?, 'approve_kol_request', ?, ?)",
             )
+            .bind(actor_id)
+            .bind(request_id.to_string())
+            .bind(format!(
+                "kol_id={kol_id}, category_id={}",
+                category_id.unwrap_or(0)
+            ))
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(KolRequestEffect {
             request_id,
             kol_id: Some(kol_id),
@@ -6374,6 +6399,7 @@ impl Db {
         request_id: i64,
         actor_id: i64,
     ) -> Result<KolRequestEffect, CatalogError> {
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query(
             "SELECT r.platform, r.name, r.external_id, r.user_id, r.category_id, r.status,
                     COALESCE(u.telegram_chat_id, '') AS applicant_chat_id,
@@ -6382,7 +6408,7 @@ impl Db {
              WHERE r.id = ?",
         )
         .bind(request_id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         let Some(row) = row else {
             return Err(CatalogError::Missing("申请不存在或已处理"));
@@ -6396,21 +6422,23 @@ impl Db {
              WHERE id = ? AND status = 'pending'",
         )
         .bind(request_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .rows_affected();
         if updated == 0 {
             return Err(CatalogError::Missing("申请不存在或已处理"));
         }
         if actor_id > 0 {
-            self.add_admin_log(
-                actor_id,
-                "reject_kol_request",
-                &request_id.to_string(),
-                "",
+            sqlx::query(
+                "INSERT INTO admin_logs (user_id, action, target, detail)
+                 VALUES (?, 'reject_kol_request', ?, '')",
             )
+            .bind(actor_id)
+            .bind(request_id.to_string())
+            .execute(&mut *tx)
             .await?;
         }
+        tx.commit().await?;
         Ok(KolRequestEffect {
             request_id,
             kol_id: None,
@@ -8775,6 +8803,94 @@ mod tests {
             .await
             .is_err());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn kol_request_transition_rolls_back_and_records_actor_atomically() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('reader', 'x')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let reader = db.user_by_username("reader").await.unwrap().unwrap();
+        let failing = db
+            .add_kol_request_without_category("xueqiu", "900", reader.id, "")
+            .await
+            .unwrap();
+        sqlx::query(&format!(
+            "CREATE TRIGGER fail_kol_request_subscription
+             BEFORE INSERT ON subscriptions WHEN NEW.user_id = {}
+             BEGIN SELECT RAISE(ABORT, 'forced subscription failure'); END",
+            reader.id
+        ))
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(db
+            .approve_kol_request_as(failing, None, admin.id)
+            .await
+            .is_err());
+        assert!(db.kol_request_pending(failing).await.unwrap());
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM kols WHERE platform = 'xueqiu' AND external_id = '900'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM subscriptions WHERE user_id = ?",
+            )
+            .bind(reader.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
+        assert!(db.list_admin_logs(20).await.unwrap().is_empty());
+        sqlx::query("DROP TRIGGER fail_kol_request_subscription")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let approved = db
+            .approve_kol_request_as(failing, None, admin.id)
+            .await
+            .unwrap();
+        assert!(approved.kol_id.is_some());
+        let logs = db.list_admin_logs(20).await.unwrap();
+        assert!(logs.iter().any(|log| {
+            log["user_id"] == admin.id && log["action"] == "approve_kol_request"
+        }));
+
+        let rejected = db
+            .add_kol_request_without_category("weibo", "901", reader.id, "")
+            .await
+            .unwrap();
+        db.reject_kol_request_as(rejected, admin.id).await.unwrap();
+        assert!(db
+            .approve_kol_request_as(rejected, None, admin.id)
+            .await
+            .is_err());
+        let logs = db.list_admin_logs(20).await.unwrap();
+        assert!(logs.iter().any(|log| {
+            log["user_id"] == admin.id && log["action"] == "reject_kol_request"
+        }));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM kols WHERE platform = 'weibo' AND external_id = '901'",
+            )
+            .fetch_one(db.pool())
+            .await
+            .unwrap(),
+            0
+        );
     }
 
     #[tokio::test]

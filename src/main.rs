@@ -1527,12 +1527,14 @@ async fn approve_kol_request(
     headers: HeaderMap,
     UrlPath(request_id): UrlPath<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     let kol_id = state
         .db
-        .approve_kol_request(request_id)
+        .approve_kol_request_as(request_id, None, admin.id)
         .await
-        .map_err(catalog_err)?;
+        .map_err(catalog_err)?
+        .kol_id
+        .ok_or_else(|| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "审批结果无效"))?;
     Ok(Json(json!({ "ok": true, "kol_id": kol_id })))
 }
 
@@ -1541,10 +1543,10 @@ async fn reject_kol_request(
     headers: HeaderMap,
     UrlPath(request_id): UrlPath<i64>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers).await?;
+    let admin = require_admin(&state, &headers).await?;
     state
         .db
-        .reject_kol_request(request_id)
+        .reject_kol_request_as(request_id, admin.id)
         .await
         .map_err(catalog_err)?;
     Ok(Json(json!({ "ok": true })))

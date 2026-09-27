@@ -62,7 +62,11 @@ fn parse_message(update_id: i64, value: &Value) -> Option<BotUpdate> {
 
 fn parse_callback(update_id: i64, value: &Value) -> Option<BotUpdate> {
     let callback_id = value.get("id").and_then(Value::as_str)?.trim();
-    let data = value.get("data").and_then(Value::as_str)?.to_owned();
+    let data = value.get("data").and_then(Value::as_str)?;
+    if data.is_empty() || data.len() > MAX_CALLBACK_BYTES {
+        return None;
+    }
+    let data = data.to_owned();
     let actor_id = id_string(value.get("from")?.get("id")?)?;
     let message = value.get("message")?;
     let chat = message.get("chat")?;
@@ -344,6 +348,21 @@ mod tests {
         assert_eq!(callback.message_chat_id, "42");
     }
 
+    #[test]
+    fn rejects_empty_or_oversized_callback_data_by_bytes() {
+        assert_eq!(parse_update(&callback_update("", 42, 42)).unwrap(), None);
+        assert_eq!(
+            parse_update(&callback_update(&"x".repeat(65), 42, 42)).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_update(&callback_update(&"é".repeat(33), 42, 42)).unwrap(),
+            None
+        );
+        assert!(parse_update(&callback_update(&"é".repeat(32), 42, 42))
+            .unwrap()
+            .is_some());
+    }
     #[test]
     fn serializes_keyboard_targets_and_bounds_text_and_callback_data() {
         let response = TelegramResponse {

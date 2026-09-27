@@ -19,11 +19,19 @@ pub enum TelegramChatType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TelegramMessage {
+pub struct TelegramCallback {
+    pub id: String,
     pub chat_id: String,
+    pub message_chat_id: String,
     pub chat_type: TelegramChatType,
-    pub display_name: String,
-    pub text: Option<String>,
+    pub message_id: i64,
+    pub data: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramEditMessage {
+    pub chat_id: String,
+    pub message_id: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,6 +44,16 @@ pub struct TelegramButton {
 pub struct TelegramResponse {
     pub text: String,
     pub keyboard: Option<Vec<Vec<TelegramButton>>>,
+    pub answer_callback_query_id: Option<String>,
+    pub edit_message: Option<TelegramEditMessage>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramMessage {
+    pub chat_id: String,
+    pub chat_type: TelegramChatType,
+    pub display_name: String,
+    pub text: Option<String>,
 }
 
 #[derive(Debug)]
@@ -76,8 +94,11 @@ pub async fn handle_message(
         Some(Command::Start(Some(code)) | Command::Bind(code)) => {
             bind(db, chat_id, &code, now).await
         }
-        Some(Command::Start(None)) => Ok(response("欢迎使用 VPush。\n\n".to_owned() + help_text())),
-        Some(Command::Help) => Ok(response(help_text())),
+        Some(Command::Start(None)) => Ok(response_with_keyboard(
+            "欢迎使用 VPush。\n\n".to_owned() + help_text(),
+            start_keyboard(),
+        )),
+        Some(Command::Help) => Ok(response_with_keyboard(help_text(), common_keyboard())),
         Some(Command::List(page)) => list(db, &user, page).await,
         Some(Command::Search(keyword)) => search(db, &user, &keyword).await,
         Some(Command::Subscribe(reference, kind)) => subscribe(db, &user, &reference, &kind).await,
@@ -90,6 +111,218 @@ pub async fn handle_message(
         Err(message) => response(message),
     };
     Ok(Some(response))
+}
+
+pub async fn handle_callback(
+    db: &Db,
+    callback: TelegramCallback,
+) -> Result<Option<TelegramResponse>, String> {
+    if callback.chat_type != TelegramChatType::Private {
+        return Ok(None);
+    }
+    let chat_id = callback.chat_id.trim();
+    if chat_id.is_empty()
+        || callback.message_chat_id.trim() != chat_id
+        || callback.data.trim().is_empty()
+        || callback.data.chars().count() > MAX_INPUT_CHARS
+    {
+        return Ok(None);
+    }
+
+    let Some(user) = db
+        .user_by_telegram_chat_id(chat_id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(Some(callback_response(
+            &callback,
+            response("Telegram 私聊身份无效"),
+            false,
+        )));
+    };
+    let result = dispatch_callback(db, &user, callback.data.trim()).await;
+    let (response, edit) = match result {
+        Ok((response, edit)) => (response, edit),
+        Err(message) => (response(message), false),
+    };
+    Ok(Some(callback_response(&callback, response, edit)))
+}
+
+async fn dispatch_callback(
+    db: &Db,
+    user: &User,
+    data: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let mut parts = data.split(':');
+    let action = parts.next().unwrap_or_default();
+    match action {
+        "list" => callback_list(db, user, &mut parts).await,
+        "mysubs" => callback_mysubs(db, user, &mut parts).await,
+        "help" if parts.next().is_none() => Ok((help_text_with_keyboard(), true)),
+        "sub" if parts.clone().count() == 1 => {
+            callback_subscribe(db, user, parts.next().unwrap_or_default()).await
+        }
+        "unsub" if parts.clone().count() == 1 => {
+            callback_unsubscribe(db, user, parts.next().unwrap_or_default()).await
+        }
+        // Rich post-card actions need the Task 8 post-card context and remain deferred here.
+        "sec" | "secundo" | "unsubundo" => Ok((response("此按钮将在富消息支持后可用。"), false)),
+        _ => Ok((response("按钮已失效，请重新发送 /list。"), false)),
+    }
+}
+
+async fn callback_list<'a>(
+    db: &Db,
+    user: &User,
+    parts: &mut impl Iterator<Item = &'a str>,
+) -> Result<(TelegramResponse, bool), String> {
+    let direction = parts.next().unwrap_or_default();
+    let raw_page = parts.next().unwrap_or_default();
+    if parts.next().is_some() {
+        return Ok((response("按钮已失效，请重新发送 /list。"), false));
+    }
+    let page = raw_page
+        .parse::<usize>()
+        .ok()
+        .filter(|page| *page > 0)
+        .ok_or_else(|| "页码无效".to_string())?;
+    let target = match direction {
+        "prev" => page,
+        "next" => page.checked_add(1).ok_or_else(|| "页码无效".to_string())?,
+        _ => return Ok((response("按钮已失效，请重新发送 /list。"), false)),
+    };
+    Ok((list(db, user, target).await?, true))
+}
+
+async fn callback_mysubs<'a>(
+    db: &Db,
+    user: &User,
+    parts: &mut impl Iterator<Item = &'a str>,
+) -> Result<(TelegramResponse, bool), String> {
+    match parts.next() {
+        None => Ok((my_subscriptions(db, user).await?, true)),
+        Some("type") => {
+            let id = callback_id(parts.next(), parts.next())?;
+            let kol = db
+                .kol_for(user.id, user.is_admin, id)
+                .await
+                .map_err(|err| err.to_string())?
+                .ok_or_else(|| "订阅源不存在或不可见".to_string())?;
+            if !is_subscribed(&kol) {
+                return Err("尚未订阅该订阅源".into());
+            }
+            let current = kol
+                .get("subscribe_type")
+                .and_then(Value::as_str)
+                .unwrap_or("post");
+            let next = next_subscription_type(current).ok_or_else(|| "订阅类型无效".to_string())?;
+            db.set_subscription_type(user.id, id, next)
+                .await
+                .map_err(catalog_error)?;
+            Ok((my_subscriptions(db, user).await?, true))
+        }
+        Some("unsub") => {
+            let id = callback_id(parts.next(), parts.next())?;
+            if parts.next().is_some() {
+                return Ok((response("按钮已失效，请重新发送 /mysubs。"), false));
+            }
+            callback_unsubscribe_id(db, user, id).await
+        }
+        _ => Ok((response("按钮已失效，请重新发送 /mysubs。"), false)),
+    }
+}
+
+fn callback_id(first: Option<&str>, extra: Option<&str>) -> Result<i64, String> {
+    if extra.is_some() {
+        return Err("订阅源 ID 无效".into());
+    }
+    first
+        .ok_or_else(|| "订阅源 ID 无效".to_string())?
+        .parse::<i64>()
+        .ok()
+        .filter(|id| *id > 0)
+        .ok_or_else(|| "订阅源 ID 无效".to_string())
+}
+
+async fn callback_subscribe(
+    db: &Db,
+    user: &User,
+    raw_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let id = callback_id(Some(raw_id), None)?;
+    let kol = db
+        .kol_for(user.id, user.is_admin, id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "订阅源不存在或不可见".to_string())?;
+    db.subscribe(user.id, user.is_admin, id, "post")
+        .await
+        .map_err(catalog_error)?;
+    Ok((
+        response(format!("已订阅 {}（post）。", display_name(&kol))),
+        true,
+    ))
+}
+
+async fn callback_unsubscribe(
+    db: &Db,
+    user: &User,
+    raw_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let id = callback_id(Some(raw_id), None)?;
+    callback_unsubscribe_id(db, user, id).await
+}
+
+async fn callback_unsubscribe_id(
+    db: &Db,
+    user: &User,
+    id: i64,
+) -> Result<(TelegramResponse, bool), String> {
+    let kol = db
+        .kol_for(user.id, user.is_admin, id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "订阅源不存在或不可见".to_string())?;
+    if !is_subscribed(&kol) {
+        return Err("尚未订阅该订阅源".into());
+    }
+    db.unsubscribe(user.id, id)
+        .await
+        .map_err(|err| err.to_string())?;
+    Ok((
+        response(format!("已取消订阅 {}。", display_name(&kol))),
+        true,
+    ))
+}
+
+fn is_subscribed(kol: &Value) -> bool {
+    kol.get("subscribed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn next_subscription_type(kind: &str) -> Option<&'static str> {
+    match kind {
+        "post" => Some("reply"),
+        "reply" => Some("both"),
+        "both" => Some("post"),
+        _ => None,
+    }
+}
+
+fn callback_response(
+    callback: &TelegramCallback,
+    mut response: TelegramResponse,
+    edit: bool,
+) -> TelegramResponse {
+    response.answer_callback_query_id = Some(callback.id.clone());
+    if edit {
+        response.edit_message = Some(TelegramEditMessage {
+            chat_id: callback.message_chat_id.trim().to_owned(),
+            message_id: callback.message_id,
+        });
+    }
+    response
 }
 
 fn parse_command(text: &str) -> Option<Command> {
@@ -127,14 +360,11 @@ fn parse_command(text: &str) -> Option<Command> {
             Some(Command::List(page))
         }
         "search" => {
-            if args.len() != 1 {
-                return None;
-            }
-            let keyword = args[0].trim();
+            let keyword = args.join(" ").trim().to_owned();
             if keyword.is_empty() || keyword.chars().count() > 100 {
                 return None;
             }
-            Some(Command::Search(keyword.to_owned()))
+            Some(Command::Search(keyword))
         }
         "sub" => {
             if !(1..=2).contains(&args.len()) {
@@ -216,13 +446,16 @@ async fn list(db: &Db, user: &User, page: usize) -> Result<TelegramResponse, Str
         .map_err(|err| err.to_string())?;
     let start = page.saturating_sub(1).saturating_mul(PAGE_SIZE);
     if start >= items.len() {
-        return Ok(response(format!("第 {page} 页没有可见订阅源。")));
+        return Ok(response_with_keyboard(
+            format!("第 {page} 页没有可见订阅源。"),
+            list_keyboard(&[], page, items.len()),
+        ));
     }
     let end = (start + PAGE_SIZE).min(items.len());
-    Ok(response(format_catalog(
-        &items[start..end],
-        Some((page, items.len())),
-    )))
+    Ok(response_with_keyboard(
+        format_catalog(&items[start..end], Some((page, items.len()))),
+        list_keyboard(&items[start..end], page, items.len()),
+    ))
 }
 
 async fn search(db: &Db, user: &User, keyword: &str) -> Result<TelegramResponse, String> {
@@ -244,7 +477,10 @@ async fn search(db: &Db, user: &User, keyword: &str) -> Result<TelegramResponse,
     if matches.is_empty() {
         return Ok(response(format!("没有找到与“{keyword}”匹配的可见订阅源。")));
     }
-    Ok(response(format_catalog(&matches, None)))
+    Ok(response_with_keyboard(
+        format_catalog(&matches, None),
+        search_keyboard(&matches),
+    ))
 }
 
 async fn subscribe(
@@ -286,9 +522,15 @@ async fn my_subscriptions(db: &Db, user: &User) -> Result<TelegramResponse, Stri
         .await
         .map_err(|err| err.to_string())?;
     if items.is_empty() {
-        return Ok(response("还没有订阅。发送 /list 查看可用订阅源。"));
+        return Ok(response_with_keyboard(
+            "还没有订阅。发送 /list 查看可用订阅源。",
+            common_keyboard(),
+        ));
     }
-    Ok(response(format_catalog(&items, None)))
+    Ok(response_with_keyboard(
+        format_catalog(&items, None),
+        my_subscriptions_keyboard(&items),
+    ))
 }
 
 async fn resolve_reference(db: &Db, user: &User, reference: &str) -> Result<Value, String> {
@@ -325,6 +567,113 @@ async fn resolve_reference(db: &Db, user: &User, reference: &str) -> Result<Valu
                 && item.get("external_id").and_then(Value::as_str) == Some(external_id.as_str())
         })
         .ok_or_else(|| "订阅源不存在或不可见".into())
+}
+
+fn list_keyboard(items: &[Value], page: usize, total: usize) -> Option<Vec<Vec<TelegramButton>>> {
+    let mut rows = Vec::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_i64).filter(|id| *id > 0) else {
+            continue;
+        };
+        let mut row = Vec::new();
+        push_button(&mut row, "订阅", format!("sub:{id}"));
+        push_button(&mut row, "取消订阅", format!("unsub:{id}"));
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    let pages = total.div_ceil(PAGE_SIZE);
+    let mut navigation = Vec::new();
+    if page > 1 {
+        push_button(&mut navigation, "上一页", format!("list:prev:{}", page - 1));
+    }
+    if page < pages {
+        push_button(&mut navigation, "下一页", format!("list:next:{page}"));
+    }
+    if !navigation.is_empty() {
+        rows.push(navigation);
+    }
+    append_common_buttons(&mut rows);
+    nonempty_keyboard(rows)
+}
+
+fn search_keyboard(items: &[Value]) -> Option<Vec<Vec<TelegramButton>>> {
+    let mut rows = Vec::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_i64).filter(|id| *id > 0) else {
+            continue;
+        };
+        let mut row = Vec::new();
+        push_button(&mut row, "订阅", format!("sub:{id}"));
+        push_button(&mut row, "取消订阅", format!("unsub:{id}"));
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    append_common_buttons(&mut rows);
+    nonempty_keyboard(rows)
+}
+
+fn my_subscriptions_keyboard(items: &[Value]) -> Option<Vec<Vec<TelegramButton>>> {
+    let mut rows = Vec::new();
+    for item in items {
+        let Some(id) = item.get("id").and_then(Value::as_i64).filter(|id| *id > 0) else {
+            continue;
+        };
+        let mut row = Vec::new();
+        push_button(&mut row, "切换类型", format!("mysubs:type:{id}"));
+        push_button(&mut row, "取消订阅", format!("mysubs:unsub:{id}"));
+        if !row.is_empty() {
+            rows.push(row);
+        }
+    }
+    append_common_buttons(&mut rows);
+    nonempty_keyboard(rows)
+}
+
+fn start_keyboard() -> Option<Vec<Vec<TelegramButton>>> {
+    let mut rows = Vec::new();
+    let mut first = Vec::new();
+    push_button(&mut first, "查看订阅源", "list:1".to_owned());
+    if !first.is_empty() {
+        rows.push(first);
+    }
+    append_common_buttons(&mut rows);
+    nonempty_keyboard(rows)
+}
+
+fn common_keyboard() -> Option<Vec<Vec<TelegramButton>>> {
+    let mut rows = Vec::new();
+    append_common_buttons(&mut rows);
+    nonempty_keyboard(rows)
+}
+
+fn help_text_with_keyboard() -> TelegramResponse {
+    response_with_keyboard(help_text(), common_keyboard())
+}
+
+fn append_common_buttons(rows: &mut Vec<Vec<TelegramButton>>) {
+    let mut row = Vec::new();
+    push_button(&mut row, "订阅源", "list:1".to_owned());
+    push_button(&mut row, "我的订阅", "mysubs".to_owned());
+    push_button(&mut row, "帮助", "help".to_owned());
+    if !row.is_empty() {
+        rows.push(row);
+    }
+}
+
+fn push_button(row: &mut Vec<TelegramButton>, text: &str, callback_data: String) {
+    if callback_data.len() <= 64 {
+        row.push(TelegramButton {
+            text: text.to_owned(),
+            callback_data,
+        });
+    }
+}
+
+fn nonempty_keyboard(rows: Vec<Vec<TelegramButton>>) -> Option<Vec<Vec<TelegramButton>>> {
+    let rows: Vec<Vec<TelegramButton>> = rows.into_iter().filter(|row| !row.is_empty()).collect();
+    (!rows.is_empty()).then_some(rows)
 }
 
 fn format_catalog(items: &[Value], page: Option<(usize, usize)>) -> String {
@@ -375,9 +724,18 @@ fn normalize_bind_code(raw: &str) -> Option<String> {
 }
 
 fn response(text: impl Into<String>) -> TelegramResponse {
+    response_with_keyboard(text, None)
+}
+
+fn response_with_keyboard(
+    text: impl Into<String>,
+    keyboard: Option<Vec<Vec<TelegramButton>>>,
+) -> TelegramResponse {
     TelegramResponse {
         text: bounded(text.into()),
-        keyboard: None,
+        keyboard,
+        answer_callback_query_id: None,
+        edit_message: None,
     }
 }
 
@@ -417,6 +775,27 @@ mod tests {
             text: Some(text.into()),
         }
     }
+    fn callback(data: &str) -> TelegramCallback {
+        TelegramCallback {
+            id: "callback-1".into(),
+            chat_id: "42".into(),
+            message_chat_id: "42".into(),
+            chat_type: TelegramChatType::Private,
+            message_id: 17,
+            data: data.into(),
+        }
+    }
+
+    fn callback_for(data: &str, chat_id: &str, message_chat_id: &str) -> TelegramCallback {
+        TelegramCallback {
+            id: "callback-2".into(),
+            chat_id: chat_id.into(),
+            message_chat_id: message_chat_id.into(),
+            chat_type: TelegramChatType::Private,
+            message_id: 18,
+            data: data.into(),
+        }
+    }
 
     #[test]
     fn parser_accepts_commands_and_normalizes_pasted_codes() {
@@ -432,6 +811,223 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn callbacks_mutate_only_authorized_private_actor_and_return_transport_targets() {
+        let db = db().await;
+        let id = db
+            .add_kol(
+                "weibo",
+                "callback-source",
+                "callback-1",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        handle_message(&db, private("/help"), 1_000).await.unwrap();
+
+        let subscribed = handle_callback(&db, callback(&format!("sub:{id}")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            subscribed.answer_callback_query_id.as_deref(),
+            Some("callback-1")
+        );
+        assert_eq!(
+            subscribed.edit_message,
+            Some(TelegramEditMessage {
+                chat_id: "42".into(),
+                message_id: 17,
+            })
+        );
+        assert_eq!(db.my_subscriptions(1).await.unwrap().len(), 1);
+
+        let changed = handle_callback(&db, callback(&format!("mysubs:type:{id}")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            changed.answer_callback_query_id.as_deref(),
+            Some("callback-1")
+        );
+        assert_eq!(
+            db.my_subscriptions(1).await.unwrap()[0]["subscribe_type"],
+            "reply"
+        );
+        handle_callback(&db, callback(&format!("mysubs:type:{id}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.my_subscriptions(1).await.unwrap()[0]["subscribe_type"],
+            "both"
+        );
+        handle_callback(&db, callback(&format!("mysubs:type:{id}")))
+            .await
+            .unwrap();
+        assert_eq!(
+            db.my_subscriptions(1).await.unwrap()[0]["subscribe_type"],
+            "post"
+        );
+
+        handle_message(
+            &db,
+            TelegramMessage {
+                chat_id: "43".into(),
+                ..private("/help")
+            },
+            1_000,
+        )
+        .await
+        .unwrap();
+        assert!(
+            handle_callback(&db, callback_for(&format!("unsub:{id}"), "43", "42"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.my_subscriptions(1).await.unwrap().len(), 1);
+
+        let removed = handle_callback(&db, callback(&format!("mysubs:unsub:{id}")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(removed.text.contains("已取消订阅"));
+        assert!(db.my_subscriptions(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn callbacks_reject_groups_acl_hidden_ids_and_random_data_without_mutation() {
+        let db = db().await;
+        let public_id = db
+            .add_kol(
+                "weibo",
+                "public-callback",
+                "public-1",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        let private_id = db
+            .add_kol(
+                "weibo",
+                "private-callback",
+                "private-1",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kols SET is_private = 1 WHERE id = ?")
+            .bind(private_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        handle_message(&db, private("/help"), 1_000).await.unwrap();
+
+        let mut group = callback(&format!("sub:{public_id}"));
+        group.chat_type = TelegramChatType::Group;
+        assert!(handle_callback(&db, group).await.unwrap().is_none());
+        assert!(handle_callback(&db, callback(&format!("sub:{private_id}")))
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("不可见"));
+        assert!(handle_callback(&db, callback("sub:0"))
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("无效"));
+        assert!(handle_callback(&db, callback("sub:9223372036854775808"))
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("无效"));
+        let random = handle_callback(&db, callback("random:999"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            random.answer_callback_query_id.as_deref(),
+            Some("callback-1")
+        );
+        assert!(random.edit_message.is_none());
+        assert!(db.my_subscriptions(1).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn callback_pagination_boundaries_and_multiword_search_are_supported() {
+        let db = db().await;
+        for index in 0..21 {
+            db.add_kol(
+                "weibo",
+                &format!("page source {index}"),
+                &format!("page-{index}"),
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        db.add_kol(
+            "weibo",
+            "multi word target",
+            "multi-word",
+            None,
+            false,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+        handle_message(&db, private("/help"), 1_000).await.unwrap();
+
+        let page_two = handle_callback(&db, callback("list:next:1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(page_two.text.contains("第 2/2 页"));
+        let last_page = handle_callback(&db, callback("list:next:2"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(last_page.text.contains("没有可见订阅源"));
+        let first_page = handle_callback(&db, callback("list:prev:1"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first_page.text.contains("第 1/2 页"));
+        assert!(handle_callback(&db, callback("list:prev:0"))
+            .await
+            .unwrap()
+            .unwrap()
+            .text
+            .contains("无效"));
+
+        let search = handle_message(&db, private("/search multi word"), 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(search.text.contains("multi word target"));
+        assert!(search
+            .keyboard
+            .unwrap()
+            .iter()
+            .flatten()
+            .any(|button| button.callback_data == "sub:22" || button.callback_data == "sub:23"));
+    }
     #[tokio::test]
     async fn private_identity_is_created_but_group_and_malformed_updates_are_ignored() {
         let db = db().await;
@@ -457,7 +1053,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(result.text.contains("/list"));
-        assert!(result.keyboard.is_none());
+        let buttons: Vec<String> = result
+            .keyboard
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .map(|button| button.callback_data)
+            .collect();
+        assert!(buttons.iter().any(|data| data == "list:1"));
+        assert!(buttons.iter().any(|data| data == "mysubs"));
+        assert!(buttons.iter().any(|data| data == "help"));
         assert!(db.user_by_telegram_chat_id("42").await.unwrap().is_some());
     }
 

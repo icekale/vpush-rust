@@ -188,7 +188,7 @@ async fn callback_list<'a>(
         .ok_or_else(|| "页码无效".to_string())?;
     let target = match direction {
         "prev" => page,
-        "next" => page.checked_add(1).ok_or_else(|| "页码无效".to_string())?,
+        "next" => page.saturating_add(1),
         _ => return Ok((response("按钮已失效，请重新发送 /list。"), false)),
     };
     Ok((list(db, user, target).await?, true))
@@ -440,22 +440,40 @@ async fn take_bind_attempt(db: &Db, chat_id: &str, now: i64) -> Result<bool, Str
 }
 
 async fn list(db: &Db, user: &User, page: usize) -> Result<TelegramResponse, String> {
-    let items = db
-        .catalog(user.id, user.is_admin, "", 0)
+    let requested_offset = list_offset(page);
+    let (total_count, mut items) = db
+        .catalog_page(user.id, user.is_admin, PAGE_SIZE, requested_offset)
         .await
         .map_err(|err| err.to_string())?;
-    let start = page.saturating_sub(1).saturating_mul(PAGE_SIZE);
-    if start >= items.len() {
-        return Ok(response_with_keyboard(
-            format!("第 {page} 页没有可见订阅源。"),
-            list_keyboard(&[], page, items.len()),
-        ));
+    let total = usize::try_from(total_count.max(0)).unwrap_or(usize::MAX);
+    if total == 0 {
+        return Ok(response("没有可见订阅源。"));
     }
-    let end = (start + PAGE_SIZE).min(items.len());
+    let pages = total.div_ceil(PAGE_SIZE);
+    let requested_page = page;
+    let page = page.clamp(1, pages);
+    if requested_page != page {
+        let offset = list_offset(page);
+        let (_, refreshed) = db
+            .catalog_page(user.id, user.is_admin, PAGE_SIZE, offset)
+            .await
+            .map_err(|err| err.to_string())?;
+        items = refreshed;
+    }
+    if items.is_empty() {
+        return Ok(response("没有可见订阅源。"));
+    }
     Ok(response_with_keyboard(
-        format_catalog(&items[start..end], Some((page, items.len()))),
-        list_keyboard(&items[start..end], page, items.len()),
+        format_catalog(&items, Some((page, total))),
+        list_keyboard(&items, page, total),
     ))
+}
+
+fn list_offset(page: usize) -> i64 {
+    page.checked_sub(1)
+        .and_then(|page| page.checked_mul(PAGE_SIZE))
+        .and_then(|offset| i64::try_from(offset).ok())
+        .unwrap_or(i64::MAX)
 }
 
 async fn search(db: &Db, user: &User, keyword: &str) -> Result<TelegramResponse, String> {
@@ -518,7 +536,7 @@ async fn unsubscribe(db: &Db, user: &User, reference: &str) -> Result<TelegramRe
 
 async fn my_subscriptions(db: &Db, user: &User) -> Result<TelegramResponse, String> {
     let items = db
-        .my_subscriptions(user.id)
+        .visible_my_subscriptions(user.id, user.is_admin)
         .await
         .map_err(|err| err.to_string())?;
     if items.is_empty() {
@@ -966,6 +984,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn paged_catalog_bounds_rows_and_clamps_extreme_list_pages() {
+        let db = db().await;
+        for index in 0..45 {
+            db.add_kol(
+                "weibo",
+                &format!("bounded source {index}"),
+                &format!("bounded-{index}"),
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let private_id = db
+            .add_kol(
+                "weibo",
+                "unauthorized private source",
+                "unauthorized-private",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kols SET is_private = 1 WHERE id = ?")
+            .bind(private_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        handle_message(&db, private("/help"), 1_000).await.unwrap();
+
+        let (total, first_page) = db.catalog_page(1, false, 100, 0).await.unwrap();
+        assert_eq!(total, 45);
+        assert_eq!(first_page.len(), PAGE_SIZE);
+        assert!(first_page
+            .iter()
+            .all(|item| item["id"].as_i64() != Some(private_id)));
+
+        let extreme = handle_message(&db, private(&format!("/list {}", usize::MAX)), 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(extreme.text.contains("第 3/3 页"));
+        assert!(extreme.text.lines().skip(1).count().le(&PAGE_SIZE));
+        assert!(!extreme.text.contains("unauthorized private source"));
+    }
+
+    #[tokio::test]
+    async fn telegram_mysubs_filters_revoked_acl_and_disabled_sources_without_deleting() {
+        let db = db().await;
+        let revoked_id = db
+            .add_kol(
+                "weibo",
+                "revoked private source",
+                "revoked-private",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kols SET is_private = 1 WHERE id = ?")
+            .bind(revoked_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let disabled_id = db
+            .add_kol(
+                "weibo",
+                "disabled source",
+                "disabled-source",
+                None,
+                false,
+                false,
+                false,
+            )
+            .await
+            .unwrap();
+        handle_message(&db, private("/help"), 1_000).await.unwrap();
+        sqlx::query("INSERT INTO kol_acl (kol_id, user_id) VALUES (?, ?)")
+            .bind(revoked_id)
+            .bind(1_i64)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.subscribe(1, false, revoked_id, "post").await.unwrap();
+        db.subscribe(1, false, disabled_id, "reply").await.unwrap();
+        sqlx::query("DELETE FROM kol_acl WHERE kol_id = ? AND user_id = ?")
+            .bind(revoked_id)
+            .bind(1_i64)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE kols SET enabled = 0 WHERE id = ?")
+            .bind(disabled_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let response = handle_message(&db, private("/mysubs"), 1_000)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(response.text.contains("还没有订阅"));
+        assert!(!response.text.contains("revoked private source"));
+        assert!(!response.text.contains("disabled source"));
+        assert!(response.keyboard.unwrap().iter().flatten().all(|button| {
+            button.callback_data != format!("mysubs:type:{revoked_id}")
+                && button.callback_data != format!("mysubs:unsub:{revoked_id}")
+                && button.callback_data != format!("mysubs:type:{disabled_id}")
+                && button.callback_data != format!("mysubs:unsub:{disabled_id}")
+        }));
+        assert_eq!(db.my_subscriptions(1).await.unwrap().len(), 2);
+
+        let rejected = handle_callback(&db, callback(&format!("mysubs:type:{revoked_id}")))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rejected.text.contains("不可见") || rejected.text.contains("尚未订阅"));
+        let subscriptions = db.my_subscriptions(1).await.unwrap();
+        assert_eq!(
+            subscriptions
+                .iter()
+                .find(|item| item["id"].as_i64() == Some(revoked_id))
+                .expect("revoked subscription")["subscribe_type"],
+            "post"
+        );
+        assert!(
+            handle_callback(&db, callback(&format!("mysubs:unsub:{disabled_id}")))
+                .await
+                .unwrap()
+                .unwrap()
+                .text
+                .contains("不可见")
+        );
+        assert_eq!(db.my_subscriptions(1).await.unwrap().len(), 2);
+    }
+    #[tokio::test]
     async fn callback_pagination_boundaries_and_multiword_search_are_supported() {
         let db = db().await;
         for index in 0..21 {
@@ -1003,7 +1163,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(last_page.text.contains("没有可见订阅源"));
+        assert!(last_page.text.contains("第 2/2 页"));
         let first_page = handle_callback(&db, callback("list:prev:1"))
             .await
             .unwrap()

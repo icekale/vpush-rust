@@ -5239,6 +5239,37 @@ impl Db {
         }))
     }
 
+    pub async fn catalog_page(
+        &self,
+        user_id: i64,
+        is_admin: bool,
+        page_size: usize,
+        offset: i64,
+    ) -> Result<(i64, Vec<Value>), sqlx::Error> {
+        let limit = page_size.clamp(1, 20) as i64;
+        let offset = offset.max(0);
+        let total: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM kols k WHERE k.enabled = 1 AND {VISIBLE}"
+        ))
+        .bind(i64::from(is_admin))
+        .bind(user_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let rows = sqlx::query(&format!(
+            "{KOL_SELECT} WHERE k.enabled = 1 AND {VISIBLE} ORDER BY subscribed DESC, k.priority DESC, last_post_at DESC, k.id DESC LIMIT ? OFFSET ?"
+        ))
+        .bind(user_id)
+        .bind(i64::from(is_admin))
+        .bind(user_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut items: Vec<Value> = rows.iter().map(kol_json).collect();
+        self.attach_quotes(&mut items).await?;
+        Ok((total, items))
+    }
+
     pub async fn catalog(
         &self,
         user_id: i64,
@@ -5474,6 +5505,30 @@ impl Db {
         on: bool,
     ) -> Result<(), CatalogError> {
         self.touch_flag(user_id, kol_id, "hide_images", on).await
+    }
+
+    pub async fn visible_my_subscriptions(
+        &self,
+        user_id: i64,
+        is_admin: bool,
+    ) -> Result<Vec<Value>, sqlx::Error> {
+        let rows = sqlx::query(&format!(
+            "SELECT k.id, k.platform, k.name, k.external_id, k.avatar_url,
+                    s.type AS subscribe_type, s.favorite, s.secondary, s.hide_images
+             FROM subscriptions s
+             JOIN kols k ON k.id = s.kol_id
+             WHERE s.user_id = ? AND k.enabled = 1 AND {VISIBLE}
+             ORDER BY k.name, k.id"
+        ))
+        .bind(user_id)
+        .bind(i64::from(is_admin))
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| subscription_json(&row))
+            .collect())
     }
 
     pub async fn my_subscriptions(&self, user_id: i64) -> Result<Vec<Value>, sqlx::Error> {

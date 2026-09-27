@@ -170,19 +170,19 @@
 - Create: `docs/superpowers/artifacts/rollback-runbook.md`
 - Do not modify production until separately approved
 
-- [ ] **Step 1: 记录生产状态**
+- [x] **Step 1: 记录生产状态**
 
   只读记录 Python 镜像 digest、容器健康、Caddy upstream、数据库文件/WAL、Rust 镜像 digest 和配置状态。
 
-- [ ] **Step 2: 演练最终同步**
+- [x] **Step 2: 演练最终同步**
 
   在隔离环境模拟短暂写入冻结、SQLite backup、Rust 迁移、健康检查和失败回滚；记录每一步命令、预期输出和停止条件。
 
-- [ ] **Step 3: 写正式 runbook**
+- [x] **Step 3: 写正式 runbook**
 
   明确冻结范围、备份校验、启动顺序、Caddy 变更、验收 URL、回滚顺序和责任边界。红线操作全部标为“需用户明确批准”。
 
-- [ ] **Step 4: 完成最终审查**
+- [x] **Step 4: 完成最终审查**
 
   只有路由、配置、业务验收、外部依赖和回滚演练全部通过，才提交正式切流请求；否则保持 Python 流量不变。
 

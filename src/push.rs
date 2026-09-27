@@ -664,7 +664,7 @@ fn telegram_message_body(chat_id: &str, text: &str, parse_mode: Option<&str>) ->
     body.to_string()
 }
 
-fn parse_telegram_response(status: u16, body: &str) -> Result<(), String> {
+pub(crate) fn parse_telegram_response(status: u16, body: &str) -> Result<(), String> {
     let response: serde_json::Value = serde_json::from_str(body)
         .map_err(|_| format!("Telegram HTTP {status} response invalid"))?;
     if status == 429 {

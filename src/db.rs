@@ -3073,16 +3073,24 @@ impl Db {
         Ok(())
     }
 
-    pub async fn other_user_has(
-        &self,
-        column: &str,
-        value: &str,
-        id: i64,
-    ) -> Result<bool, sqlx::Error> {
-        let sql = match column {
-            "telegram_bot_token" => {
-                "SELECT id FROM users WHERE telegram_bot_token = ? AND id != ? LIMIT 1"
+    pub async fn other_user_has(&self, column: &str, value: &str, id: i64) -> Result<bool, String> {
+        if column == "telegram_bot_token" {
+            let rows = sqlx::query("SELECT telegram_bot_token FROM users WHERE id != ?")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|_| "读取 Telegram 配置失败".to_string())?;
+            let key = crate::feishu_personal::credential_key().unwrap_or_default();
+            for row in rows {
+                let stored: String = row.get("telegram_bot_token");
+                let token = crate::push::telegram_secret(&stored, &key)?;
+                if token == value {
+                    return Ok(true);
+                }
             }
+            return Ok(false);
+        }
+        let sql = match column {
             "telegram_chat_id" => {
                 "SELECT id FROM users WHERE telegram_chat_id = ? AND id != ? LIMIT 1"
             }
@@ -3092,7 +3100,8 @@ impl Db {
             .bind(value)
             .bind(id)
             .fetch_optional(&self.pool)
-            .await?
+            .await
+            .map_err(|_| "读取 Telegram 配置失败".to_string())?
             .is_some())
     }
 
@@ -7541,6 +7550,60 @@ fn clip_title(title: &str, fallback: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+
+    #[tokio::test]
+    async fn telegram_token_uniqueness_compares_decrypted_enc2_values() {
+        let _env_lock = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
+        let key = base64::engine::general_purpose::URL_SAFE.encode([8u8; 32]);
+        let previous = std::env::var_os("FEISHU_CREDENTIAL_KEY");
+        std::env::set_var("FEISHU_CREDENTIAL_KEY", &key);
+        let path = std::env::temp_dir().join(format!(
+            "vpush-telegram-unique-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let other_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let token = "123456:ABCDEFGHIJKLMNOPQRST";
+        let first = crate::feishu_personal::seal(&key, token).unwrap();
+        let second = crate::feishu_personal::seal(&key, token).unwrap();
+        assert_ne!(first, second);
+        sqlx::query("INSERT INTO users (username, password_hash, telegram_bot_token) VALUES ('other', 'hash', ?)")
+            .bind(format!("enc2:{first}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db
+            .other_user_has("telegram_bot_token", token, other_id)
+            .await
+            .unwrap());
+        sqlx::query("UPDATE users SET telegram_bot_token = ? WHERE username = 'other'")
+            .bind(format!("enc2:{second}"))
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db
+            .other_user_has("telegram_bot_token", token, other_id)
+            .await
+            .unwrap());
+        let _ = std::fs::remove_file(&path);
+        match previous {
+            Some(value) => std::env::set_var("FEISHU_CREDENTIAL_KEY", value),
+            None => std::env::remove_var("FEISHU_CREDENTIAL_KEY"),
+        }
+    }
 
     #[tokio::test]
     async fn ticker_page_hides_digest_the_reader_cannot_fully_see() {

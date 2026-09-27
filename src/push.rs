@@ -28,12 +28,18 @@ pub async fn test_user(
         ));
     }
     if picked.telegram {
-        let token = telegram_token_for(&user.telegram_bot_token);
-        if telegram_token_ok(&token) && chat_id_ok(&user.telegram_chat_id) {
-            results.push(outcome(
-                "telegram",
-                send_telegram(&token, &user.telegram_chat_id, &text).await,
-            ));
+        let key = crate::feishu_personal::credential_key().unwrap_or_default();
+        match telegram_secret(&user.telegram_bot_token, &key) {
+            Ok(token) if token.is_empty() => {}
+            Ok(token) => {
+                let result = if telegram_token_ok(&token) && chat_id_ok(&user.telegram_chat_id) {
+                    send_telegram(&token, &user.telegram_chat_id, &text).await
+                } else {
+                    Err("Telegram 配置无效".into())
+                };
+                results.push(outcome("telegram", result));
+            }
+            Err(err) => results.push(outcome("telegram", Err(err))),
         }
     }
     if picked.feishu && crate::feishu::configured(db).await.unwrap_or(false) {
@@ -78,8 +84,12 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
         sent = true;
     }
     if picked.telegram {
-        let token = telegram_token_for(&user.telegram_bot_token);
-        if telegram_token_ok(&token) && chat_id_ok(&user.telegram_chat_id) {
+        let key = crate::feishu_personal::credential_key().unwrap_or_default();
+        let token = telegram_secret(&user.telegram_bot_token, &key)?;
+        if !token.is_empty() {
+            if !telegram_token_ok(&token) || !chat_id_ok(&user.telegram_chat_id) {
+                return Err("Telegram 配置无效".into());
+            }
             send_telegram(&token, &user.telegram_chat_id, text).await?;
             sent = true;
         }
@@ -135,13 +145,45 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             }
         }
         if channels.telegram {
-            let token = telegram_token_for(&target.telegram_bot_token);
-            if let Err(err) = send_telegram(&token, &target.telegram_chat_id, &plain(note)).await {
-                tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
-                note_push_failure(db, &format!("Telegram：{err}")).await;
-                let _ =
-                    remember_failure(db, kol_id, note.url, "telegram", target.user_id, &err, unix)
+            let key = crate::feishu_personal::credential_key().unwrap_or_default();
+            match telegram_secret(&target.telegram_bot_token, &key) {
+                Ok(token) if token.is_empty() => {}
+                Ok(token) => {
+                    let result =
+                        if telegram_token_ok(&token) && chat_id_ok(&target.telegram_chat_id) {
+                            send_telegram(&token, &target.telegram_chat_id, &plain(note)).await
+                        } else {
+                            Err("Telegram 配置无效".into())
+                        };
+                    if let Err(err) = result {
+                        tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
+                        note_push_failure(db, &format!("Telegram：{err}")).await;
+                        let _ = remember_failure(
+                            db,
+                            kol_id,
+                            note.url,
+                            "telegram",
+                            target.user_id,
+                            &err,
+                            unix,
+                        )
                         .await;
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
+                    note_push_failure(db, &format!("Telegram：{err}")).await;
+                    let _ = remember_failure(
+                        db,
+                        kol_id,
+                        note.url,
+                        "telegram",
+                        target.user_id,
+                        &err,
+                        unix,
+                    )
+                    .await;
+                }
             }
         }
         if channels.feishu {
@@ -416,7 +458,8 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
             }
             "telegram" => {
                 let row = sqlx::query("SELECT telegram_bot_token, telegram_chat_id FROM users WHERE id = ?").bind(user_id).fetch_one(db.pool()).await.map_err(|err| err.to_string())?;
-                let token = telegram_token_for(&row.get::<String, _>("telegram_bot_token"));
+                let key = crate::feishu_personal::credential_key().unwrap_or_default();
+                let token = telegram_secret(&row.get::<String, _>("telegram_bot_token"), &key)?;
                 send_telegram(&token, &row.get::<String, _>("telegram_chat_id"), &text).await
             }
             "webpush" => crate::webpush::send_text(db, user_id, &text).await,
@@ -533,12 +576,24 @@ async fn send_bark_text(key: &str, title: &str, body: &str) -> Result<(), String
         .map_err(|err| err.to_string())?
 }
 
-fn telegram_token_for(custom: &str) -> String {
-    if telegram_token_ok(custom) {
-        custom.to_string()
-    } else {
+pub fn telegram_secret(stored: &str, key: &str) -> Result<String, String> {
+    let token = if let Some(ciphertext) = stored.strip_prefix("enc2:") {
+        if key.is_empty() {
+            return Err("缺少 Telegram 凭据解密密钥".into());
+        }
+        crate::feishu_personal::open_app_secret(key, ciphertext)
+            .map_err(|_| "Telegram 凭据无法解密".to_string())?
+    } else if stored.starts_with("enc1:") {
+        return Err("旧版 Telegram 凭据需要迁移".into());
+    } else if stored.is_empty() {
         std::env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default()
+    } else {
+        stored.to_string()
+    };
+    if !token.is_empty() && !telegram_token_ok(&token) {
+        return Err("Telegram 配置无效".into());
     }
+    Ok(token)
 }
 
 pub fn telegram_token_ok(token: &str) -> bool {
@@ -753,6 +808,7 @@ fn post_json(url: &str, body: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
 
     fn target(start: &str, end: &str, favorite: bool, allow: bool) -> PushTarget {
         PushTarget {
@@ -768,6 +824,40 @@ mod tests {
             telegram_chat_id: String::new(),
             telegram_bot_token: String::new(),
         }
+    }
+
+    #[test]
+    fn telegram_secret_requires_migration_for_legacy_ciphertext() {
+        let key = base64::engine::general_purpose::URL_SAFE.encode([3u8; 32]);
+        assert!(telegram_secret("enc1:legacy-ciphertext", &key)
+            .unwrap_err()
+            .contains("迁移"));
+    }
+
+    #[test]
+    fn telegram_secret_decrypts_enc2_and_accepts_plaintext() {
+        use base64::Engine;
+
+        let key = base64::engine::general_purpose::URL_SAFE.encode([3u8; 32]);
+        let token = "123456:ABCDEFGHIJKLMNOPQRST";
+        let encrypted = crate::feishu_personal::seal(&key, token).unwrap();
+        assert_eq!(
+            telegram_secret(&format!("enc2:{encrypted}"), &key).unwrap(),
+            token
+        );
+        assert_eq!(telegram_secret(token, &key).unwrap(), token);
+    }
+
+    #[test]
+    fn telegram_secret_does_not_fallback_when_key_is_missing_or_wrong() {
+        use base64::Engine;
+
+        let key = base64::engine::general_purpose::URL_SAFE.encode([3u8; 32]);
+        let other_key = base64::engine::general_purpose::URL_SAFE.encode([4u8; 32]);
+        let encrypted = crate::feishu_personal::seal(&key, "123456:ABCDEFGHIJKLMNOPQRST").unwrap();
+        assert!(telegram_secret(&format!("enc2:{encrypted}"), "").is_err());
+        assert!(telegram_secret(&format!("enc2:{encrypted}"), &other_key).is_err());
+        assert!(telegram_secret("not-a-telegram-token", &key).is_err());
     }
 
     #[test]

@@ -5176,11 +5176,14 @@ async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result
                     .await
                     .map_err(db_err)?;
             } else {
+                let key = crate::feishu_personal::credential_key().ok_or_else(|| {
+                    ApiError::new(StatusCode::BAD_REQUEST, "未配置 FEISHU_CREDENTIAL_KEY")
+                })?;
                 if state
                     .db
                     .other_user_has("telegram_bot_token", value, user.id)
                     .await
-                    .map_err(db_err)?
+                    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
                 {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
@@ -5200,16 +5203,18 @@ async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result
                     .db
                     .other_user_has("telegram_chat_id", &chat_id, user.id)
                     .await
-                    .map_err(db_err)?
+                    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
                 {
                     return Err(ApiError::new(
                         StatusCode::BAD_REQUEST,
                         "该 Telegram 已绑定其他账号",
                     ));
                 }
+                let stored = crate::feishu_personal::seal(&key, value)
+                    .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "Telegram 凭据无法加密"))?;
                 state
                     .db
-                    .set_user_text(user.id, "telegram_bot_token", value)
+                    .set_user_text(user.id, "telegram_bot_token", &format!("enc2:{stored}"))
                     .await
                     .map_err(db_err)?;
                 state
@@ -6480,11 +6485,77 @@ mod tests {
     use axum::http::Request;
     use tower::ServiceExt;
 
+    #[tokio::test]
+    async fn apply_profile_rejects_custom_telegram_token_without_credential_key() {
+        let _env_lock = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
+        let previous = std::env::var_os("FEISHU_CREDENTIAL_KEY");
+        std::env::remove_var("FEISHU_CREDENTIAL_KEY");
+        let path = std::env::temp_dir().join(format!(
+            "vpush-profile-{}-{}.db",
+            std::process::id(),
+            now_secs()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "test-secret".into(),
+            allow_register: true,
+            static_dir: path.clone(),
+            fails: Arc::new(Mutex::new(HashMap::new())),
+        };
+        let err = apply_profile(
+            &state,
+            &user,
+            &MeUpdate {
+                telegram_chat_id: None,
+                telegram_bot_token: Some("123456:ABCDEFGHIJKLMNOPQRST".into()),
+                feishu_open_id: None,
+                feishu_chat_id: None,
+                wecom_webhook: None,
+                bark_key: None,
+                notify_enabled: None,
+                daily_report_enabled: None,
+                translate_twitter: None,
+                push_channels: None,
+                dnd_start: None,
+                dnd_end: None,
+                dnd_allow_favorite: None,
+                keywords: None,
+                keywords_match_reports: None,
+                keywords_match_news: None,
+                news_font_size: None,
+                news_source_ids: None,
+                llm_api_base: None,
+                llm_api_key: None,
+                llm_model: None,
+                llm_api_format: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert_eq!(err.detail, "未配置 FEISHU_CREDENTIAL_KEY");
+        let _ = std::fs::remove_dir_all(&path);
+        match previous {
+            Some(value) => std::env::set_var("FEISHU_CREDENTIAL_KEY", value),
+            None => std::env::remove_var("FEISHU_CREDENTIAL_KEY"),
+        }
+    }
+
     #[test]
     fn download_token_prefers_header_then_query_then_cookie() {
         let mut headers = HeaderMap::new();
         assert_eq!(download_token(&headers, Some("query")), "query");
-        headers.insert(header::COOKIE, "vpush_file=cookie; other=1".parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            "vpush_file=cookie; other=1".parse().unwrap(),
+        );
         assert_eq!(download_token(&headers, None), "cookie");
         headers.insert(header::AUTHORIZATION, "Bearer header".parse().unwrap());
         assert_eq!(download_token(&headers, Some("query")), "header");

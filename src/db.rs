@@ -508,6 +508,17 @@ CREATE TABLE IF NOT EXISTS webpush_subscriptions (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_webpush_user ON webpush_subscriptions(user_id);
+CREATE TABLE IF NOT EXISTS android_devices (
+    installation_id TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL,
+    token TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    device_model TEXT NOT NULL DEFAULT '',
+    app_version TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_android_devices_user ON android_devices(user_id);
 CREATE TABLE IF NOT EXISTS ima_document_index (
     group_id TEXT NOT NULL,
     media_id TEXT NOT NULL,
@@ -3090,6 +3101,54 @@ impl Db {
                 telegram_bot_token: row.get("telegram_bot_token"),
             })
             .collect())
+    }
+
+    pub async fn android_device_count(&self, user_id: i64) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM android_devices WHERE user_id = ?")
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn upsert_android_device(
+        &self,
+        installation_id: &str,
+        user_id: i64,
+        token: &str,
+        provider: &str,
+        device_model: &str,
+        app_version: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO android_devices (installation_id, user_id, token, provider, device_model, app_version)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(installation_id) DO UPDATE SET
+                user_id = excluded.user_id, token = excluded.token,
+                provider = excluded.provider, device_model = excluded.device_model,
+                app_version = excluded.app_version, updated_at = datetime('now')",
+        )
+        .bind(installation_id)
+        .bind(user_id)
+        .bind(token)
+        .bind(provider)
+        .bind(device_model)
+        .bind(app_version)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn delete_android_device(
+        &self,
+        installation_id: &str,
+        user_id: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM android_devices WHERE installation_id = ? AND user_id = ?")
+            .bind(installation_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     pub async fn webpush_count(&self, user_id: i64) -> Result<i64, sqlx::Error> {
@@ -7815,6 +7874,45 @@ mod tests {
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].notify_enabled);
         assert!(targets[0].wecom_webhook.contains("qyapi"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn android_devices_are_upserted_and_user_scoped() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-android-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        db.upsert_android_device("installation-1", admin.id, "token", "fcm", "Pixel", "1.0")
+            .await
+            .unwrap();
+        assert_eq!(db.android_device_count(admin.id).await.unwrap(), 1);
+        db.upsert_android_device(
+            "installation-1",
+            admin.id,
+            "token-2",
+            "fcm",
+            "Pixel 2",
+            "2.0",
+        )
+        .await
+        .unwrap();
+        assert_eq!(db.android_device_count(admin.id).await.unwrap(), 1);
+        db.delete_android_device("installation-1", admin.id + 1)
+            .await
+            .unwrap();
+        assert_eq!(db.android_device_count(admin.id).await.unwrap(), 1);
+        db.delete_android_device("installation-1", admin.id)
+            .await
+            .unwrap();
+        assert_eq!(db.android_device_count(admin.id).await.unwrap(), 0);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -50,15 +50,15 @@
 - Modify: `src/auth.rs`
 - Test: existing `src/main.rs` and `src/db.rs` test modules
 
-- [ ] **Step 1: 为每个 Python 用户核心接口建立失败测试**
+- [x] **Step 1: 为每个 Python 用户核心接口建立失败测试**
 
   覆盖 `/api/me`、WebPush、Android device、订阅 `PUT/DELETE`、隐藏图片、分类/KOL 详情、用户 Feed、新闻详情和文章图片。测试只使用临时 SQLite，不调用外部服务。
 
-- [ ] **Step 2: 对照 Python 请求/响应契约实现最小 Rust handler**
+- [x] **Step 2: 对照 Python 请求/响应契约实现最小 Rust handler**
 
   复用现有 `require_user`、`require_admin`、`Db` 方法和 JSON 类型；错误状态码与字段名按 Python 基线对齐，不新增平行认证系统。
 
-- [ ] **Step 3: 运行核心测试**
+- [x] **Step 3: 运行核心测试**
 
   ```bash
   cargo test --all-targets
@@ -66,7 +66,7 @@
 
   预期：全部通过，且新增测试覆盖每个补齐接口至少一个成功和一个拒绝分支。
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
   ```bash
   git add src/main.rs src/db.rs src/webpush.rs src/auth.rs

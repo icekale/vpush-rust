@@ -309,6 +309,10 @@ fn router(state: AppState) -> Router {
         .route("/api/me", get(me).put(update_me))
         .route("/api/me/password", post(change_password))
         .route(
+            "/api/me/android-devices/{installation_id}",
+            put(register_android_device).delete(unregister_android_device),
+        )
+        .route(
             "/api/me/webpush",
             post(subscribe_webpush).delete(unsubscribe_webpush),
         )
@@ -4551,10 +4555,98 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<Va
     profile["vapid_public_key"] = json!(public_key);
     profile["webpush_count"] = json!(count);
     profile["webpush_bound"] = json!(count > 0);
-    profile["android_device_count"] = json!(0);
+    profile["android_device_count"] = json!(state
+        .db
+        .android_device_count(user.id)
+        .await
+        .map_err(db_err)?);
     Ok(Json(profile))
 }
 
+#[derive(Deserialize)]
+struct AndroidDeviceIn {
+    token: String,
+    provider: String,
+    device_model: Option<String>,
+    app_version: Option<String>,
+}
+
+const ANDROID_PROVIDERS: &[&str] = &["fcm", "huawei", "xiaomi", "oppo", "vivo", "meizu", "other"];
+
+fn valid_android_installation_id(value: &str) -> bool {
+    value.len() >= 8
+        && value.len() <= 128
+        && value.chars().enumerate().all(|(index, ch)| {
+            ch.is_ascii_alphanumeric() || (index > 0 && matches!(ch, '.' | '_' | '-'))
+        })
+}
+
+async fn register_android_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(installation_id): UrlPath<String>,
+    Json(body): Json<AndroidDeviceIn>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let installation_id = installation_id.trim();
+    if !valid_android_installation_id(installation_id) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备安装标识无效"));
+    }
+    let token = body.token.trim();
+    if token.is_empty() || token.len() > 4096 {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "设备 token 不能为空",
+        ));
+    }
+    if !ANDROID_PROVIDERS.contains(&body.provider.as_str()) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备厂商无效"));
+    }
+    let device_model = body.device_model.as_deref().unwrap_or("").trim();
+    let app_version = body.app_version.as_deref().unwrap_or("").trim();
+    if device_model.chars().count() > 128 || app_version.chars().count() > 64 {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备信息过长"));
+    }
+    state
+        .db
+        .upsert_android_device(
+            installation_id,
+            user.id,
+            token,
+            &body.provider,
+            device_model,
+            app_version,
+        )
+        .await
+        .map_err(db_err)?;
+    Ok(Json(json!({
+        "ok": true,
+        "installation_id": installation_id,
+        "provider": body.provider,
+        "device_count": state.db.android_device_count(user.id).await.map_err(db_err)?,
+    })))
+}
+
+async fn unregister_android_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(installation_id): UrlPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let installation_id = installation_id.trim();
+    if !valid_android_installation_id(installation_id) {
+        return Err(ApiError::new(StatusCode::BAD_REQUEST, "设备安装标识无效"));
+    }
+    state
+        .db
+        .delete_android_device(installation_id, user.id)
+        .await
+        .map_err(db_err)?;
+    Ok(Json(json!({
+        "ok": true,
+        "device_count": state.db.android_device_count(user.id).await.map_err(db_err)?,
+    })))
+}
 #[derive(Deserialize)]
 struct LlmForm {
     llm_api_base: Option<String>,

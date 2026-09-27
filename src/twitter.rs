@@ -758,6 +758,7 @@ fn mark_cooling(channel: &str) {
     }
 }
 
+#[cfg(test)]
 fn clear_cooling() {
     *cool_store().lock().unwrap_or_else(|err| err.into_inner()) = (0, 0);
 }
@@ -775,6 +776,7 @@ fn cached_user(screen: &str) -> Option<String> {
         .cloned()
 }
 
+// ponytail: uid cache is process-local, same as Python; persist if restarts keep spending the lookup quota
 fn remember_user(screen: &str, id: &str) {
     user_ids()
         .lock()

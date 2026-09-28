@@ -172,6 +172,7 @@ async fn pull(
             &crate::feishu::Note {
                 kol_name: name,
                 platform: "zsxq",
+                external_id: &topic.external_id,
                 post_type: "post",
                 title: &topic.title,
                 content: &topic.content,

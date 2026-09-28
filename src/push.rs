@@ -109,13 +109,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
         }
     };
     let now = beijing_minutes();
-    let telegram_post = match load_telegram_latest(db, kol_id, note.url).await {
-        Ok(post) => post,
-        Err(err) => {
-            tracing::warn!(kol = kol_id, "读取 Telegram 帖子失败: {err}");
-            None
-        }
-    };
+    let telegram_post = load_telegram_identity(db, kol_id, note.platform, note.external_id).await;
     let mut want_feishu = false;
     for target in &targets {
         if !target.notify_enabled || dnd_blocks(target, now) {
@@ -130,38 +124,59 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             if let Err(err) = wecom(&target.wecom_webhook, note).await {
                 tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
                 note_push_failure(db, &format!("企业微信：{err}")).await;
-                let _ = remember_failure(db, kol_id, note.url, "wecom", target.user_id, &err, unix)
-                    .await;
+                let _ = remember_failure(
+                    db,
+                    kol_id,
+                    (note.platform, note.external_id),
+                    "wecom",
+                    target.user_id,
+                    &err,
+                    unix,
+                )
+                .await;
             }
         }
         if channels.bark {
             if let Err(err) = bark(&target.bark_key, note).await {
                 tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
                 note_push_failure(db, &format!("Bark：{err}")).await;
-                let _ = remember_failure(db, kol_id, note.url, "bark", target.user_id, &err, unix)
-                    .await;
+                let _ = remember_failure(
+                    db,
+                    kol_id,
+                    (note.platform, note.external_id),
+                    "bark",
+                    target.user_id,
+                    &err,
+                    unix,
+                )
+                .await;
             }
         }
         if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
             let key = crate::feishu_personal::credential_key().unwrap_or_default();
             match telegram_secret(&target.telegram_bot_token, &key) {
                 Ok(token) => {
-                    if let Err(err) = send_telegram_post(
-                        &token,
-                        &target.telegram_chat_id,
-                        telegram_post.as_ref(),
-                        target.user_id,
-                        db,
-                        Some(note),
-                    )
-                    .await
-                    {
+                    let result = match &telegram_post {
+                        Ok(Some(post)) => {
+                            send_telegram_post(
+                                &token,
+                                &target.telegram_chat_id,
+                                Some(post),
+                                target.user_id,
+                                db,
+                            )
+                            .await
+                        }
+                        Ok(None) => Err("帖子不存在".into()),
+                        Err(err) => Err(format!("读取帖子失败: {err}")),
+                    };
+                    if let Err(err) = result {
                         tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
                         note_push_failure(db, &format!("Telegram：{err}")).await;
                         let _ = remember_failure(
                             db,
                             kol_id,
-                            note.url,
+                            (note.platform, note.external_id),
                             "telegram",
                             target.user_id,
                             &err,
@@ -176,7 +191,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     let _ = remember_failure(
                         db,
                         kol_id,
-                        note.url,
+                        (note.platform, note.external_id),
                         "telegram",
                         target.user_id,
                         &err,
@@ -195,9 +210,16 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             {
                 tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
                 note_push_failure(db, &format!("浏览器：{err}")).await;
-                let _ =
-                    remember_failure(db, kol_id, note.url, "webpush", target.user_id, &err, unix)
-                        .await;
+                let _ = remember_failure(
+                    db,
+                    kol_id,
+                    (note.platform, note.external_id),
+                    "webpush",
+                    target.user_id,
+                    &err,
+                    unix,
+                )
+                .await;
             }
         }
     }
@@ -209,6 +231,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
         Note {
             kol_name: note.kol_name,
             platform: note.platform,
+            external_id: note.external_id,
             post_type: note.post_type,
             title: note.title,
             content: note.content,
@@ -224,7 +247,16 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             .duration_since(UNIX_EPOCH)
             .map(|item| item.as_secs() as i64)
             .unwrap_or(0);
-        let _ = remember_failure(db, kol_id, note.url, "feishu", 0, &err, unix).await;
+        let _ = remember_failure(
+            db,
+            kol_id,
+            (note.platform, note.external_id),
+            "feishu",
+            0,
+            &err,
+            unix,
+        )
+        .await;
     }
 }
 
@@ -247,24 +279,32 @@ const RETRY_DELAYS: [i64; 3] = [60, 300, 900];
 pub async fn remember_failure(
     db: &Db,
     kol_id: i64,
-    url: &str,
+    identity: (&str, &str),
     channel: &str,
     user_id: i64,
     error: &str,
     now: i64,
 ) -> Result<(), sqlx::Error> {
-    let row = sqlx::query("SELECT id, platform, external_id, url FROM posts WHERE kol_id = ? ORDER BY id DESC LIMIT 1")
-        .bind(kol_id)
-        .fetch_optional(db.pool())
-        .await?;
-    let Some(row) = row else { return Ok(()) };
-    let stored: String = row.get("url");
-    if !url.is_empty() && stored != url {
+    let row =
+        sqlx::query("SELECT id FROM posts WHERE platform = ? AND external_id = ? AND kol_id = ?")
+            .bind(identity.0)
+            .bind(identity.1)
+            .bind(kol_id)
+            .fetch_optional(db.pool())
+            .await?;
+    let Some(row) = row else {
+        tracing::warn!(
+            kol = kol_id,
+            platform = identity.0,
+            external_id = identity.1,
+            channel,
+            "未找到推送失败对应的帖子，跳过重试入队"
+        );
         return Ok(());
-    }
+    };
     let post_id: i64 = row.get("id");
-    let platform: String = row.get("platform");
-    let external_id: String = row.get("external_id");
+    let platform = identity.0;
+    let external_id = identity.1;
     sqlx::query(
         "INSERT INTO push_retries (channel, user_id, platform, external_id, post_id, attempts, next_at)
          VALUES (?, ?, ?, ?, ?, 0, ?)
@@ -272,8 +312,8 @@ pub async fn remember_failure(
     )
     .bind(channel)
     .bind(user_id)
-    .bind(&platform)
-    .bind(&external_id)
+    .bind(platform)
+    .bind(external_id)
     .bind(post_id)
     .bind(now + RETRY_DELAYS[0])
     .execute(db.pool())
@@ -422,7 +462,7 @@ where
 
 pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
     retry_due(db, now, |post_id, channel, user_id| async move {
-        let row = sqlx::query("SELECT k.name, p.platform, p.post_type, p.title, p.content, p.url, p.published_at FROM posts p JOIN kols k ON k.id = p.kol_id WHERE p.id = ?")
+        let row = sqlx::query("SELECT k.name, p.platform, p.external_id, p.post_type, p.title, p.content, p.url, p.published_at FROM posts p JOIN kols k ON k.id = p.kol_id WHERE p.id = ?")
             .bind(post_id)
             .fetch_optional(db.pool())
             .await
@@ -430,6 +470,7 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
         let Some(row) = row else { return Err("帖子不存在".into()) };
         let name: String = row.get("name");
         let platform: String = row.get("platform");
+        let external_id: String = row.get("external_id");
         let post_type: String = row.get("post_type");
         let title: String = row.get("title");
         let content: String = row.get("content");
@@ -439,6 +480,7 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
             let note = Note {
                 kol_name: &name,
                 platform: &platform,
+                external_id: &external_id,
                 post_type: &post_type,
                 title: &title,
                 content: &content,
@@ -462,7 +504,7 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
                 let token = telegram_secret(&row.get::<String, _>("telegram_bot_token"), &key)?;
                 let post = load_telegram_post(db, post_id).await.map_err(|err| err.to_string())?
                     .ok_or_else(|| "帖子不存在".to_string())?;
-                send_telegram_post(&token, &row.get::<String, _>("telegram_chat_id"), Some(&post), user_id, db, None).await
+                send_telegram_post(&token, &row.get::<String, _>("telegram_chat_id"), Some(&post), user_id, db).await
             }
             "webpush" => crate::webpush::send_text(db, user_id, &text).await,
             "feishu" => crate::feishu::send_text(db, &text).await,
@@ -730,20 +772,21 @@ async fn load_telegram_post(db: &Db, post_id: i64) -> Result<Option<TelegramPost
     Ok(row.map(TelegramPost::from_row))
 }
 
-async fn load_telegram_latest(
+async fn load_telegram_identity(
     db: &Db,
     kol_id: i64,
-    url: &str,
+    platform: &str,
+    external_id: &str,
 ) -> Result<Option<TelegramPost>, sqlx::Error> {
     let row = sqlx::query(&format!(
-        "{TELEGRAM_POST_SELECT} WHERE p.kol_id = ? ORDER BY p.id DESC LIMIT 1"
+        "{TELEGRAM_POST_SELECT} WHERE p.platform = ? AND p.external_id = ? AND p.kol_id = ?"
     ))
+    .bind(platform)
+    .bind(external_id)
     .bind(kol_id)
     .fetch_optional(db.pool())
     .await?;
-    Ok(row
-        .map(TelegramPost::from_row)
-        .filter(|post| url.is_empty() || post.url == url))
+    Ok(row.map(TelegramPost::from_row))
 }
 
 fn telegram_url(raw: &str) -> bool {
@@ -1016,13 +1059,9 @@ async fn send_telegram_post(
     post: Option<&TelegramPost>,
     user_id: i64,
     db: &Db,
-    fallback: Option<&Note<'_>>,
 ) -> Result<(), String> {
     let Some(post) = post else {
-        return match fallback {
-            Some(note) => send_telegram(token, chat_id, &plain(note)).await,
-            None => Err("帖子不存在".into()),
-        };
+        return Err("帖子不存在".into());
     };
     let (favorite, keyword) = telegram_reasons(db, post, user_id)
         .await
@@ -1362,7 +1401,7 @@ mod tests {
             .unwrap();
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, content, post_type, images, tags, detail, title_src, content_src, url, published_at) VALUES ('xueqiu', ?, 'fixture', '原标题', '你好<&>', 'reply', '[\"https://example.test/a.jpg\"]', '[\"中文\"]', '{\"files\":[]}', 'Original', 'Hello', 'https://example.test/post', '2026-09-28')")
             .bind(kol).execute(db.pool()).await.unwrap();
-        let initial = load_telegram_latest(&db, kol, "https://example.test/post")
+        let initial = load_telegram_identity(&db, kol, "xueqiu", "fixture")
             .await
             .unwrap()
             .unwrap();
@@ -1373,7 +1412,7 @@ mod tests {
             render_telegram_post(&initial, reasons.0, reasons.1),
             render_telegram_post(&retry, reasons.0, reasons.1)
         );
-        assert!(load_telegram_latest(&db, kol, "https://example.test/wrong")
+        assert!(load_telegram_identity(&db, kol, "xueqiu", "wrong")
             .await
             .unwrap()
             .is_none());
@@ -1383,6 +1422,190 @@ mod tests {
             .await
             .unwrap();
         assert!(load_telegram_post(&db, initial.id).await.unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn telegram_identity_survives_newer_post_with_identical_or_empty_url() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-tg-identity-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let kol = db
+            .add_kol("xueqiu", "甲", "identity", None, false, false, false)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, telegram_bot_token, telegram_chat_id, push_channels) VALUES ('reader', 'x', '123456:ABCDEFGHIJKLMNOPQRST', 'invalid-chat', 'telegram')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'reader'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id) VALUES (?, ?)")
+            .bind(user)
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        for (id, content) in [("A", "A 正文"), ("B", "B 正文")] {
+            sqlx::query("INSERT INTO posts (platform, kol_id, external_id, content, url) VALUES ('xueqiu', ?, ?, ?, '')")
+                .bind(kol).bind(id).bind(content).execute(db.pool()).await.unwrap();
+        }
+        let a_id: i64 = sqlx::query_scalar(
+            "SELECT id FROM posts WHERE platform = 'xueqiu' AND external_id = 'A'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let a = load_telegram_identity(&db, kol, "xueqiu", "A")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.id, a_id);
+        let (html, _) = render_telegram_post(&a, false, false);
+        assert!(html.contains("A 正文"));
+        assert!(!html.contains("B 正文"));
+        let note = Note {
+            kol_name: "甲",
+            platform: "xueqiu",
+            external_id: "A",
+            post_type: "post",
+            title: "A",
+            content: "A 正文",
+            url: "",
+            published_at: "",
+        };
+        deliver(&db, kol, &note).await;
+        let retry_id: i64 =
+            sqlx::query_scalar("SELECT post_id FROM push_retries WHERE channel = 'telegram'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(retry_id, a_id);
+        let retry = load_telegram_post(&db, retry_id).await.unwrap().unwrap();
+        assert_eq!(
+            render_telegram_post(&a, false, false),
+            render_telegram_post(&retry, false, false)
+        );
+        sqlx::query("UPDATE posts SET url = 'https://example.test/same' WHERE kol_id = ?")
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            load_telegram_identity(&db, kol, "xueqiu", "A")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            a_id
+        );
+        assert!(load_telegram_identity(&db, kol + 1, "xueqiu", "A")
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("DELETE FROM posts WHERE id = ?")
+            .bind(a_id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let next_at: i64 = sqlx::query_scalar("SELECT next_at FROM push_retries WHERE post_id = ?")
+            .bind(a_id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(retry_due_live(&db, next_at).await.unwrap(), 0);
+        let status: String = sqlx::query_scalar(
+            "SELECT status FROM push_logs WHERE post_id = ? AND channel = 'telegram'",
+        )
+        .bind(a_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(status, "failed");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn telegram_missing_post_or_lookup_error_never_sends_or_queues_another_post() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-tg-missing-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let kol = db
+            .add_kol("xueqiu", "甲", "missing", None, false, false, false)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, telegram_bot_token, telegram_chat_id, push_channels) VALUES ('reader', 'x', '123456:ABCDEFGHIJKLMNOPQRST', 'invalid-chat', 'telegram')")
+            .execute(db.pool()).await.unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'reader'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id) VALUES (?, ?)")
+            .bind(user)
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id) VALUES ('xueqiu', ?, 'B')")
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(load_telegram_identity(&db, kol, "xueqiu", "A")
+            .await
+            .unwrap()
+            .is_none());
+        let note = Note {
+            kol_name: "甲",
+            platform: "xueqiu",
+            external_id: "A",
+            post_type: "post",
+            title: "A",
+            content: "A 正文",
+            url: "",
+            published_at: "",
+        };
+        deliver(&db, kol, &note).await;
+        assert!(
+            send_telegram_post("123456:ABCDEFGHIJKLMNOPQRST", "-1", None, user, &db)
+                .await
+                .is_err()
+        );
+        remember_failure(&db, kol, ("xueqiu", "A"), "telegram", 1, "missing", 1_000)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_retries")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        sqlx::query("DROP TABLE posts")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(load_telegram_identity(&db, kol, "xueqiu", "A")
+            .await
+            .is_err());
+        deliver(&db, kol, &note).await;
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM push_retries")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1617,6 +1840,7 @@ mod tests {
         let note = Note {
             kol_name: "测试",
             platform: "xueqiu",
+            external_id: "deliver-unbound",
             post_type: "post",
             title: "标题",
             content: "正文",
@@ -1695,7 +1919,7 @@ mod tests {
         remember_failure(
             &db,
             kol_id,
-            "https://example.test/retry",
+            ("xueqiu", "retry-telegram"),
             "telegram",
             user_id,
             "Telegram 配置无效",
@@ -1768,20 +1992,20 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'p1', '标题', 'https://xueqiu.com/p/1')").bind(kol).execute(db.pool()).await.unwrap();
+        remember_failure(&db, kol, ("xueqiu", "p1"), "wecom", user, "超时", 1_000)
+            .await
+            .unwrap();
         remember_failure(
             &db,
             kol,
-            "https://xueqiu.com/p/1",
+            ("xueqiu", "not-found"),
             "wecom",
             user,
-            "超时",
+            "不应入队",
             1_000,
         )
         .await
         .unwrap();
-        remember_failure(&db, kol, "https://other", "wecom", user, "不应入队", 1_000)
-            .await
-            .unwrap();
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM push_retries")
                 .fetch_one(db.pool())
@@ -1832,17 +2056,9 @@ mod tests {
             "success"
         );
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'p2', '二', 'https://xueqiu.com/p/2')").bind(kol).execute(db.pool()).await.unwrap();
-        remember_failure(
-            &db,
-            kol,
-            "https://xueqiu.com/p/2",
-            "bark",
-            user,
-            "超时",
-            2_000,
-        )
-        .await
-        .unwrap();
+        remember_failure(&db, kol, ("xueqiu", "p2"), "bark", user, "超时", 2_000)
+            .await
+            .unwrap();
         for delay in [60, 300, 900] {
             let at: i64 = sqlx::query_scalar("SELECT next_at FROM push_retries")
                 .fetch_one(db.pool())
@@ -1875,17 +2091,9 @@ mod tests {
             .await
             .unwrap();
         sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, url) VALUES ('xueqiu', ?, 'p3', '三', 'https://xueqiu.com/p/3')").bind(kol).execute(db.pool()).await.unwrap();
-        remember_failure(
-            &db,
-            kol,
-            "https://xueqiu.com/p/3",
-            "telegram",
-            user,
-            "超时",
-            3_000,
-        )
-        .await
-        .unwrap();
+        remember_failure(&db, kol, ("xueqiu", "p3"), "telegram", user, "超时", 3_000)
+            .await
+            .unwrap();
         assert_eq!(
             retry_due(&db, 3_060, |_, _, _| async { Ok(()) })
                 .await

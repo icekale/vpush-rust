@@ -197,6 +197,7 @@ async fn save(db: &Db, kol_id: i64, kol_name: &str, batch: Batch) -> Result<(), 
             &crate::feishu::Note {
                 kol_name,
                 platform: "xueqiu",
+                external_id: &post.external_id,
                 post_type: &post.post_type,
                 title: &post.title,
                 content: &post.content,

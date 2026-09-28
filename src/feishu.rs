@@ -7,6 +7,7 @@ use crate::db::Db;
 pub struct Note<'a> {
     pub kol_name: &'a str,
     pub platform: &'a str,
+    pub external_id: &'a str,
     pub post_type: &'a str,
     pub title: &'a str,
     pub content: &'a str,
@@ -160,6 +161,7 @@ mod tests {
         let note = Note {
             kol_name: "甲",
             platform: "xueqiu",
+            external_id: "fixture",
             post_type: "reply",
             title: "",
             content: "回复一下",

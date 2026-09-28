@@ -232,6 +232,7 @@ async fn pull(
             &crate::feishu::Note {
                 kol_name: name,
                 platform: "weibo",
+                external_id: &post.external_id,
                 post_type: "post",
                 title: &post.title,
                 content: &post.content,

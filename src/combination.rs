@@ -202,6 +202,7 @@ async fn sync_one(
             &crate::feishu::Note {
                 kol_name: name,
                 platform: "combination",
+                external_id: &post.external_id,
                 post_type: "post",
                 title: &post.title,
                 content: &post.content,

@@ -189,6 +189,7 @@ async fn pull(
             &crate::feishu::Note {
                 kol_name: name,
                 platform: "twitter",
+                external_id: &tweet.external_id,
                 post_type: kind,
                 title: &tweet.content.chars().take(80).collect::<String>(),
                 content: &tweet.content,

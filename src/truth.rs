@@ -113,6 +113,7 @@ async fn poll(db: &Db) -> Result<(), String> {
             &crate::feishu::Note {
                 kol_name: &name,
                 platform: "truth",
+                external_id: &entry.external_id,
                 post_type: "post",
                 title: &entry.title,
                 content: &entry.content,

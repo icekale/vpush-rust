@@ -5583,27 +5583,62 @@ impl Db {
         url: &str,
         published_at: &str,
     ) -> Result<(), sqlx::Error> {
+        self.save_fetched_src(
+            kol_id,
+            external_id,
+            title,
+            content,
+            "",
+            "",
+            post_type,
+            images_json,
+            url,
+            published_at,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn save_fetched_src(
+        &self,
+        kol_id: i64,
+        external_id: &str,
+        title: &str,
+        content: &str,
+        title_src: &str,
+        content_src: &str,
+        post_type: &str,
+        images_json: &str,
+        url: &str,
+        published_at: &str,
+    ) -> Result<(), sqlx::Error> {
+        let title = crate::zh_simp::to_simplified(title);
+        let content = crate::zh_simp::to_simplified(content);
         let platform: String = sqlx::query_scalar("SELECT platform FROM kols WHERE id = ?")
             .bind(kol_id)
             .fetch_one(&self.pool)
             .await?;
         sqlx::query(
             "INSERT INTO posts
-                (platform, kol_id, external_id, title, content, post_type, images, url, published_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (platform, kol_id, external_id, title, content, title_src, content_src, post_type, images, url, published_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(platform, external_id) DO UPDATE SET
                 title = excluded.title,
                 content = excluded.content,
+                title_src = CASE WHEN excluded.title_src != '' THEN excluded.title_src ELSE title_src END,
+                content_src = CASE WHEN excluded.content_src != '' THEN excluded.content_src ELSE content_src END,
                 post_type = excluded.post_type,
                 images = excluded.images,
                 url = excluded.url,
                 published_at = excluded.published_at",
         )
-        .bind(platform)
+        .bind(&platform)
         .bind(kol_id)
         .bind(external_id)
-        .bind(title)
-        .bind(content)
+        .bind(&title)
+        .bind(&content)
+        .bind(title_src)
+        .bind(content_src)
         .bind(post_type)
         .bind(images_json)
         .bind(url)

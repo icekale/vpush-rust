@@ -15,7 +15,7 @@ use crate::db::Db;
 
 const USER_TWEETS: &str = "T1x2zehUOKCWNpKwZCpnbg";
 const USER_BY_NAME: &str = "Gb-d6r0vxPOADdG62OEBpQ";
-const BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+pub(crate) const BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
 const FEATURES: &str = r#"{"rweb_video_screen_enabled":false,"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"tweetypie_unmention_optimization_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"rweb_video_timestamps_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"responsive_web_enhance_cards_enabled":false}"#;
 const APP_CONSUMER_KEY: &str = "3nVuSoBZnx6U4vzUxf5w";
 const APP_CONSUMER_SECRET: &str = "Bcs59EFbbsdF6Sl9Ng71smgStWEGwXXKSjYvPVt7qys";
@@ -195,11 +195,23 @@ async fn pull(
         }
         let images = serde_json::to_string(&tweet.images).unwrap_or_else(|_| "[]".into());
         let kind = if tweet.reply { "reply" } else { "post" };
-        db.save_fetched(
+        let raw_title: String = tweet.content.chars().take(80).collect();
+        let (title, content, title_src, content_src) = crate::translate::for_new_post(
+            db,
+            "twitter",
+            &tweet.external_id,
+            &raw_title,
+            &tweet.content,
+            proxy.as_deref(),
+        )
+        .await;
+        db.save_fetched_src(
             kol_id,
             &tweet.external_id,
-            &tweet.content.chars().take(80).collect::<String>(),
-            &tweet.content,
+            &title,
+            &content,
+            &title_src,
+            &content_src,
             kind,
             &images,
             &tweet.url,
@@ -222,8 +234,8 @@ async fn pull(
                 kol_name: name,
                 platform: "twitter",
                 post_type: kind,
-                title: &tweet.content.chars().take(80).collect::<String>(),
-                content: &tweet.content,
+                title: &title,
+                content: &content,
                 url: &tweet.url,
                 published_at: &tweet.published_at,
             },
@@ -328,7 +340,7 @@ async fn graphql(
     Err(last)
 }
 
-fn browser() -> Result<wreq::Client, String> {
+pub(crate) fn browser() -> Result<wreq::Client, String> {
     static CLIENT: OnceLock<Result<wreq::Client, String>> = OnceLock::new();
     match CLIENT.get_or_init(chrome_client) {
         Ok(client) => Ok(client.clone()),

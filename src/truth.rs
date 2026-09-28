@@ -48,6 +48,7 @@ async fn poll(db: &Db) -> Result<(), String> {
     };
     let exit = crate::proxy_admin::acquire(db, "truth").await?;
     let proxy = exit.as_ref().map(|item| item.url.clone());
+    let proxy_url = proxy.clone();
     let proxy_id = exit.map(|item| item.id);
     let fetched = tokio::task::spawn_blocking(move || fetch_head(proxy.as_deref()))
         .await
@@ -87,11 +88,22 @@ async fn poll(db: &Db) -> Result<(), String> {
             continue;
         }
         let images = serde_json::to_string(&entry.images).unwrap_or_else(|_| "[]".into());
-        db.save_fetched(
-            id,
+        let (title, content, title_src, content_src) = crate::translate::for_new_post(
+            db,
+            "truth",
             &entry.external_id,
             &entry.title,
             &entry.content,
+            proxy_url.as_deref(),
+        )
+        .await;
+        db.save_fetched_src(
+            id,
+            &entry.external_id,
+            &title,
+            &content,
+            &title_src,
+            &content_src,
             "post",
             &images,
             &entry.url,
@@ -114,8 +126,8 @@ async fn poll(db: &Db) -> Result<(), String> {
                 kol_name: &name,
                 platform: "truth",
                 post_type: "post",
-                title: &entry.title,
-                content: &entry.content,
+                title: &title,
+                content: &content,
                 url: &entry.url,
                 published_at: &entry.published_at,
             },
@@ -343,7 +355,12 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
     (year as i32, month as u32, day as u32)
 }
 
-pub async fn backfill<F, Fut>(db: &Db, limit: i64, mut translate: F) -> Result<i64, sqlx::Error>
+pub async fn backfill<F, Fut>(
+    db: &Db,
+    platform: &str,
+    limit: i64,
+    mut translate: F,
+) -> Result<i64, sqlx::Error>
 where
     F: FnMut(String) -> Fut,
     Fut: std::future::Future<Output = Result<String, String>>,
@@ -351,10 +368,11 @@ where
     use sqlx::Row;
     let rows = sqlx::query(
         "SELECT id, title, content FROM posts
-         WHERE platform = 'truth' AND content_src = '' AND length(content) >= 20
+         WHERE platform = ? AND content_src = '' AND length(content) >= 20
          AND published_at >= datetime('now', '-1 day')
          ORDER BY id DESC LIMIT ?",
     )
+    .bind(platform)
     .bind(limit.saturating_mul(3).max(1))
     .fetch_all(db.pool())
     .await?;
@@ -387,7 +405,15 @@ where
             .chars()
             .take(80)
             .collect();
-        store_translation(db, id, &title_zh, &translated, &title, &content).await?;
+        store_translation(
+            db,
+            id,
+            &crate::zh_simp::to_simplified(&title_zh),
+            &crate::zh_simp::to_simplified(&translated),
+            &title,
+            &content,
+        )
+        .await?;
         done += 1;
     }
     Ok(done)
@@ -503,7 +529,7 @@ mod tests {
         .await
         .unwrap();
         let mut calls = 0;
-        let done = backfill(&db, 2, |text| {
+        let done = backfill(&db, "truth", 2, |text| {
             calls += 1;
             async move {
                 Ok(format!(
@@ -535,7 +561,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(old.is_empty());
-        let again = backfill(&db, 3, |text| async move {
+        let again = backfill(&db, "truth", 3, |text| async move {
             if text.contains("three") {
                 Ok(text)
             } else {

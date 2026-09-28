@@ -285,32 +285,35 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
             _ => {}
         }
     }
-    if let Some(cfg) = admin_llm(db).await {
-        if db
-            .setting("config_translate_twitter_content")
+    if db
+        .setting("config_translate_twitter_content")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        == Some("1")
+    {
+        let exit = crate::proxy_admin::acquire(db, "twitter")
             .await
             .ok()
-            .flatten()
-            .as_deref()
-            == Some("1")
-        {
-            match crate::truth::backfill(db, 3, |text| {
-                let cfg = cfg.clone();
-                async move {
-                    crate::llm::complete(
-                        &cfg,
-                        &format!("把下面内容翻译成简体中文，只输出译文：\n{text}"),
-                    )
-                    .await
-                }
+            .flatten();
+        let proxy = exit.as_ref().map(|item| item.url.clone());
+        for platform in ["truth", "twitter"] {
+            match crate::truth::backfill(db, platform, 3, |text| {
+                let db = db.clone();
+                let proxy = proxy.clone();
+                async move { crate::translate::text(&db, &text, None, proxy.as_deref()).await }
             })
             .await
             {
-                Ok(done) if done > 0 => tracing::info!(done, "Truth 翻译回填"),
-                Err(err) => tracing::warn!("Truth 翻译回填失败: {err}"),
+                Ok(done) if done > 0 => tracing::info!(done, platform, "翻译回填"),
+                Err(err) => tracing::warn!(platform, "翻译回填失败: {err}"),
                 _ => {}
             }
         }
+    }
+    simplify_due(db).await;
+    if let Some(cfg) = admin_llm(db).await {
         let extract_cfg = with_model(db, cfg.clone(), "report_extract_model").await;
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -423,6 +426,68 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
         tracing::warn!("推送重试失败: {err}");
     }
     Ok(())
+}
+
+async fn simplify_due(db: &Db) {
+    use sqlx::Row;
+    if db.setting("zh_simp_cursor").await.ok().flatten().as_deref() == Some("0") {
+        return;
+    }
+    let before = db
+        .setting("zh_simp_cursor")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(i64::MAX);
+    let rows = sqlx::query(
+        "SELECT id, title, content, title_src, content_src FROM posts WHERE id < ? ORDER BY id DESC LIMIT 100",
+    )
+    .bind(before)
+    .fetch_all(db.pool())
+    .await;
+    let Ok(rows) = rows else {
+        return;
+    };
+    if rows.is_empty() {
+        let _ = db.set_setting("zh_simp_cursor", "0").await;
+        return;
+    }
+    let mut next = before;
+    for row in rows {
+        let id: i64 = row.get("id");
+        next = id;
+        let title: String = row.get("title");
+        let content: String = row.get("content");
+        let title_src: String = row.get("title_src");
+        let content_src: String = row.get("content_src");
+        let title_zh = crate::zh_simp::to_simplified(&title);
+        let content_zh = crate::zh_simp::to_simplified(&content);
+        let title_src_zh = if title_src == title {
+            title_zh.clone()
+        } else {
+            title_src.clone()
+        };
+        let content_src_zh = if content_src == content {
+            content_zh.clone()
+        } else {
+            content_src
+        };
+        if title_zh == title && content_zh == content && title_src_zh == title_src {
+            continue;
+        }
+        let _ = sqlx::query(
+            "UPDATE posts SET title = ?, content = ?, title_src = ?, content_src = ? WHERE id = ?",
+        )
+        .bind(&title_zh)
+        .bind(&content_zh)
+        .bind(&title_src_zh)
+        .bind(&content_src_zh)
+        .bind(id)
+        .execute(db.pool())
+        .await;
+    }
+    let _ = db.set_setting("zh_simp_cursor", &next.to_string()).await;
 }
 
 #[cfg(test)]

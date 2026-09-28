@@ -25,6 +25,7 @@ mod push;
 mod reports;
 mod syslogs;
 mod tags;
+mod translate;
 mod truth;
 mod twitter;
 mod url_guard;
@@ -36,6 +37,7 @@ mod wscn;
 mod xincai;
 mod xq_crypto;
 mod xueqiu;
+mod zh_simp;
 mod zsxq;
 mod zsxq_file;
 
@@ -2811,7 +2813,6 @@ fn download_token(headers: &HeaderMap, query_token: Option<&str>) -> String {
         .unwrap_or("")
         .to_string()
 }
-
 
 async fn feishu_asset(
     State(state): State<AppState>,
@@ -6484,7 +6485,10 @@ mod tests {
     fn download_token_prefers_header_then_query_then_cookie() {
         let mut headers = HeaderMap::new();
         assert_eq!(download_token(&headers, Some("query")), "query");
-        headers.insert(header::COOKIE, "vpush_file=cookie; other=1".parse().unwrap());
+        headers.insert(
+            header::COOKIE,
+            "vpush_file=cookie; other=1".parse().unwrap(),
+        );
         assert_eq!(download_token(&headers, None), "cookie");
         headers.insert(header::AUTHORIZATION, "Bearer header".parse().unwrap());
         assert_eq!(download_token(&headers, Some("query")), "header");

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 const HOSTS: &[&str] = &[
@@ -200,6 +200,9 @@ pub fn reset_quota() {
 }
 
 pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> {
+    if target.host == "static-assets-1.truthsocial.com" && !target.video {
+        return fetch_truth(target);
+    }
     let agent = ureq::AgentBuilder::new()
         .resolver(crate::url_guard::public_resolver)
         .timeout(Duration::from_secs(if target.video { 30 } else { 15 }))
@@ -351,6 +354,79 @@ fn bad() -> ImgError {
     }
 }
 
+fn fetch_truth(target: &Target) -> Result<Proxied, ImgError> {
+    let url = target.url.clone();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| upstream(false))?;
+    let (status, content_type, body) = runtime.block_on(async move {
+        let response = chrome()
+            .map_err(|_| upstream(false))?
+            .get(url)
+            .header("Referer", "https://truthsocial.com/")
+            .header(
+                "Accept",
+                "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            )
+            .send()
+            .await
+            .map_err(|_| upstream(false))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|_| upstream(false))?
+            .to_vec();
+        Ok::<_, ImgError>((status, content_type, body))
+    })?;
+    if status != 200 {
+        return Err(upstream(false));
+    }
+    if !IMAGE_TYPES.contains(&content_type.as_str()) {
+        return Err(ImgError {
+            status: 400,
+            detail: "非图片内容",
+            retry_after: None,
+        });
+    }
+    if body.len() > IMAGE_MAX {
+        return Err(ImgError {
+            status: 400,
+            detail: "图片过大",
+            retry_after: None,
+        });
+    }
+    finish(false, 200, content_type, Some(body.len()), None, body)
+}
+
+fn chrome() -> Result<wreq::Client, String> {
+    static CLIENT: OnceLock<Result<wreq::Client, String>> = OnceLock::new();
+    match CLIENT.get_or_init(|| {
+        // ponytail: CF challenges ureq and Chrome124; Chrome137 is the newest profile here
+        wreq::Client::builder()
+            .emulation(wreq_util::Emulation::Chrome137)
+            .redirect(wreq::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(20))
+            .build()
+            .map_err(|err| err.to_string())
+    }) {
+        Ok(client) => Ok(client.clone()),
+        Err(err) => Err(err.clone()),
+    }
+}
+
 fn upstream(video: bool) -> ImgError {
     ImgError {
         status: 502,
@@ -411,5 +487,13 @@ mod tests {
         assert_eq!(err.status, 429);
         assert_eq!(err.detail, "图片加载过于频繁，请稍后再试");
         take_quota(false, "1.2.3.4", 160).unwrap();
+    }
+
+    #[test]
+    fn truth_jpeg_passes_cloudflare_with_chrome() {
+        let target = validate("https://static-assets-1.truthsocial.com/tmtg:prime-ts-assets/media_attachments/files/117/345/153/898/008/432/original/3826b8f99055aa3b.jpg").unwrap();
+        let got = fetch(&target, None).expect("truth image");
+        assert_eq!(got.media_type, "image/jpeg");
+        assert!(got.body.len() > 2048);
     }
 }

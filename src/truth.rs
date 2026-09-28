@@ -60,10 +60,17 @@ async fn poll(db: &Db) -> Result<(), String> {
         }
         Err(err) => {
             crate::proxy_admin::note(db, proxy_id, false, &err).await;
+            let _ = db.note_kol_fetch(id, Some(&err)).await;
             return Err(err);
         }
     };
-    let entries = parse_archive_head(&raw)?;
+    let entries = match parse_archive_head(&raw) {
+        Ok(entries) => entries,
+        Err(err) => {
+            let _ = db.note_kol_fetch(id, Some(&err)).await;
+            return Err(err);
+        }
+    };
     let last = db.max_external_num(id).await.map_err(|e| e.to_string())?;
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -134,6 +141,7 @@ async fn poll(db: &Db) -> Result<(), String> {
             },
         );
     }
+    let _ = db.note_kol_fetch(id, None).await;
     Ok(())
 }
 

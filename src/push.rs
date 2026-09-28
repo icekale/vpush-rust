@@ -1,6 +1,7 @@
 //! 按订阅用户自己的开关发新帖。空的推送渠道表示「已绑定的都发」。
 
 use std::collections::VecDeque;
+use std::io::Read;
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -1433,7 +1434,7 @@ fn telegram_deliver_post_media(
         rich_images,
         fallback_images,
         videos,
-        |method, body| telegram_post(token, method, body),
+        |method, body| telegram_post_media_request(token, method, body),
     )
 }
 
@@ -1587,6 +1588,289 @@ fn telegram_post(token: &str, method: &str, body: &str) -> Result<(), TelegramRe
         thread::sleep,
     )
     .map(|_| ())
+}
+
+const TELEGRAM_PHOTO_LIMIT: usize = 10_000_000;
+const TELEGRAM_VIDEO_LIMIT: usize = 50_000_000;
+
+#[derive(Clone, Debug)]
+struct TelegramUpload {
+    field: &'static str,
+    filename: &'static str,
+    mime: &'static str,
+    bytes: Vec<u8>,
+}
+
+fn telegram_multipart_body(fields: &[(&str, &str)], files: &[TelegramUpload]) -> (String, Vec<u8>) {
+    const BOUNDARY: &str = "vpush-telegram-multipart-boundary";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+    }
+    for file in files {
+        body.extend_from_slice(
+            format!("--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\nContent-Type: {}\r\n\r\n", file.field, file.filename, file.mime).as_bytes(),
+        );
+        body.extend_from_slice(&file.bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    (BOUNDARY.to_string(), body)
+}
+
+fn telegram_post_multipart(
+    token: &str,
+    method: &str,
+    fields: &[(&str, &str)],
+    files: &[TelegramUpload],
+) -> Result<(), TelegramRequestError> {
+    let url = format!("https://api.telegram.org/bot{token}/{method}");
+    let (boundary, body) = telegram_multipart_body(fields, files);
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(30))
+        .build();
+    telegram_request_with(
+        || {
+            telegram_wait_for_slot();
+            match agent
+                .post(&url)
+                .set(
+                    "Content-Type",
+                    &format!("multipart/form-data; boundary={boundary}"),
+                )
+                .send_bytes(&body)
+            {
+                Ok(response) | Err(ureq::Error::Status(_, response)) => {
+                    telegram_http_response(response)
+                }
+                Err(_) => Err(TelegramRequestError::Transport),
+            }
+        },
+        thread::sleep,
+    )
+    .map(|_| ())
+}
+
+fn telegram_validate_download_url(url: &str) -> Result<(), ()> {
+    let parsed = url::Url::parse(url).map_err(|_| ())?;
+    let scheme = parsed.scheme();
+    if !matches!(scheme, "http" | "https") || crate::url_guard::validate_url(url, scheme).is_err() {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn telegram_download_media(url: &str, video: bool) -> Result<TelegramUpload, ()> {
+    telegram_validate_download_url(url)?;
+    let response = ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(120))
+        .redirects(0)
+        .build()
+        .get(url)
+        .call()
+        .map_err(|_| ())?;
+    if !(200..300).contains(&response.status()) {
+        return Err(());
+    }
+    let mime = response
+        .header("Content-Type")
+        .unwrap_or("")
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let limit = if video {
+        TELEGRAM_VIDEO_LIMIT
+    } else {
+        TELEGRAM_PHOTO_LIMIT
+    };
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .take((limit + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if !telegram_media_body_valid(&mime, &bytes, video) {
+        return Err(());
+    }
+    let (field, filename, mime) = if video {
+        if mime == "video/webm" {
+            ("video", "video.webm", "video/webm")
+        } else {
+            ("video", "video.mp4", "video/mp4")
+        }
+    } else {
+        match mime.as_str() {
+            "image/jpeg" => ("photo", "photo.jpg", "image/jpeg"),
+            "image/png" => ("photo", "photo.png", "image/png"),
+            "image/gif" => ("photo", "photo.gif", "image/gif"),
+            "image/webp" => ("photo", "photo.webp", "image/webp"),
+            _ => return Err(()),
+        }
+    };
+    Ok(TelegramUpload {
+        field,
+        filename,
+        mime,
+        bytes,
+    })
+}
+
+fn telegram_media_size_valid(bytes: &[u8], video: bool) -> bool {
+    let limit = if video {
+        TELEGRAM_VIDEO_LIMIT
+    } else {
+        TELEGRAM_PHOTO_LIMIT
+    };
+    !bytes.is_empty() && bytes.len() <= limit
+}
+
+fn telegram_media_body_valid(mime: &str, bytes: &[u8], video: bool) -> bool {
+    if !telegram_media_size_valid(bytes, video) {
+        return false;
+    }
+    if video {
+        return matches!(mime, "video/mp4" | "video/webm")
+            && if mime == "video/mp4" {
+                bytes.len() >= 12 && &bytes[4..8] == b"ftyp"
+            } else {
+                bytes.starts_with(&[0x1a, 0x45, 0xdf, 0xa3])
+            };
+    }
+    match mime {
+        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
+        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
+        "image/gif" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
+        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
+        _ => false,
+    }
+}
+
+fn telegram_post_media_with_fallback<F, D, U>(
+    method: &str,
+    body: &str,
+    mut request: F,
+    mut download: D,
+    mut upload: U,
+) -> Result<(), TelegramRequestError>
+where
+    F: FnMut(&str, &str) -> Result<(), TelegramRequestError>,
+    D: FnMut(&str, bool) -> Result<TelegramUpload, ()>,
+    U: FnMut(&str, &[(&str, &str)], &[TelegramUpload]) -> Result<(), TelegramRequestError>,
+{
+    match request(method, body) {
+        Ok(()) => Ok(()),
+        Err(TelegramRequestError::Api(_))
+            if matches!(method, "sendPhoto" | "sendVideo" | "sendMediaGroup") =>
+        {
+            let payload: Value = serde_json::from_str(body)
+                .map_err(|_| TelegramRequestError::Api("Telegram request rejected".into()))?;
+            let chat = payload["chat_id"].as_str().unwrap_or_default();
+            match method {
+                "sendPhoto" | "sendVideo" => {
+                    let video = method == "sendVideo";
+                    let url = payload[if video { "video" } else { "photo" }]
+                        .as_str()
+                        .unwrap_or_default();
+                    let file = download(url, video).map_err(|_| {
+                        TelegramRequestError::Api("Telegram media download failed".into())
+                    })?;
+                    let mut fields = vec![("chat_id", chat)];
+                    if video {
+                        fields.push(("supports_streaming", "true"));
+                    }
+                    upload(method, &fields, &[file])
+                }
+                "sendMediaGroup" => {
+                    let urls: Vec<&str> = payload["media"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|item| item["media"].as_str())
+                        .take(4)
+                        .collect();
+                    let mut files = Vec::new();
+                    for url in urls {
+                        if let Ok(file) = download(url, false) {
+                            files.push(file);
+                        }
+                    }
+                    if files.is_empty() {
+                        return Err(TelegramRequestError::Api(
+                            "Telegram media download failed".into(),
+                        ));
+                    }
+                    if files.len() == 1 {
+                        return upload("sendPhoto", &[("chat_id", chat)], &files);
+                    }
+                    let media = files
+                        .iter()
+                        .enumerate()
+                        .map(|(i, file)| {
+                            let mut file = TelegramUpload {
+                                field: "photo",
+                                ..file.clone()
+                            };
+                            file.field = match i {
+                                0 => "p0",
+                                1 => "p1",
+                                2 => "p2",
+                                _ => "p3",
+                            };
+                            file
+                        })
+                        .collect::<Vec<_>>();
+                    let media_json = serde_json::to_string(
+                        &media
+                            .iter()
+                            .enumerate()
+                            .map(|(i, _)| json!({"type":"photo", "media":format!("attach://p{i}")}))
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap_or_default();
+                    let fields = [("chat_id", chat), ("media", media_json.as_str())];
+                    match upload("sendMediaGroup", &fields, &media) {
+                        Ok(()) => Ok(()),
+                        Err(TelegramRequestError::Api(_)) => {
+                            for file in &media {
+                                let photo = TelegramUpload {
+                                    field: "photo",
+                                    ..file.clone()
+                                };
+                                upload(
+                                    "sendPhoto",
+                                    &[("chat_id", chat)],
+                                    std::slice::from_ref(&photo),
+                                )?;
+                            }
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn telegram_post_media_request(
+    token: &str,
+    method: &str,
+    body: &str,
+) -> Result<(), TelegramRequestError> {
+    telegram_post_media_with_fallback(
+        method,
+        body,
+        |method, body| telegram_post(token, method, body),
+        telegram_download_media,
+        |method, fields, files| telegram_post_multipart(token, method, fields, files),
+    )
 }
 
 async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
@@ -2418,6 +2702,150 @@ mod tests {
             methods,
             ["sendMessage", "sendMediaGroup", "sendPhoto", "sendPhoto"]
         );
+    }
+
+    #[test]
+    fn telegram_multipart_builder_uses_controlled_fields_and_binary_bytes() {
+        let file = TelegramUpload {
+            field: "photo",
+            filename: "photo.jpg",
+            mime: "image/jpeg",
+            bytes: vec![0xff, 0xd8, 0xff, 0x00],
+        };
+        let (boundary, body) = telegram_multipart_body(&[("chat_id", "-123")], &[file]);
+        let text = String::from_utf8_lossy(&body);
+        assert!(text.contains(&format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"chat_id\""
+        )));
+        assert!(text.contains("name=\"photo\"; filename=\"photo.jpg\"\r\nContent-Type: image/jpeg"));
+        assert!(body
+            .windows(4)
+            .any(|window| window == [0xff, 0xd8, 0xff, 0x00]));
+        assert!(text.ends_with(&format!("--{boundary}--\r\n")));
+    }
+
+    #[test]
+    fn telegram_media_download_validation_rejects_private_malformed_and_oversize() {
+        for url in [
+            "http://127.0.0.1/a.jpg",
+            "https://localhost/a.jpg",
+            "https://[::1]/a.jpg",
+            "https://user:pass@example.test/a.jpg",
+            "not a url",
+            "file:///etc/passwd",
+        ] {
+            assert!(telegram_validate_download_url(url).is_err(), "{url}");
+        }
+        assert!(telegram_media_size_valid(
+            &vec![0; TELEGRAM_PHOTO_LIMIT],
+            false
+        ));
+        assert!(!telegram_media_size_valid(
+            &vec![0; TELEGRAM_PHOTO_LIMIT + 1],
+            false
+        ));
+        assert!(telegram_media_size_valid(
+            &vec![0; TELEGRAM_VIDEO_LIMIT],
+            true
+        ));
+        assert!(!telegram_media_size_valid(
+            &vec![0; TELEGRAM_VIDEO_LIMIT + 1],
+            true
+        ));
+        assert!(!telegram_media_body_valid(
+            "image/jpeg",
+            b"not an image",
+            false
+        ));
+    }
+
+    #[test]
+    fn telegram_media_fallback_is_api_rejection_only_and_builds_photo_upload() {
+        let mut requests = Vec::new();
+        let mut upload_methods = Vec::new();
+        let body = json!({"chat_id":"-123", "photo":"https://cdn.example/a.jpg"}).to_string();
+        telegram_post_media_with_fallback(
+            "sendPhoto",
+            &body,
+            |method, _| {
+                requests.push(method.to_string());
+                Err(TelegramRequestError::Api("Telegram HTTP 400".into()))
+            },
+            |url, video| {
+                assert_eq!(url, "https://cdn.example/a.jpg");
+                assert!(!video);
+                Ok(TelegramUpload {
+                    field: "photo",
+                    filename: "photo.jpg",
+                    mime: "image/jpeg",
+                    bytes: vec![1],
+                })
+            },
+            |method, fields, files| {
+                upload_methods.push(method.to_string());
+                assert_eq!(fields, [("chat_id", "-123")]);
+                assert_eq!(files[0].field, "photo");
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(requests, ["sendPhoto"]);
+        assert_eq!(upload_methods, ["sendPhoto"]);
+
+        let mut downloads = 0;
+        let result = telegram_post_media_with_fallback(
+            "sendPhoto",
+            &body,
+            |_, _| Err(TelegramRequestError::Transport),
+            |_, _| {
+                downloads += 1;
+                unreachable!()
+            },
+            |_, _, _| unreachable!(),
+        );
+        assert_eq!(result, Err(TelegramRequestError::Transport));
+        assert_eq!(downloads, 0);
+    }
+
+    #[test]
+    fn telegram_album_fallback_uploads_attach_group_then_individuals_on_api_rejection() {
+        let urls = ["https://cdn.example/1.jpg", "https://cdn.example/2.jpg"];
+        let body = json!({"chat_id":"-123", "media":urls.iter().map(|url| json!({"type":"photo", "media":url})).collect::<Vec<_>>()}).to_string();
+        let mut uploads = Vec::new();
+        telegram_post_media_with_fallback(
+            "sendMediaGroup",
+            &body,
+            |_, _| Err(TelegramRequestError::Api("rejected".into())),
+            |_, _| {
+                Ok(TelegramUpload {
+                    field: "photo",
+                    filename: "photo.jpg",
+                    mime: "image/jpeg",
+                    bytes: vec![1],
+                })
+            },
+            |method, fields, files| {
+                uploads.push((
+                    method.to_string(),
+                    fields
+                        .iter()
+                        .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                        .collect::<Vec<_>>(),
+                    files.iter().map(|file| file.field).collect::<Vec<_>>(),
+                ));
+                if method == "sendMediaGroup" {
+                    Err(TelegramRequestError::Api("album rejected".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(uploads[0].0, "sendMediaGroup");
+        assert_eq!(uploads[0].2, ["p0", "p1"]);
+        assert!(uploads[0].1[1].1.contains("attach://p0"));
+        assert_eq!(uploads[1].0, "sendPhoto");
+        assert_eq!(uploads[2].0, "sendPhoto");
     }
 
     #[test]

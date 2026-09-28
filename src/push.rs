@@ -1218,6 +1218,91 @@ fn add_html(out: &mut String, fragment: &str) {
     }
 }
 
+/// sendRichMessage 忽略换行。分段标签对齐 Python 的 Rich HTML。
+fn rich_paragraphs(escaped: &str) -> String {
+    let mut parts = Vec::new();
+    for block in escaped.trim().split("\n\n") {
+        let lines: Vec<&str> = block
+            .split('\n')
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        if !lines.is_empty() {
+            parts.push(format!("<p>{}</p>", lines.join("<br>")));
+        }
+    }
+    parts.join("")
+}
+
+fn rich_line(escaped: &str) -> String {
+    let text = escaped.trim();
+    if text.is_empty() {
+        String::new()
+    } else {
+        format!("<p>{text}</p>")
+    }
+}
+
+/// sendMessage 的 HTML 不认 p/br/footer。回退时拆回换行，保留 b/em/a/blockquote。
+fn telegram_fallback_html(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find('>') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let tag = &rest[start..start + end + 1];
+        match fallback_tag(tag) {
+            FallbackTag::Break => out.push('\n'),
+            FallbackTag::Drop => {}
+            FallbackTag::Keep => out.push_str(tag),
+        }
+        rest = &rest[start + end + 1..];
+    }
+    out.push_str(rest);
+    let mut tidy = String::new();
+    let mut newlines = 0u8;
+    for ch in out.chars() {
+        if ch == '\n' {
+            newlines += 1;
+            if newlines <= 2 {
+                tidy.push('\n');
+            }
+        } else {
+            newlines = 0;
+            tidy.push(ch);
+        }
+    }
+    tidy.trim().to_string()
+}
+
+enum FallbackTag {
+    Break,
+    Drop,
+    Keep,
+}
+
+fn fallback_tag(tag: &str) -> FallbackTag {
+    let inner = tag.trim_start_matches('<').trim_end_matches('>').trim();
+    let name: String = inner
+        .chars()
+        .take_while(|ch| !ch.is_whitespace())
+        .flat_map(char::to_lowercase)
+        .collect();
+    match name.as_str() {
+        "br" | "/p" | "/footer" | "/li" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4"
+        | "/h5" | "/h6" => FallbackTag::Break,
+        "p" | "footer" | "figure" | "/figure" | "tg-collage" | "/tg-collage" | "img"
+        | "table" | "/table" | "thead" | "/thead" | "tbody" | "/tbody" | "tr" | "th"
+        | "/th" | "td" | "/td" | "caption" | "/caption" | "details" | "/details"
+        | "summary" | "/summary" | "ol" | "/ol" | "ul" | "/ul" | "li" => FallbackTag::Drop,
+        _ => FallbackTag::Keep,
+    }
+}
+
 fn detail_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
@@ -1246,7 +1331,7 @@ fn render_telegram_post(
     );
     add_html(
         &mut html,
-        &format!("<b>{}</b>", escape_html(&heading, 180, 900)),
+        &format!("<p><b>{}</b></p>", escape_html(&heading, 180, 900)),
     );
     if favorite || keyword {
         let reason = match (favorite, keyword) {
@@ -1254,13 +1339,13 @@ fn render_telegram_post(
             (true, false) => "⭐ 特别关注",
             _ => "🔎 关键词命中",
         };
-        add_html(&mut html, &format!("\n<i>{reason}</i>"));
+        add_html(&mut html, &format!("<p><em>{reason}</em></p>"));
     }
     if post.platform != "combination"
         && ((!post.content_src.is_empty() && post.content_src != post.content)
             || (!post.title_src.is_empty() && post.title_src != post.title))
     {
-        add_html(&mut html, "\n<i>翻译自英语</i>");
+        add_html(&mut html, "<p><em>翻译自英语</em></p>");
     }
     if post.platform != "combination" || !post.detail.is_object() {
         let body = if !post.content.is_empty() {
@@ -1270,11 +1355,11 @@ fn render_telegram_post(
         } else {
             "（无正文）"
         };
-        let body = escape_html(body, 2000, 2600);
+        let body = rich_paragraphs(&escape_html(body, 2000, 2600));
         if post.post_type == "reply" {
-            add_html(&mut html, &format!("\n\n<blockquote>{body}</blockquote>"));
+            add_html(&mut html, &format!("<blockquote>{body}</blockquote>"));
         } else {
-            add_html(&mut html, &format!("\n\n{body}"));
+            add_html(&mut html, &body);
         }
     }
     if post.platform == "combination" && post.detail.is_object() {
@@ -1293,7 +1378,7 @@ fn render_telegram_post(
             if !labels.is_empty() {
                 add_html(
                     &mut html,
-                    &format!("\n{}", escape_html(&labels.join(" · "), 350, 600)),
+                    &rich_line(&escape_html(&labels.join(" · "), 350, 600)),
                 );
             }
         }
@@ -1319,15 +1404,16 @@ fn render_telegram_post(
                 };
                 let prev = action["prev"].as_str().unwrap_or("0.0%");
                 let target = action["target"].as_str().unwrap_or("0.0%");
-                let line = format!("\n{mark} {kind}　{name}\n{prev} → {target}");
-                add_html(&mut html, &escape_html(&line, 300, 500));
+                let line = format!("{mark} {kind}　{name}\n{prev} → {target}");
+                add_html(&mut html, &rich_paragraphs(&escape_html(&line, 300, 500)));
                 if !action["price"].is_null() {
                     add_html(
                         &mut html,
-                        &format!(
-                            "\n成交价 {}",
-                            escape_html(&detail_text(&action["price"]), 40, 120)
-                        ),
+                        &rich_line(&escape_html(
+                            &format!("成交价 {}", detail_text(&action["price"])),
+                            40,
+                            120,
+                        )),
                     );
                 }
             }
@@ -1342,19 +1428,19 @@ fn render_telegram_post(
                     continue;
                 }
                 if !printed {
-                    add_html(&mut html, "\n现有持仓");
+                    add_html(&mut html, "<p>现有持仓</p>");
                     printed = true;
                 }
                 let symbol = holding["symbol"].as_str().unwrap_or("");
-                let line = format!("\n{name}（{symbol}） {}%", detail_text(&holding["weight"]));
-                add_html(&mut html, &escape_html(&line, 200, 350));
+                let line = format!("{name}（{symbol}） {}%", detail_text(&holding["weight"]));
+                add_html(&mut html, &rich_line(&escape_html(&line, 200, 350)));
             }
         }
         let cash = detail_text(&post.detail["cash"]);
         if !cash.is_empty() {
             add_html(
                 &mut html,
-                &format!("\n💵 现金 {}", escape_html(&cash, 40, 100)),
+                &rich_line(&escape_html(&format!("💵 现金 {cash}"), 40, 100)),
             );
         }
     } else {
@@ -1374,14 +1460,20 @@ fn render_telegram_post(
         if !meta.is_empty() {
             add_html(
                 &mut html,
-                &format!("\n{}", escape_html(&meta.join(" · "), 350, 650)),
+                &format!(
+                    "<footer>{}</footer>",
+                    escape_html(&meta.join(" · "), 350, 650)
+                ),
             );
         }
     }
     if !post.published_at.is_empty() {
         add_html(
             &mut html,
-            &format!("\n🕐 {}", escape_html(&post.published_at, 80, 150)),
+            &format!(
+                "<footer>🕐 {}</footer>",
+                escape_html(&post.published_at, 80, 150)
+            ),
         );
     }
     if let Some(files) = post.detail["files"].as_array() {
@@ -1402,7 +1494,7 @@ fn render_telegram_post(
                 continue;
             }
             let fragment = format!(
-                "\n📎 <a href=\"{}\">{}</a>",
+                "<p>📎 <a href=\"{}\">{}</a></p>",
                 escaped_url,
                 escape_html(name, 100, 200)
             );
@@ -1412,7 +1504,7 @@ fn render_telegram_post(
             }
         }
         if linked {
-            add_html(&mut html, "\n附件链接可能过期");
+            add_html(&mut html, "<footer>附件链接可能过期</footer>");
         }
     }
     let keyboard = telegram_url(&post.url)
@@ -1535,7 +1627,12 @@ where
         }
     }
     if !rich_sent {
-        let fallback = telegram_message_body(chat_id, html, Some("HTML"), reply_markup);
+        let fallback = telegram_message_body(
+            chat_id,
+            &telegram_fallback_html(html),
+            Some("HTML"),
+            reply_markup,
+        );
         request("sendMessage", &fallback)?;
         telegram_send_media_best_effort(chat_id, fallback_images, videos, &mut request);
     } else {
@@ -2290,13 +2387,18 @@ mod tests {
         assert_eq!(
             html,
             concat!(
-            "<b>📌 甲&lt;&amp; · 雪球 · 回复</b>\n<i>⭐ 特别关注 · 🔎 关键词命中</i>",
-            "\n<i>翻译自英语</i>\n\n<blockquote>你好&lt;&amp;&gt; &quot;世界&quot;</blockquote>",
-            "\n🗂 投资&lt;观察&gt; · A&amp;B · 中文\n🕐 2026-09-28 12:00",
-            "\n📎 <a href=\"https://example.test/a?x=1&amp;y=2\">财报&lt;&amp;&gt;</a>",
-            "\n附件链接可能过期"
+            "<p><b>📌 甲&lt;&amp; · 雪球 · 回复</b></p><p><em>⭐ 特别关注 · 🔎 关键词命中</em></p>",
+            "<p><em>翻译自英语</em></p><blockquote><p>你好&lt;&amp;&gt; &quot;世界&quot;</p></blockquote>",
+            "<footer>🗂 投资&lt;观察&gt; · A&amp;B · 中文</footer><footer>🕐 2026-09-28 12:00</footer>",
+            "<p>📎 <a href=\"https://example.test/a?x=1&amp;y=2\">财报&lt;&amp;&gt;</a></p>",
+            "<footer>附件链接可能过期</footer>"
         )
         );
+        let fallback = telegram_fallback_html(&html);
+        assert!(!fallback.contains("<p>") && !fallback.contains("<br>") && !fallback.contains("<footer>"));
+        assert!(fallback.contains("\n<blockquote>"));
+        assert!(fallback.lines().any(|line| line.contains("翻译自英语")));
+        assert!(fallback.lines().any(|line| line.contains("你好")));
         assert_eq!(
             keyboard,
             Some(
@@ -2327,10 +2429,10 @@ mod tests {
         assert_eq!(
             html,
             concat!(
-                "<b>📌 甲&lt;&amp; · 雪球组合 · 调仓</b>",
-                "\n今日 +1.2% · 净值 1.031\n➕ 增持　甲&lt;&amp;（SH1）\n1% → 2%",
-                "\n成交价 10&lt;&amp;\n现有持仓\n乙（SZ2） 12.5%",
-                "\n💵 现金 20%\n🕐 2026-09-28 12:00"
+                "<p><b>📌 甲&lt;&amp; · 雪球组合 · 调仓</b></p>",
+                "<p>今日 +1.2% · 净值 1.031</p><p>➕ 增持　甲&lt;&amp;（SH1）<br>1% → 2%</p>",
+                "<p>成交价 10&lt;&amp;</p><p>现有持仓</p><p>乙（SZ2） 12.5%</p>",
+                "<p>💵 现金 20%</p><footer>🕐 2026-09-28 12:00</footer>"
             )
         );
     }

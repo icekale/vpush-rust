@@ -299,7 +299,8 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
             .flatten();
         let proxy = exit.as_ref().map(|item| item.url.clone());
         for platform in ["truth", "twitter"] {
-            match crate::truth::backfill(db, platform, 3, |text| {
+            // ponytail: 20/min while the one-day backlog drains; 3 was the steady Python pace
+            match crate::truth::backfill(db, platform, 20, |text| {
                 let db = db.clone();
                 let proxy = proxy.clone();
                 async move { crate::translate::text(&db, &text, None, proxy.as_deref()).await }

@@ -1293,12 +1293,13 @@ fn fallback_tag(tag: &str) -> FallbackTag {
         .flat_map(char::to_lowercase)
         .collect();
     match name.as_str() {
-        "br" | "/p" | "/footer" | "/li" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4"
-        | "/h5" | "/h6" => FallbackTag::Break,
-        "p" | "footer" | "figure" | "/figure" | "tg-collage" | "/tg-collage" | "img"
-        | "table" | "/table" | "thead" | "/thead" | "tbody" | "/tbody" | "tr" | "th"
-        | "/th" | "td" | "/td" | "caption" | "/caption" | "details" | "/details"
-        | "summary" | "/summary" | "ol" | "/ol" | "ul" | "/ul" | "li" => FallbackTag::Drop,
+        "br" | "/p" | "/footer" | "/li" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4" | "/h5" | "/h6" => {
+            FallbackTag::Break
+        }
+        "p" | "footer" | "figure" | "/figure" | "tg-collage" | "/tg-collage" | "img" | "table"
+        | "/table" | "thead" | "/thead" | "tbody" | "/tbody" | "tr" | "th" | "/th" | "td"
+        | "/td" | "caption" | "/caption" | "details" | "/details" | "summary" | "/summary"
+        | "ol" | "/ol" | "ul" | "/ul" | "li" => FallbackTag::Drop,
         _ => FallbackTag::Keep,
     }
 }
@@ -2397,7 +2398,11 @@ mod tests {
         )
         );
         let fallback = telegram_fallback_html(&html);
-        assert!(!fallback.contains("<p>") && !fallback.contains("<br>") && !fallback.contains("<footer>"));
+        assert!(
+            !fallback.contains("<p>")
+                && !fallback.contains("<br>")
+                && !fallback.contains("<footer>")
+        );
         assert!(fallback.contains("\n<blockquote>"));
         assert!(fallback.lines().any(|line| line.contains("翻译自英语")));
         assert!(fallback.lines().any(|line| line.contains("你好")));

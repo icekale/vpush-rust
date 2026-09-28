@@ -1,6 +1,9 @@
 //! 按订阅用户自己的开关发新帖。空的推送渠道表示「已绑定的都发」。
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::VecDeque;
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::Row;
@@ -108,6 +111,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             return;
         }
     };
+    let rich_messages = telegram_rich_messages(db).await;
     let now = beijing_minutes();
     let telegram_post = load_telegram_identity(db, kol_id, note.platform, note.external_id).await;
     let mut want_feishu = false;
@@ -164,6 +168,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                                 Some(post),
                                 target.user_id,
                                 db,
+                                rich_messages,
                             )
                             .await
                         }
@@ -475,6 +480,7 @@ where
 }
 
 pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
+    let rich_messages = telegram_rich_messages(db).await;
     retry_due(db, now, |post_id, channel, user_id| async move {
         let row = sqlx::query("SELECT k.name, p.platform, p.external_id, p.post_type, p.title, p.content, p.url, p.published_at FROM posts p JOIN kols k ON k.id = p.kol_id WHERE p.id = ?")
             .bind(post_id)
@@ -518,7 +524,15 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
                 let token = telegram_secret(&row.get::<String, _>("telegram_bot_token"), &key)?;
                 let post = load_telegram_post(db, post_id).await.map_err(|err| err.to_string())?
                     .ok_or_else(|| "帖子不存在".to_string())?;
-                send_telegram_post(&token, &row.get::<String, _>("telegram_chat_id"), Some(&post), user_id, db).await
+                send_telegram_post(
+                    &token,
+                    &row.get::<String, _>("telegram_chat_id"),
+                    Some(&post),
+                    user_id,
+                    db,
+                    rich_messages,
+                )
+                .await
             }
             "webpush" => crate::webpush::send_text(db, user_id, &text).await,
             "feishu" => crate::feishu::send_text(db, &text).await,
@@ -1067,12 +1081,22 @@ async fn telegram_reasons(
     Ok((favorite, keyword))
 }
 
+async fn telegram_rich_messages(db: &Db) -> bool {
+    db.setting("config_telegram_rich_messages")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("0")
+}
+
 async fn send_telegram_post(
     token: &str,
     chat_id: &str,
     post: Option<&TelegramPost>,
     user_id: i64,
     db: &Db,
+    rich_messages: bool,
 ) -> Result<(), String> {
     let Some(post) = post else {
         return Err("帖子不存在".into());
@@ -1082,11 +1106,84 @@ async fn send_telegram_post(
         .map_err(|err| err.to_string())?;
     let (html, markup) = render_telegram_post(post, favorite, keyword);
     validate_telegram_send(token, chat_id)?;
-    let body = telegram_message_body(chat_id, &html, Some("HTML"), markup);
     let token = token.to_string();
-    tokio::task::spawn_blocking(move || telegram_post(&token, &body))
-        .await
-        .map_err(|_| "Telegram network error".to_string())?
+    let chat_id = chat_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        telegram_deliver_post(&token, &chat_id, &html, markup, rich_messages)
+    })
+    .await
+    .map_err(|_| "Telegram network error".to_string())?
+    .map_err(TelegramRequestError::message)
+}
+
+fn telegram_rich_message_body(chat_id: &str, html: &str, reply_markup: Option<&Value>) -> String {
+    let rich_message = json!({
+        "html": html,
+        "skip_entity_detection": true,
+    });
+    let mut body = json!({
+        "chat_id": chat_id,
+        "rich_message": rich_message.to_string(),
+    });
+    if let Some(markup) = reply_markup {
+        body["reply_markup"] = json!(markup.to_string());
+    }
+    body.to_string()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TelegramRequestError {
+    Api(String),
+    RateLimited,
+    Transport,
+}
+
+impl TelegramRequestError {
+    fn message(self) -> String {
+        match self {
+            Self::Api(message) => message,
+            Self::RateLimited => "Telegram rate limited".into(),
+            Self::Transport => "Telegram network error".into(),
+        }
+    }
+}
+
+fn telegram_deliver_post_with<F>(
+    chat_id: &str,
+    html: &str,
+    reply_markup: Option<Value>,
+    rich_messages: bool,
+    mut request: F,
+) -> Result<(), TelegramRequestError>
+where
+    F: FnMut(&str, &str) -> Result<(), TelegramRequestError>,
+{
+    if rich_messages {
+        let rich_body = telegram_rich_message_body(chat_id, html, reply_markup.as_ref());
+        match request("sendRichMessage", &rich_body) {
+            Ok(()) => return Ok(()),
+            Err(TelegramRequestError::Api(_) | TelegramRequestError::RateLimited) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let fallback_body = telegram_message_body(chat_id, html, Some("HTML"), reply_markup);
+    request("sendMessage", &fallback_body)
+}
+
+fn telegram_deliver_post(
+    token: &str,
+    chat_id: &str,
+    html: &str,
+    reply_markup: Option<Value>,
+    rich_messages: bool,
+) -> Result<(), TelegramRequestError> {
+    telegram_deliver_post_with(
+        chat_id,
+        html,
+        reply_markup,
+        rich_messages,
+        |method, body| telegram_post(token, method, body),
+    )
 }
 
 fn telegram_message_body(
@@ -1109,77 +1206,167 @@ fn telegram_message_body(
     body.to_string()
 }
 
-pub(crate) fn parse_telegram_response(status: u16, body: &str) -> Result<(), String> {
-    let response: serde_json::Value = serde_json::from_str(body)
-        .map_err(|_| format!("Telegram HTTP {status} response invalid"))?;
-    if status == 429 {
-        let retry_after = response
+#[derive(Debug, PartialEq, Eq)]
+enum TelegramResponseError {
+    RateLimited(u64),
+    Api(String),
+}
+
+fn telegram_response(status: u16, body: &str) -> Result<(), TelegramResponseError> {
+    let response: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if status == 429
+        || (response.get("ok").and_then(Value::as_bool) == Some(false)
+            && response.get("error_code").and_then(Value::as_u64) == Some(429))
+    {
+        let seconds = response
             .pointer("/parameters/retry_after")
-            .and_then(serde_json::Value::as_u64)
-            .map(|value| value.min(86_400));
-        return match retry_after {
-            Some(seconds) => Err(format!(
-                "Telegram HTTP 429 rate limited; retry_after={seconds}s"
-            )),
-            None => Err("Telegram HTTP 429 rate limited".into()),
-        };
+            .and_then(Value::as_u64)
+            .unwrap_or(1)
+            .clamp(1, 60);
+        return Err(TelegramResponseError::RateLimited(seconds));
     }
     if !(200..300).contains(&status) {
-        return Err(format!("Telegram HTTP {status}"));
+        return Err(TelegramResponseError::Api(format!(
+            "Telegram HTTP {status}"
+        )));
     }
-    if response.get("ok").and_then(serde_json::Value::as_bool) == Some(true) {
-        Ok(())
-    } else {
-        Err(format!("Telegram HTTP {status} response rejected"))
+    match response.get("ok").and_then(Value::as_bool) {
+        Some(true) => Ok(()),
+        Some(false) => Err(TelegramResponseError::Api(format!(
+            "Telegram HTTP {status} response rejected"
+        ))),
+        None => Err(TelegramResponseError::Api(format!(
+            "Telegram HTTP {status} response invalid"
+        ))),
     }
 }
 
-fn telegram_post(token: &str, body: &str) -> Result<(), String> {
-    let url = format!("https://api.telegram.org/bot{token}/sendMessage");
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(15))
-        .build();
-    let request = agent.post(&url).set("Content-Type", "application/json");
-    let response = match request.send_string(body) {
-        Ok(response) => response,
-        Err(ureq::Error::Status(status, response)) => {
-            let body = response
-                .into_string()
-                .map_err(|_| format!("Telegram HTTP {status} response unreadable"))?;
-            return parse_telegram_response(status, &body);
+pub(crate) fn parse_telegram_response(status: u16, body: &str) -> Result<(), String> {
+    telegram_response(status, body).map_err(|err| match err {
+        TelegramResponseError::RateLimited(seconds) => {
+            format!("Telegram HTTP 429 rate limited; retry_after={seconds}s")
         }
-        Err(_) => return Err("Telegram network error".into()),
-    };
+        TelegramResponseError::Api(message) => message,
+    })
+}
+
+fn telegram_request_with<F, S>(mut request: F, mut sleep: S) -> Result<String, TelegramRequestError>
+where
+    F: FnMut() -> Result<(u16, String), TelegramRequestError>,
+    S: FnMut(Duration),
+{
+    for attempt in 0..2 {
+        let (status, body) = request()?;
+        match telegram_response(status, &body) {
+            Ok(()) => return Ok(body),
+            Err(TelegramResponseError::RateLimited(seconds)) if attempt == 0 => {
+                sleep(Duration::from_secs(seconds));
+            }
+            Err(TelegramResponseError::RateLimited(_)) => {
+                return Err(TelegramRequestError::RateLimited);
+            }
+            Err(TelegramResponseError::Api(message)) => {
+                return Err(TelegramRequestError::Api(message));
+            }
+        }
+    }
+    unreachable!("Telegram request loop returns on the second attempt")
+}
+
+static TELEGRAM_REQUESTS: OnceLock<Mutex<VecDeque<Instant>>> = OnceLock::new();
+
+fn telegram_slot_at(requests: &mut VecDeque<Instant>, now: Instant) -> Option<Duration> {
+    while requests
+        .front()
+        .is_some_and(|at| now.duration_since(*at) >= Duration::from_secs(1))
+    {
+        requests.pop_front();
+    }
+    if requests.len() >= 15 {
+        return requests
+            .front()
+            .map(|at| Duration::from_secs(1).saturating_sub(now.duration_since(*at)));
+    }
+    requests.push_back(now);
+    None
+}
+
+fn telegram_wait_for_slot() {
+    let requests = TELEGRAM_REQUESTS.get_or_init(|| Mutex::new(VecDeque::new()));
+    loop {
+        let wait = {
+            let mut requests = requests.lock().unwrap_or_else(|err| err.into_inner());
+            telegram_slot_at(&mut requests, Instant::now())
+        };
+        match wait {
+            Some(delay) => thread::sleep(delay),
+            None => return,
+        }
+    }
+}
+
+fn telegram_http_response(response: ureq::Response) -> Result<(u16, String), TelegramRequestError> {
     let status = response.status();
     let body = response
         .into_string()
-        .map_err(|_| format!("Telegram HTTP {status} response unreadable"))?;
-    parse_telegram_response(status, &body)
+        .map_err(|_| TelegramRequestError::Transport)?;
+    Ok((status, body))
+}
+
+fn telegram_post(token: &str, method: &str, body: &str) -> Result<(), TelegramRequestError> {
+    let url = format!("https://api.telegram.org/bot{token}/{method}");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(15))
+        .build();
+    telegram_request_with(
+        || {
+            telegram_wait_for_slot();
+            match agent
+                .post(&url)
+                .set("Content-Type", "application/json")
+                .send_string(body)
+            {
+                Ok(response) | Err(ureq::Error::Status(_, response)) => {
+                    telegram_http_response(response)
+                }
+                Err(_) => Err(TelegramRequestError::Transport),
+            }
+        },
+        thread::sleep,
+    )
+    .map(|_| ())
 }
 
 async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
     validate_telegram_send(token, chat_id)?;
     let body = telegram_message_body(chat_id, text, None, None);
     let token = token.to_string();
-    tokio::task::spawn_blocking(move || telegram_post(&token, &body))
+    tokio::task::spawn_blocking(move || telegram_post(&token, "sendMessage", &body))
         .await
         .map_err(|_| "Telegram network error".to_string())?
+        .map_err(TelegramRequestError::message)
 }
 
 fn telegram_get(token: &str, method: &str) -> Result<String, String> {
     let url = format!("https://api.telegram.org/bot{token}/{method}");
     let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(10))
-        .timeout_read(std::time::Duration::from_secs(15))
+        .timeout_connect(Duration::from_secs(10))
+        .timeout_read(Duration::from_secs(15))
         .build();
-    match agent.get(&url).call() {
-        Ok(resp) => resp
-            .into_string()
-            .map_err(|_| "Telegram response unreadable".into()),
-        Err(ureq::Error::Status(status, _)) => Err(format!("Telegram HTTP {status}")),
-        Err(_) => Err("Telegram network error".into()),
-    }
+    telegram_request_with(
+        || {
+            telegram_wait_for_slot();
+            match agent.get(&url).call() {
+                Ok(response) | Err(ureq::Error::Status(_, response)) => {
+                    telegram_http_response(response)
+                }
+                Err(_) => Err(TelegramRequestError::Transport),
+            }
+        },
+        thread::sleep,
+    )
+    .map_err(TelegramRequestError::message)
 }
 
 fn valid_bark_key(key: &str) -> bool {
@@ -1622,7 +1809,7 @@ mod tests {
         };
         deliver(&db, kol, &note).await;
         assert!(
-            send_telegram_post("123456:ABCDEFGHIJKLMNOPQRST", "-1", None, user, &db)
+            send_telegram_post("123456:ABCDEFGHIJKLMNOPQRST", "-1", None, user, &db, true)
                 .await
                 .is_err()
         );
@@ -1718,13 +1905,213 @@ mod tests {
                 r#"{"ok":false,"parameters":{"retry_after":999999999}}"#
             )
             .unwrap_err(),
-            "Telegram HTTP 429 rate limited; retry_after=86400s"
+            "Telegram HTTP 429 rate limited; retry_after=60s"
         );
         let err = parse_telegram_response(500, &body).unwrap_err();
         assert!(err.starts_with("Telegram HTTP 500"));
         assert!(!err.contains(token));
         assert!(!err.contains("api.telegram.org"));
         assert!(!err.contains("-123"));
+    }
+
+    #[test]
+    fn telegram_rich_delivery_uses_stringified_payload_and_preserves_html_fallback() {
+        let markup =
+            json!({"inline_keyboard": [[{"text": "Open", "url": "https://example.test/post"}]]});
+        let html = "<b>Post &amp; title</b>";
+        let mut calls = Vec::new();
+        telegram_deliver_post_with("-123", html, Some(markup.clone()), true, |method, body| {
+            calls.push((
+                method.to_string(),
+                serde_json::from_str::<Value>(body).unwrap(),
+            ));
+            if method == "sendRichMessage" {
+                Err(TelegramRequestError::Api("Telegram HTTP 400".into()))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].0, "sendRichMessage");
+        assert_eq!(calls[0].1["chat_id"], "-123");
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[0].1["rich_message"].as_str().unwrap()).unwrap(),
+            json!({"html": html, "skip_entity_detection": true})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(calls[0].1["reply_markup"].as_str().unwrap()).unwrap(),
+            markup
+        );
+        assert_eq!(calls[1].0, "sendMessage");
+        assert_eq!(calls[1].1["text"], html);
+        assert_eq!(calls[1].1["parse_mode"], "HTML");
+        assert_eq!(calls[1].1["reply_markup"], markup);
+        assert_eq!(calls[1].1["disable_web_page_preview"], true);
+    }
+
+    #[test]
+    fn telegram_rich_success_uses_only_rich_and_transport_failure_does_not_fallback() {
+        let mut calls = Vec::new();
+        telegram_deliver_post_with("-123", "<b>Hello</b>", None, true, |method, body| {
+            calls.push((
+                method.to_string(),
+                serde_json::from_str::<Value>(body).unwrap(),
+            ));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "sendRichMessage");
+        assert!(calls[0].1.get("reply_markup").is_none());
+
+        let mut attempts = 0;
+        let result = telegram_deliver_post_with("-123", "html", None, true, |_, _| {
+            attempts += 1;
+            Err(TelegramRequestError::Transport)
+        });
+        assert_eq!(result, Err(TelegramRequestError::Transport));
+        assert_eq!(attempts, 1);
+
+        let mut disabled = Vec::new();
+        telegram_deliver_post_with("-123", "html", None, false, |method, _| {
+            disabled.push(method.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(disabled, ["sendMessage"]);
+    }
+
+    #[test]
+    fn telegram_request_retries_only_explicit_429_once_and_redacts_errors() {
+        for first in [
+            (429, r#"{"ok":false,"parameters":{"retry_after":3}}"#),
+            (
+                200,
+                r#"{"ok":false,"error_code":429,"parameters":{"retry_after":1000}}"#,
+            ),
+        ] {
+            let mut attempts = 0;
+            let mut delays = Vec::new();
+            assert!(telegram_request_with(
+                || {
+                    attempts += 1;
+                    let (status, body) = if attempts == 1 {
+                        first
+                    } else {
+                        (200, r#"{"ok":true}"#)
+                    };
+                    Ok((status, body.into()))
+                },
+                |duration| delays.push(duration),
+            )
+            .is_ok());
+            assert_eq!(attempts, 2);
+            assert_eq!(
+                delays,
+                [Duration::from_secs(if first.0 == 429 { 3 } else { 60 })]
+            );
+        }
+        let secret = "123456:ABCDEFGHIJKLMNOPQRST https://api.telegram.org/bot123456:ABCDEFGHIJKLMNOPQRST chat=-123";
+        let mut attempts = 0;
+        let error = telegram_request_with(
+            || {
+                attempts += 1;
+                Ok((429, json!({"description": secret}).to_string()))
+            },
+            |_| {},
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "Telegram rate limited");
+        assert_eq!(attempts, 2);
+        for (status, body) in [
+            (400, json!({"ok": false, "description": secret}).to_string()),
+            (200, json!({"ok": false, "description": secret}).to_string()),
+        ] {
+            let mut attempts = 0;
+            let error = telegram_request_with(
+                || {
+                    attempts += 1;
+                    Ok((status, body.clone()))
+                },
+                |_| panic!("unexpected wait"),
+            )
+            .unwrap_err()
+            .message();
+            assert_eq!(attempts, 1);
+            assert!(!error.contains(secret));
+            assert!(!error.contains("-123"));
+        }
+        let mut attempts = 0;
+        assert_eq!(
+            telegram_request_with(
+                || {
+                    attempts += 1;
+                    Err(TelegramRequestError::Transport)
+                },
+                |_| panic!("unexpected wait"),
+            ),
+            Err(TelegramRequestError::Transport)
+        );
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            telegram_response(429, "invalid"),
+            Err(TelegramResponseError::RateLimited(1))
+        );
+        assert_eq!(
+            telegram_response(
+                200,
+                r#"{"ok":false,"error_code":429,"parameters":{"retry_after":0}}"#
+            ),
+            Err(TelegramResponseError::RateLimited(1))
+        );
+    }
+
+    #[test]
+    fn telegram_global_limiter_caps_each_sliding_second() {
+        let start = Instant::now();
+        let mut events = VecDeque::new();
+        for _ in 0..15 {
+            assert_eq!(telegram_slot_at(&mut events, start), None);
+        }
+        assert_eq!(
+            telegram_slot_at(&mut events, start),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(events.len(), 15);
+        assert_eq!(
+            telegram_slot_at(&mut events, start + Duration::from_millis(999)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            telegram_slot_at(&mut events, start + Duration::from_secs(1)),
+            None
+        );
+        assert_eq!(events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn telegram_rich_setting_defaults_on_and_respects_off() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-tg-rich-setting-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        assert!(telegram_rich_messages(&db).await);
+        db.set_setting("config_telegram_rich_messages", "0")
+            .await
+            .unwrap();
+        assert!(!telegram_rich_messages(&db).await);
+        db.set_setting("config_telegram_rich_messages", "1")
+            .await
+            .unwrap();
+        assert!(telegram_rich_messages(&db).await);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

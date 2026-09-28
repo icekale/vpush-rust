@@ -295,18 +295,20 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             if let Err(err) =
                 crate::webpush::notify_note(db, target.user_id, note, target.favorite).await
             {
-                tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
-                note_push_failure(db, &format!("浏览器：{err}")).await;
-                remember_failure_logged(
-                    db,
-                    kol_id,
-                    (note.platform, note.external_id),
-                    "webpush",
-                    target.user_id,
-                    &err,
-                    unix,
-                )
-                .await;
+                if !unbound_skip(&err) {
+                    tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
+                    note_push_failure(db, &format!("浏览器：{err}")).await;
+                    remember_failure_logged(
+                        db,
+                        kol_id,
+                        (note.platform, note.external_id),
+                        "webpush",
+                        target.user_id,
+                        &err,
+                        unix,
+                    )
+                    .await;
+                }
             } else {
                 remember_success(
                     db,
@@ -552,6 +554,15 @@ where
                 tx.commit().await?;
                 done += 1;
             }
+            Err(err) if unbound_skip(&err) => {
+                sqlx::query("DELETE FROM push_retries WHERE channel = ? AND user_id = ? AND platform = ? AND external_id = ?")
+                    .bind(&channel)
+                    .bind(user_id)
+                    .bind(&platform)
+                    .bind(&external_id)
+                    .execute(db.pool())
+                    .await?;
+            }
             Err(_) => {
                 let next = attempts + 1;
                 if next >= RETRY_DELAYS.len() as i64 {
@@ -702,6 +713,10 @@ fn channels(raw: &str) -> Channels {
         telegram: picked.contains(&"telegram"),
         webpush: picked.contains(&"webpush"),
     }
+}
+
+fn unbound_skip(err: &str) -> bool {
+    err == "飞书未绑定" || err == "用户未绑定浏览器通知"
 }
 
 fn dnd_blocks(target: &PushTarget, now: u32) -> bool {
@@ -2143,6 +2158,13 @@ fn post_json(url: &str, body: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn unbound_channels_are_skips_not_failures() {
+        assert!(unbound_skip("飞书未绑定"));
+        assert!(unbound_skip("用户未绑定浏览器通知"));
+        assert!(!unbound_skip("推送 HTTP 500"));
+    }
 
     fn target(start: &str, end: &str, favorite: bool, allow: bool) -> PushTarget {
         PushTarget {

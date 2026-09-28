@@ -7889,13 +7889,39 @@ fn users_column_def(
         sql.push_str(" NOT NULL");
     }
     if let Some(default) = default {
-        sql.push_str(" DEFAULT ");
-        sql.push_str(default);
+        sql.push_str(&default_clause(default));
     }
     if name == "username" {
         sql.push_str(" UNIQUE");
     }
     sql
+}
+
+fn default_clause(default: &str) -> String {
+    let default = default.trim();
+    if default.is_empty() {
+        return String::new();
+    }
+    if literal_default(default) || default.starts_with('(') {
+        format!(" DEFAULT {default}")
+    } else {
+        format!(" DEFAULT ({default})")
+    }
+}
+
+fn literal_default(value: &str) -> bool {
+    if value.eq_ignore_ascii_case("null")
+        || value.eq_ignore_ascii_case("current_time")
+        || value.eq_ignore_ascii_case("current_date")
+        || value.eq_ignore_ascii_case("current_timestamp")
+    {
+        return true;
+    }
+    if value.starts_with('\'') || value.to_ascii_lowercase().starts_with("x'") {
+        return true;
+    }
+    let rest = value.strip_prefix(['+', '-']).unwrap_or(value);
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit() || b == b'.')
 }
 
 async fn add_column(pool: &SqlitePool, sql: &str) -> Result<(), sqlx::Error> {

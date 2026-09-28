@@ -1506,13 +1506,24 @@ fn parse_token(text: &str) -> Result<Token, Fail> {
 }
 
 fn get_json(url: &str, token: &str) -> Result<Value, Fail> {
-    let text = ureq::get(url)
+    let response = ureq::get(url)
         .set("Authorization", &format!("Bearer {token}"))
         .timeout(std::time::Duration::from_secs(20))
-        .call()
-        .map_err(|_| fail(400, "飞书文档读取失败"))?
-        .into_string()
-        .map_err(|_| fail(400, "飞书文档读取失败"))?;
+        .call();
+    let text = match response {
+        Ok(response) => response
+            .into_string()
+            .map_err(|_| fail(400, "飞书文档读取失败"))?,
+        Err(ureq::Error::Status(status, response)) => {
+            let body = response.into_string().unwrap_or_default();
+            let code = serde_json::from_str::<Value>(&body)
+                .ok()
+                .and_then(|value| value.get("code").and_then(|item| item.as_i64()));
+            tracing::warn!(status, code, "飞书文档 HTTP 失败");
+            return Err(fail(400, "飞书文档读取失败"));
+        }
+        Err(_) => return Err(fail(400, "飞书文档读取失败")),
+    };
     let value: Value = serde_json::from_str(&text).map_err(|_| fail(400, "飞书返回了无效数据"))?;
     let code = value
         .get("code")
@@ -1522,6 +1533,7 @@ fn get_json(url: &str, token: &str) -> Result<Value, Fail> {
         return Err(fail(400, "飞书授权已失效"));
     }
     if code != 0 {
+        tracing::warn!(code, "飞书文档接口拒绝");
         return Err(fail(400, "飞书文档读取失败"));
     }
     Ok(value.get("data").cloned().unwrap_or(value))

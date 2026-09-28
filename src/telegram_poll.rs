@@ -1,14 +1,14 @@
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::db::Db;
-use crate::telegram_adapter::{dispatch, parse_update};
+use crate::telegram_adapter::{dispatch, parse_update, BotUpdate};
 
 const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 const GET_UPDATES_TIMEOUT: i64 = 30;
@@ -16,6 +16,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(40);
 const LEASE_SECS: i64 = 90;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const MAX_BACKOFF_SECS: u64 = 30;
+
+type TransportFuture = Pin<Box<dyn Future<Output = Result<(u16, String), String>> + Send>>;
+type Transport = Arc<dyn Fn(String, Value) -> TransportFuture + Send + Sync>;
 
 pub(crate) fn enabled(inbound: Option<&str>, token: Option<&str>) -> bool {
     inbound == Some("1") && token.is_some_and(|token| !token.trim().is_empty())
@@ -46,10 +49,10 @@ pub(crate) async fn run_with_endpoint(db: Db, token: String, owner: String, endp
         return;
     };
 
-    let lost = Arc::new(AtomicBool::new(false));
-    let heartbeat = spawn_heartbeat(db.clone(), owner.clone(), lost.clone());
-    let result = poll_loop(&db, &token, &owner, endpoint, &mut offset, lost.clone()).await;
-    lost.store(true, Ordering::Release);
+    let (lease_tx, lease_rx) = watch::channel(false);
+    let heartbeat = spawn_heartbeat(db.clone(), owner.clone(), lease_tx.clone());
+    let result = poll_loop(&db, &token, &owner, endpoint, &mut offset, lease_rx).await;
+    lease_tx.send_replace(true);
     heartbeat.abort();
     if let Err(error) = db.telegram_poll_release(&owner).await {
         tracing::warn!("Telegram 入站租约释放失败: {error}");
@@ -64,22 +67,19 @@ pub(crate) async fn run_with_endpoint(db: Db, token: String, owner: String, endp
     }
 }
 
-fn spawn_heartbeat(db: Db, owner: String, lost: Arc<AtomicBool>) -> JoinHandle<()> {
+fn spawn_heartbeat(db: Db, owner: String, lease_lost: watch::Sender<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
-            if lost.load(Ordering::Acquire) {
-                return;
-            }
             match db.telegram_poll_heartbeat(&owner, LEASE_SECS).await {
                 Ok(true) => {}
                 Ok(false) => {
-                    lost.store(true, Ordering::Release);
+                    lease_lost.send_replace(true);
                     return;
                 }
                 Err(error) => {
                     tracing::warn!("Telegram 入站租约心跳失败: {error}");
-                    lost.store(true, Ordering::Release);
+                    lease_lost.send_replace(true);
                     return;
                 }
             }
@@ -93,68 +93,164 @@ async fn poll_loop(
     owner: &str,
     endpoint: &str,
     offset: &mut i64,
-    lost: Arc<AtomicBool>,
+    mut lease: watch::Receiver<bool>,
 ) -> Result<(), PollError> {
     loop {
-        if lost.load(Ordering::Acquire) {
-            return Err(PollError::LostLease);
-        }
+        ensure_lease(db, owner, &lease).await?;
         let token_for_request = token.to_owned();
         let endpoint_for_request = endpoint.to_owned();
         let requested_offset = *offset;
-        let response = tokio::task::spawn_blocking(move || {
-            get_updates(&endpoint_for_request, &token_for_request, requested_offset)
-        })
-        .await
-        .map_err(|_| PollError::Http("Telegram request task stopped".into()))??;
+        let response = get_updates_with_lease(
+            endpoint_for_request,
+            token_for_request,
+            requested_offset,
+            &mut lease,
+        )
+        .await?;
         match response {
             GetUpdates::Conflict => return Err(PollError::Conflict),
             GetUpdates::RateLimited(seconds) => {
-                tokio::time::sleep(Duration::from_secs(seconds)).await;
-                continue;
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(seconds)) => {}
+                    changed = lease.changed() => {
+                        changed.map_err(|_| PollError::LostLease)?;
+                        return Err(PollError::LostLease);
+                    }
+                }
             }
             GetUpdates::Updates(updates) => {
                 for value in updates {
-                    if lost.load(Ordering::Acquire) {
-                        return Err(PollError::LostLease);
-                    }
-                    let Some(update_id) = value.get("update_id").and_then(Value::as_i64) else {
-                        continue;
-                    };
-                    if update_id < 0 {
-                        continue;
-                    }
-                    let next_offset = update_id.checked_add(1).ok_or(PollError::OffsetOverflow)?;
-                    if let Ok(Some(update)) = parse_update(&value) {
-                        let db = db.clone();
-                        let dispatch_token = token.to_owned();
-                        let dispatch_endpoint = endpoint.to_owned();
-                        dispatch(&db, update, unix_now(), move |method, body| {
-                            let token = dispatch_token.clone();
-                            let endpoint = dispatch_endpoint.clone();
-                            async move {
-                                tokio::task::spawn_blocking(move || {
-                                    call_api(&endpoint, &token, &method, body)
-                                })
-                                .await
-                                .map_err(|_| "Telegram request task stopped".to_string())?
-                            }
-                        })
-                        .await
-                        .map_err(PollError::Dispatch)?;
-                    }
-                    if !db
-                        .telegram_poll_save_offset(owner, next_offset)
-                        .await
-                        .map_err(PollError::Db)?
-                    {
-                        return Err(PollError::LostLease);
-                    }
-                    *offset = next_offset;
+                    *offset = process_update(
+                        db.clone(),
+                        owner,
+                        value,
+                        lease.clone(),
+                        http_transport(endpoint, token),
+                    )
+                    .await?;
                 }
             }
         }
     }
+}
+
+async fn process_update(
+    db: Db,
+    owner: &str,
+    value: Value,
+    lease: watch::Receiver<bool>,
+    transport: Transport,
+) -> Result<i64, PollError> {
+    ensure_lease(&db, owner, &lease).await?;
+    let update_id = value
+        .get("update_id")
+        .and_then(Value::as_i64)
+        .ok_or(PollError::MalformedUpdate)?;
+    if update_id < 0 {
+        return Err(PollError::MalformedUpdate);
+    }
+    let next_offset = update_id.checked_add(1).ok_or(PollError::OffsetOverflow)?;
+    let parsed = parse_update(&value).map_err(|_| PollError::MalformedUpdate)?;
+    if let Some(update) = parsed {
+        dispatch_with_lease(&db, owner, update, lease.clone(), transport).await?;
+    }
+    ensure_lease(&db, owner, &lease).await?;
+    if !db
+        .telegram_poll_save_offset(owner, next_offset)
+        .await
+        .map_err(PollError::Db)?
+    {
+        return Err(PollError::LostLease);
+    }
+    Ok(next_offset)
+}
+
+async fn get_updates_with_lease(
+    endpoint: String,
+    token: String,
+    offset: i64,
+    lease: &mut watch::Receiver<bool>,
+) -> Result<GetUpdates, PollError> {
+    let request = tokio::task::spawn_blocking(move || get_updates(&endpoint, &token, offset));
+    tokio::pin!(request);
+    tokio::select! {
+        response = &mut request => response
+            .map_err(|_| PollError::Http("Telegram request task stopped".into()))?,
+        changed = lease.changed() => {
+            changed.map_err(|_| PollError::LostLease)?;
+            Err(PollError::LostLease)
+        }
+    }
+}
+
+async fn ensure_lease(
+    db: &Db,
+    owner: &str,
+    lease: &watch::Receiver<bool>,
+) -> Result<(), PollError> {
+    if *lease.borrow() {
+        return Err(PollError::LostLease);
+    }
+    if !db
+        .telegram_poll_is_owner(owner)
+        .await
+        .map_err(PollError::Db)?
+    {
+        return Err(PollError::LostLease);
+    }
+    if *lease.borrow() {
+        return Err(PollError::LostLease);
+    }
+    Ok(())
+}
+
+async fn dispatch_with_lease(
+    db: &Db,
+    owner: &str,
+    update: BotUpdate,
+    mut lease: watch::Receiver<bool>,
+    transport: Transport,
+) -> Result<(), PollError> {
+    ensure_lease(db, owner, &lease).await?;
+    let dispatch_db = db.clone();
+    let transport_db = dispatch_db.clone();
+    let dispatch_owner = owner.to_owned();
+    let transport_for_dispatch = transport.clone();
+    let lease_for_transport = lease.clone();
+    let dispatch = dispatch(&dispatch_db, update, unix_now(), move |method, body| {
+        let db = transport_db.clone();
+        let owner = dispatch_owner.clone();
+        let transport = transport_for_dispatch.clone();
+        let lease = lease_for_transport.clone();
+        Box::pin(async move {
+            ensure_lease(&db, &owner, &lease)
+                .await
+                .map_err(|error| error.to_string())?;
+            transport(method, body).await
+        })
+    });
+    tokio::pin!(dispatch);
+    tokio::select! {
+        result = &mut dispatch => result.map_err(PollError::Dispatch),
+        changed = lease.changed() => {
+            changed.map_err(|_| PollError::LostLease)?;
+            Err(PollError::LostLease)
+        }
+    }
+}
+
+fn http_transport(endpoint: &str, token: &str) -> Transport {
+    let endpoint = endpoint.to_owned();
+    let token = token.to_owned();
+    Arc::new(move |method, body| {
+        let endpoint = endpoint.clone();
+        let token = token.clone();
+        Box::pin(async move {
+            tokio::task::spawn_blocking(move || call_api(&endpoint, &token, &method, body))
+                .await
+                .map_err(|_| "Telegram request task stopped".to_string())?
+        })
+    })
 }
 
 fn unix_now() -> i64 {
@@ -176,6 +272,7 @@ enum PollError {
     Conflict,
     LostLease,
     OffsetOverflow,
+    MalformedUpdate,
     Dispatch(String),
     Db(sqlx::Error),
     Http(String),
@@ -188,6 +285,7 @@ impl std::fmt::Display for PollError {
             Self::Conflict => formatter.write_str("Telegram reported a polling conflict"),
             Self::LostLease => formatter.write_str("polling lease was lost"),
             Self::OffsetOverflow => formatter.write_str("Telegram update_id overflowed cursor"),
+            Self::MalformedUpdate => formatter.write_str("Telegram update was malformed"),
             Self::Dispatch(error) => write!(formatter, "Telegram update dispatch failed: {error}"),
             Self::Db(error) => write!(formatter, "Telegram polling database error: {error}"),
             Self::Http(error) => formatter.write_str(error),
@@ -197,7 +295,11 @@ impl std::fmt::Display for PollError {
 }
 
 fn get_updates(endpoint: &str, token: &str, offset: i64) -> Result<GetUpdates, PollError> {
-    let body = json!({"offset": offset, "timeout": GET_UPDATES_TIMEOUT});
+    let body = json!({
+        "offset": offset,
+        "timeout": GET_UPDATES_TIMEOUT,
+        "allowed_updates": ["message", "callback_query"],
+    });
     let (status, response) = request(endpoint, token, "getUpdates", body)?;
     let value: Value =
         serde_json::from_str(&response).map_err(|error| PollError::Json(error.to_string()))?;
@@ -275,7 +377,120 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
     use std::thread;
+    use tokio::sync::{oneshot, watch};
+
+    fn noop_transport() -> Transport {
+        Arc::new(|_method, _body| Box::pin(async { Ok((200, r#"{"ok":true}"#.to_owned())) }))
+    }
+
+    #[tokio::test]
+    async fn malformed_updates_preserve_cursor_but_known_groups_advance_it() {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.telegram_poll_acquire("owner", 60).await.unwrap();
+        let (_lease_tx, lease_rx) = watch::channel(false);
+        let malformed = json!({
+            "update_id": 20,
+            "message": {"chat": {"id": 42, "type": "private"}}
+        });
+        assert!(matches!(
+            process_update(
+                db.clone(),
+                "owner",
+                malformed,
+                lease_rx.clone(),
+                noop_transport()
+            )
+            .await,
+            Err(PollError::MalformedUpdate)
+        ));
+        assert_eq!(db.telegram_poll_offset().await.unwrap(), 0);
+        let unknown = json!({"update_id": 21, "edited_message": {}});
+        assert!(matches!(
+            process_update(
+                db.clone(),
+                "owner",
+                unknown,
+                lease_rx.clone(),
+                noop_transport()
+            )
+            .await,
+            Err(PollError::MalformedUpdate)
+        ));
+        assert_eq!(db.telegram_poll_offset().await.unwrap(), 0);
+        let group = json!({
+            "update_id": 22,
+            "message": {"chat": {"id": -4, "type": "group"}}
+        });
+        assert_eq!(
+            process_update(db.clone(), "owner", group, lease_rx, noop_transport())
+                .await
+                .unwrap(),
+            23
+        );
+        assert_eq!(db.telegram_poll_offset().await.unwrap(), 23);
+    }
+
+    #[tokio::test]
+    async fn lease_loss_aborts_paused_dispatch_without_cursor_save_or_next_call() {
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.telegram_poll_acquire("old-owner", 60).await.unwrap();
+        let (lease_tx, lease_rx) = watch::channel(false);
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (resume_tx, resume_rx) = oneshot::channel::<()>();
+        let entered = Arc::new(Mutex::new(Some(entered_tx)));
+        let resume = Arc::new(Mutex::new(Some(resume_rx)));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let transport: Transport = {
+            let entered = entered.clone();
+            let resume = resume.clone();
+            let calls = calls.clone();
+            Arc::new(move |_method, _body| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let entered = entered.lock().unwrap().take();
+                let resume = resume.lock().unwrap().take();
+                Box::pin(async move {
+                    if let Some(entered) = entered {
+                        let _ = entered.send(());
+                    }
+                    if let Some(resume) = resume {
+                        let _ = resume.await;
+                    }
+                    Ok((200, r#"{"ok":true}"#.to_owned()))
+                })
+            })
+        };
+        let update = json!({
+            "update_id": 30,
+            "message": {
+                "chat": {"id": 42, "type": "private", "first_name": "Ada"},
+                "text": "/help"
+            }
+        });
+        let task = tokio::spawn(process_update(
+            db.clone(),
+            "old-owner",
+            update,
+            lease_rx,
+            transport,
+        ));
+        entered_rx.await.unwrap();
+        sqlx::query("UPDATE telegram_poll_state SET lease_until = unixepoch() - 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.telegram_poll_acquire("new-owner", 60).await.unwrap(),
+            Some(0)
+        );
+        lease_tx.send(true).unwrap();
+        assert!(matches!(task.await.unwrap(), Err(PollError::LostLease)));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(db.telegram_poll_offset().await.unwrap(), 0);
+        drop(resume_tx);
+    }
 
     #[tokio::test]
     async fn lease_allows_one_owner_and_release_is_owner_checked() {

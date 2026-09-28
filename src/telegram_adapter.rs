@@ -25,31 +25,46 @@ pub enum BotUpdate {
 }
 
 pub fn parse_update(value: &Value) -> Result<Option<BotUpdate>, String> {
-    let Some(update_id) = value.get("update_id").and_then(Value::as_i64) else {
-        return Ok(None);
-    };
+    let update_id = value
+        .get("update_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "malformed Telegram update".to_owned())?;
     if update_id < 0 {
-        return Ok(None);
+        return Err("malformed Telegram update".to_owned());
     }
 
-    if let Some(message) = value.get("message") {
-        return Ok(parse_message(update_id, message));
+    match (value.get("message"), value.get("callback_query")) {
+        (Some(message), None) => parse_message(update_id, message),
+        (None, Some(callback)) => parse_callback(update_id, callback),
+        _ => Err("unknown Telegram update shape".to_owned()),
     }
-    if let Some(callback) = value.get("callback_query") {
-        return Ok(parse_callback(update_id, callback));
-    }
-    Ok(None)
 }
 
-fn parse_message(update_id: i64, value: &Value) -> Option<BotUpdate> {
-    let chat = value.get("chat")?;
-    if chat.get("type").and_then(Value::as_str) != Some("private") {
-        return None;
+fn parse_message(update_id: i64, value: &Value) -> Result<Option<BotUpdate>, String> {
+    let chat = value
+        .get("chat")
+        .ok_or_else(|| "malformed Telegram message".to_owned())?;
+    let chat_kind = chat
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "malformed Telegram message".to_owned())?;
+    if matches!(chat_kind, "group" | "supergroup" | "channel") {
+        return Ok(None);
     }
-    let chat_id = id_string(chat.get("id")?)?;
-    let text = value.get("text").and_then(Value::as_str)?;
+    if chat_kind != "private" {
+        return Err("malformed Telegram message".to_owned());
+    }
+    let chat_id = id_string(
+        chat.get("id")
+            .ok_or_else(|| "malformed Telegram message".to_owned())?,
+    )
+    .ok_or_else(|| "malformed Telegram message".to_owned())?;
+    let text = value
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "malformed Telegram message".to_owned())?;
     let display_name = private_display_name(chat).unwrap_or_else(|| "Telegram 用户".to_owned());
-    Some(BotUpdate::Message {
+    Ok(Some(BotUpdate::Message {
         update_id,
         message: TelegramMessage {
             chat_id,
@@ -57,36 +72,64 @@ fn parse_message(update_id: i64, value: &Value) -> Option<BotUpdate> {
             display_name,
             text: Some(text.to_owned()),
         },
-    })
+    }))
 }
 
-fn parse_callback(update_id: i64, value: &Value) -> Option<BotUpdate> {
-    let callback_id = value.get("id").and_then(Value::as_str)?.trim();
-    let data = value.get("data").and_then(Value::as_str)?;
-    if data.is_empty() || data.len() > MAX_CALLBACK_BYTES {
-        return None;
+fn parse_callback(update_id: i64, value: &Value) -> Result<Option<BotUpdate>, String> {
+    let message = value
+        .get("message")
+        .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    let chat = message
+        .get("chat")
+        .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    let chat_kind = chat
+        .get("type")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    if matches!(chat_kind, "group" | "supergroup" | "channel") {
+        return Ok(None);
     }
-    let data = data.to_owned();
-    let actor_id = id_string(value.get("from")?.get("id")?)?;
-    let message = value.get("message")?;
-    let chat = message.get("chat")?;
-    let chat_type = chat_type(chat.get("type")?.as_str()?)?;
-    if chat_type != TelegramChatType::Private || callback_id.is_empty() {
-        return None;
+    if chat_kind != "private" {
+        return Err("malformed Telegram callback".to_owned());
     }
-    let message_chat_id = id_string(chat.get("id")?)?;
-    let message_id = message.get("message_id").and_then(Value::as_i64)?;
-    Some(BotUpdate::Callback {
+    let callback_id = value
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_str)
+        .filter(|data| !data.is_empty() && data.len() <= MAX_CALLBACK_BYTES)
+        .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    let actor_id = id_string(
+        value
+            .get("from")
+            .and_then(|from| from.get("id"))
+            .ok_or_else(|| "malformed Telegram callback".to_owned())?,
+    )
+    .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    let message_chat_id = id_string(
+        chat.get("id")
+            .ok_or_else(|| "malformed Telegram callback".to_owned())?,
+    )
+    .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    let message_id = message
+        .get("message_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| "malformed Telegram callback".to_owned())?;
+    Ok(Some(BotUpdate::Callback {
         update_id,
         callback: TelegramCallback {
             id: callback_id.to_owned(),
             chat_id: actor_id,
             message_chat_id,
-            chat_type,
+            chat_type: TelegramChatType::Private,
             message_id,
-            data,
+            data: data.to_owned(),
         },
-    })
+    }))
 }
 
 fn id_string(value: &Value) -> Option<String> {
@@ -97,16 +140,6 @@ fn id_string(value: &Value) -> Option<String> {
         .as_str()
         .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
         .map(str::to_owned)
-}
-
-fn chat_type(value: &str) -> Option<TelegramChatType> {
-    match value {
-        "private" => Some(TelegramChatType::Private),
-        "group" => Some(TelegramChatType::Group),
-        "supergroup" => Some(TelegramChatType::Supergroup),
-        "channel" => Some(TelegramChatType::Channel),
-        _ => None,
-    }
 }
 
 fn private_display_name(chat: &Value) -> Option<String> {
@@ -316,7 +349,31 @@ mod tests {
         );
         let group = json!({"update_id": 19, "message": {"chat": {"id": -4, "type": "group"}, "text": "/help"}});
         assert_eq!(parse_update(&group).unwrap(), None);
-        assert_eq!(parse_update(&json!({"update_id": -1})).unwrap(), None);
+        assert!(parse_update(&json!({"update_id": -1})).is_err());
+    }
+
+    #[test]
+    fn rejects_malformed_private_and_unknown_updates_without_ignoring_them() {
+        let malformed_private = json!({
+            "update_id": 20,
+            "message": {"chat": {"id": 42, "type": "private"}}
+        });
+        assert!(parse_update(&malformed_private).is_err());
+        assert!(parse_update(&json!({"update_id": 21, "edited_message": {}})).is_err());
+        assert!(parse_update(&json!({"update_id": -1})).is_err());
+    }
+
+    #[test]
+    fn malformed_private_callbacks_are_errors_but_group_callbacks_are_ignored() {
+        let malformed = callback_update("", 42, 42);
+        assert!(parse_update(&malformed).is_err());
+        let group = json!({
+            "update_id": 22,
+            "callback_query": {"message": {"chat": {"type": "group"}}}
+        });
+        assert_eq!(parse_update(&group).unwrap(), None);
+        assert!(parse_update(&callback_update(&"x".repeat(65), 42, 42)).is_err());
+        assert!(parse_update(&callback_update(&"é".repeat(33), 42, 42)).is_err());
     }
 
     #[test]
@@ -350,19 +407,14 @@ mod tests {
 
     #[test]
     fn rejects_empty_or_oversized_callback_data_by_bytes() {
-        assert_eq!(parse_update(&callback_update("", 42, 42)).unwrap(), None);
-        assert_eq!(
-            parse_update(&callback_update(&"x".repeat(65), 42, 42)).unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_update(&callback_update(&"é".repeat(33), 42, 42)).unwrap(),
-            None
-        );
+        assert!(parse_update(&callback_update("", 42, 42)).is_err());
+        assert!(parse_update(&callback_update(&"x".repeat(65), 42, 42)).is_err());
+        assert!(parse_update(&callback_update(&"é".repeat(33), 42, 42)).is_err());
         assert!(parse_update(&callback_update(&"é".repeat(32), 42, 42))
             .unwrap()
             .is_some());
     }
+
     #[test]
     fn serializes_keyboard_targets_and_bounds_text_and_callback_data() {
         let response = TelegramResponse {

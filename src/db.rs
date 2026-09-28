@@ -656,6 +656,16 @@ impl Db {
             .map(Some)
     }
 
+    pub async fn telegram_poll_is_owner(&self, owner: &str) -> Result<bool, sqlx::Error> {
+        let count = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM telegram_poll_state
+             WHERE id = 1 AND owner = ? AND lease_until > unixepoch()",
+        )
+        .bind(owner)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(count == 1)
+    }
     pub async fn telegram_poll_heartbeat(
         &self,
         owner: &str,

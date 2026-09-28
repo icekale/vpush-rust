@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Read;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -89,60 +89,7 @@ pub fn resolution_ok(ips: &[IpAddr]) -> bool {
 }
 
 pub fn ip_allowed(ip: IpAddr) -> bool {
-    match unwrap_v4(ip) {
-        Some(v4) => !ipv4_blocked(v4),
-        None => !ipv6_blocked(match ip {
-            IpAddr::V6(v6) => v6,
-            IpAddr::V4(_) => return false,
-        }),
-    }
-}
-
-fn unwrap_v4(ip: IpAddr) -> Option<Ipv4Addr> {
-    match ip {
-        IpAddr::V4(v4) => Some(v4),
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().or_else(|| nat64(v6)),
-    }
-}
-
-fn nat64(v6: Ipv6Addr) -> Option<Ipv4Addr> {
-    let octets = v6.octets();
-    if octets[..12] == [0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0] {
-        Some(Ipv4Addr::new(
-            octets[12], octets[13], octets[14], octets[15],
-        ))
-    } else {
-        None
-    }
-}
-
-fn ipv4_blocked(ip: Ipv4Addr) -> bool {
-    let [a, b, c, _] = ip.octets();
-    if a == 198 && (b == 18 || b == 19) {
-        return false;
-    }
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_unspecified()
-        || a == 0
-        || (a == 100 && (64..128).contains(&b))
-        || (a == 192 && b == 0 && c == 0)
-        || (a == 192 && b == 0 && c == 2)
-        || (a == 198 && b == 51 && c == 100)
-        || (a == 203 && b == 0 && c == 113)
-        || a >= 224
-}
-
-fn ipv6_blocked(ip: Ipv6Addr) -> bool {
-    let octets = ip.octets();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (octets[0] & 0xfe) == 0xfc
-        || (octets[0] == 0xfe && (octets[1] & 0xc0) == 0x80)
+    !crate::url_guard::ip_blocked(ip)
 }
 
 pub fn bounded_range(header: Option<&str>) -> String {
@@ -442,6 +389,7 @@ fn upstream(video: bool) -> ImgError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn rejects_unlisted_and_private_targets() {
@@ -464,7 +412,13 @@ mod tests {
         ))]));
         assert!(!ip_allowed("::ffff:10.0.0.1".parse().unwrap()));
         assert!(!ip_allowed("64:ff9b::a00:1".parse().unwrap()));
-        assert!(ip_allowed(IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1))));
+        assert!(!ip_allowed(IpAddr::V4(Ipv4Addr::new(198, 18, 1, 1))));
+        assert!(!ip_allowed(IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1))));
+        assert!(!ip_allowed(IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))));
+        assert!(!ip_allowed(IpAddr::V4(Ipv4Addr::new(240, 0, 0, 1))));
+        assert!(!ip_allowed("ff02::1".parse().unwrap()));
+        assert!(!ip_allowed("2002:7f00:1::".parse().unwrap()));
+        assert!(!ip_allowed("2001:0::1".parse().unwrap()));
         assert!(ip_allowed(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
     }
 
@@ -490,6 +444,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "访问公网，不在 CI 中运行"]
     fn truth_jpeg_passes_cloudflare_with_chrome() {
         let target = validate("https://static-assets-1.truthsocial.com/tmtg:prime-ts-assets/media_attachments/files/117/345/153/898/008/432/original/3826b8f99055aa3b.jpg").unwrap();
         let got = fetch(&target, None).expect("truth image");

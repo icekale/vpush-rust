@@ -20,6 +20,7 @@ pub struct Claims {
     pub name: String,
     pub ver: i64,
     pub exp: i64,
+    pub created_at: String,
 }
 
 pub fn hash_password(password: &str, salt_hex: Option<&str>) -> String {
@@ -71,12 +72,20 @@ fn is_username_rest(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_' || c == '-' || is_cjk(c)
 }
 
-pub fn create_token(uid: i64, name: &str, secret: &str, ver: i64, now: u64) -> String {
+pub fn create_token(
+    uid: i64,
+    name: &str,
+    secret: &str,
+    ver: i64,
+    now: u64,
+    created_at: &str,
+) -> String {
     let claims = Claims {
         uid,
         name: name.to_string(),
         ver,
         exp: (now + TOKEN_TTL_SECS) as i64,
+        created_at: created_at.to_string(),
     };
     let body = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(serde_json::to_vec(&claims).expect("claims"));
@@ -126,13 +135,23 @@ mod tests {
 
     #[test]
     fn token_roundtrip() {
-        let token = create_token(7, "admin", "secret", 2, 1_000);
+        let token = create_token(7, "admin", "secret", 2, 1_000, "2020-01-01 00:00:00");
         let claims = verify_token(&token, "secret", 1_000).unwrap();
         assert_eq!(claims.uid, 7);
         assert_eq!(claims.name, "admin");
         assert_eq!(claims.ver, 2);
+        assert_eq!(claims.created_at, "2020-01-01 00:00:00");
         assert!(verify_token(&token, "other", 1_000).is_none());
         assert!(verify_token(&token, "secret", claims.exp as u64 + 1).is_none());
+        let legacy = format!(
+            "{}.{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(br#"{"uid":7,"name":"admin","ver":2,"exp":99999}"#),
+            ""
+        );
+        let (body, _) = legacy.split_once('.').unwrap();
+        let signed = format!("{body}.{}", sign("secret", body));
+        assert!(verify_token(&signed, "secret", 1_000).is_none());
     }
 
     #[test]

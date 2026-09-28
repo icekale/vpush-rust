@@ -356,7 +356,7 @@ fn post_encrypted(url: &str, body: Vec<u8>, auth: String) -> Result<u16, String>
     {
         Ok(resp) => Ok(resp.status()),
         Err(ureq::Error::Status(code, _)) => Ok(code),
-        Err(err) => Err(err.to_string()),
+        Err(_) => Err("浏览器推送请求失败".into()),
     }
 }
 
@@ -482,5 +482,18 @@ mod tests {
         assert!(!endpoint_ok("https://user:pass@fcm.googleapis.com/x"));
         assert!(!endpoint_ok("https://example.com/push"));
         assert!(!keys_ok("aaaa", &auth_b64));
+    }
+
+    #[test]
+    fn transport_error_omits_endpoint_secret() {
+        let secret = "unit-test-webpush-endpoint";
+        let err = post_encrypted(
+            &format!("http://127.0.0.1:1/fcm/send/{secret}"),
+            Vec::new(),
+            "vapid t=unit.unit.unit, k=unit".into(),
+        )
+        .unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
     }
 }

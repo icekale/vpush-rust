@@ -134,6 +134,7 @@ async fn cookie(db: &Db) -> Result<Option<String>, String> {
     Ok(Some(format!("auth_token={auth}; ct0={ct0}; lang=zh-CN")))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn pull(
     db: &Db,
     cookie: Option<&str>,

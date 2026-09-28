@@ -1431,6 +1431,7 @@ fn telegram_request_error_kind(error: &TelegramRequestError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn telegram_deliver_post_media_with<F>(
     chat_id: &str,
     html: &str,
@@ -1563,6 +1564,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn telegram_deliver_post_media(
     token: &str,
     chat_id: &str,
@@ -2150,7 +2152,7 @@ fn post_json(url: &str, body: &str) -> Result<(), String> {
         Ok(resp) if (200..300).contains(&resp.status()) => Ok(()),
         Ok(resp) => Err(format!("推送 HTTP {}", resp.status())),
         Err(ureq::Error::Status(code, _)) => Err(format!("推送 HTTP {code}")),
-        Err(err) => Err(err.to_string()),
+        Err(_) => Err("推送请求失败".into()),
     }
 }
 
@@ -3641,5 +3643,25 @@ mod tests {
             Some("0")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wecom_transport_error_omits_webhook_key() {
+        let secret = "unit-test-wecom-key";
+        let err = post_json(
+            &format!("http://127.0.0.1:1/cgi-bin/webhook/send?key={secret}"),
+            "{}",
+        )
+        .unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn bark_transport_error_omits_device_key() {
+        let secret = "unit-test-bark-key";
+        let err = post_json(&format!("http://127.0.0.1:1/{secret}/title/body"), "").unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
     }
 }

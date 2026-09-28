@@ -164,7 +164,12 @@ pub async fn restore_bytes(db: &Db, data: &[u8]) -> Result<(), BackupError> {
     let folder = live.parent().unwrap_or(Path::new(".")).join("backups");
     std::fs::create_dir_all(&folder).map_err(|_| fail(500, "读取数据库失败"))?;
     let candidate = folder.join(format!("restore-{}.db", now_secs()));
-    std::fs::write(&candidate, data).map_err(|_| fail(500, "读取数据库失败"))?;
+    let bytes = data.to_vec();
+    let candidate_path = candidate.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(candidate_path, bytes))
+        .await
+        .map_err(|_| fail(500, "读取数据库失败"))?
+        .map_err(|_| fail(500, "读取数据库失败"))?;
     let result = restore_candidate(db, &live, &candidate).await;
     let _ = std::fs::remove_file(&candidate);
     result
@@ -179,13 +184,13 @@ pub async fn test_webdav(db: &Db, body: Option<&Value>) -> Result<(), BackupErro
         return Err(fail(400, "WebDAV 地址需要 https"));
     }
     let folder = join(&cfg.url, &cfg.path);
-    let status = dav(&cfg, "PROPFIND", &folder, Some("0"), None)?;
+    let status = dav_off(&cfg, "PROPFIND", &folder, Some("0"), None).await?;
     if status == 404 {
-        let created = dav(&cfg, "MKCOL", &folder, None, None)?;
+        let created = dav_off(&cfg, "MKCOL", &folder, None, None).await?;
         if !(created == 201 || created == 204 || created == 405) && created >= 400 {
             return Err(fail(400, "WebDAV 连不上，请检查地址和账号"));
         }
-        let again = dav(&cfg, "PROPFIND", &folder, Some("0"), None)?;
+        let again = dav_off(&cfg, "PROPFIND", &folder, Some("0"), None).await?;
         if again >= 400 {
             return Err(fail(400, "WebDAV 连不上，请检查地址和账号"));
         }
@@ -213,16 +218,16 @@ pub async fn restore_webdav(db: &Db) -> Result<(), BackupError> {
 }
 
 async fn restore_candidate(db: &Db, live: &Path, candidate: &Path) -> Result<(), BackupError> {
-    if !sqlite_ok(candidate) {
+    if !sqlite_ok_off(candidate).await {
         return Err(fail(400, "备份文件损坏，已取消恢复，当前数据未改"));
     }
     let snap = snapshot_unlocked(db).await?;
-    if !restore_into(live, candidate) {
-        let _ = restore_into(live, &snap);
+    if !restore_into_off(live, candidate).await {
+        let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
     }
     if sqlx::query("SELECT 1").execute(db.pool()).await.is_err() {
-        let _ = restore_into(live, &snap);
+        let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
     }
     Ok(())
@@ -238,7 +243,7 @@ async fn snapshot_unlocked(db: &Db) -> Result<PathBuf, BackupError> {
         .execute(db.pool())
         .await
         .map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
-    if !sqlite_ok(&target) {
+    if !sqlite_ok_off(&target).await {
         let _ = std::fs::remove_file(&target);
         return Err(fail(500, "备份校验失败，请稍后重试"));
     }
@@ -279,6 +284,35 @@ fn prune(folder: &Path) {
     for path in files.into_iter().take(keep) {
         let _ = std::fs::remove_file(path);
     }
+}
+
+async fn sqlite_ok_off(path: &Path) -> bool {
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || sqlite_ok(&path))
+        .await
+        .unwrap_or(false)
+}
+
+async fn restore_into_off(live: &Path, source: &Path) -> bool {
+    let live = live.to_path_buf();
+    let source = source.to_path_buf();
+    tokio::task::spawn_blocking(move || restore_into(&live, &source))
+        .await
+        .unwrap_or(false)
+}
+
+async fn dav_off(
+    cfg: &Cfg,
+    method: &'static str,
+    url: &str,
+    depth: Option<&'static str>,
+    body: Option<Vec<u8>>,
+) -> Result<u16, BackupError> {
+    let cfg = cfg.clone();
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || dav(&cfg, method, &url, depth, body.as_deref()))
+        .await
+        .map_err(|_| fail(500, "WebDAV 连不上，请检查地址和账号"))?
 }
 
 fn sqlite_ok(path: &Path) -> bool {

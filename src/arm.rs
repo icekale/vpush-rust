@@ -43,6 +43,9 @@ pub async fn admin_status(db: &Db) -> Result<Value, String> {
             downloads.push(count);
         }
     }
+    let pull = tokio::task::spawn_blocking(pull_status)
+        .await
+        .unwrap_or_else(|_| pull_for(""));
     Ok(assemble(
         &finished.unwrap_or_default(),
         &result,
@@ -53,6 +56,7 @@ pub async fn admin_status(db: &Db) -> Result<Value, String> {
         count,
         &downloads,
         now_secs(),
+        pull,
     ))
 }
 
@@ -67,6 +71,7 @@ pub fn assemble(
     cicc_count: i64,
     downloads: &[i64],
     now: i64,
+    pull: Value,
 ) -> Value {
     let finished = finished_raw.trim().parse::<i64>().unwrap_or(0);
     let last_error = clip(
@@ -80,7 +85,7 @@ pub fn assemble(
     let mut libraries = libraries(groups, runtime, result, downloads);
     libraries.push(cicc_row(cicc_stamp, cicc_count, &cicc_name(local)));
     json!({
-        "pull": pull_status(),
+        "pull": pull,
         "last_finished_at": finished,
         "next_run_at": next_shanghai(now),
         "downloaded": result["downloaded"].as_i64().unwrap_or(0),
@@ -382,6 +387,7 @@ mod tests {
             4,
             &[],
             1_700_000_000,
+            pull_for(""),
         );
         assert_eq!(status["pull"]["configured"], false);
         assert_eq!(status["last_finished_at"], 42);

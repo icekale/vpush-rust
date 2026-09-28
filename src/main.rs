@@ -3,6 +3,7 @@ mod arm;
 mod auth;
 mod backup;
 mod cicc;
+mod client_ip;
 mod combination;
 mod db;
 mod feishu;
@@ -94,8 +95,18 @@ struct AppState {
     secret: String,
     allow_register: bool,
     static_dir: PathBuf,
-    // ponytail: in-memory IP window; move to sqlite if more than one process serves login
-    fails: Arc<Mutex<HashMap<String, Vec<u64>>>>,
+    // ponytail: in-memory window; move to sqlite if more than one process serves login
+    fails: Arc<Mutex<LoginLimit>>,
+}
+
+#[derive(Default)]
+struct LoginLimit {
+    hits: HashMap<String, Vec<u64>>,
+    pruned_at: u64,
+}
+
+fn new_login_limit() -> Arc<Mutex<LoginLimit>> {
+    Arc::new(Mutex::new(LoginLimit::default()))
 }
 
 struct ApiError {
@@ -267,7 +278,7 @@ async fn main() {
         secret,
         allow_register,
         static_dir: PathBuf::from(static_dir),
-        fails: Arc::new(Mutex::new(HashMap::new())),
+        fails: new_login_limit(),
     };
     xueqiu::spawn(state.db.clone());
     combination::spawn(state.db.clone());
@@ -2162,7 +2173,7 @@ async fn update_user(
                 format!("密码最长{}位", auth::PASSWORD_MAX),
             ))
         }
-        Some(password) => Some(auth::hash_password(&password, None)),
+        Some(password) => Some(hash_password_off(password).await?),
         None => None,
     };
     state
@@ -2860,7 +2871,8 @@ async fn feishu_asset(
         }
         Err(msg) => return Err(ApiError::new(StatusCode::NOT_FOUND, msg)),
     };
-    let bytes = std::fs::read(&path)
+    let bytes = tokio::fs::read(&path)
+        .await
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "飞书文档资源不存在"))?;
     Response::builder()
         .header(header::CONTENT_TYPE, feishu_docs::asset_type(&path))
@@ -4687,21 +4699,26 @@ async fn login(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(body): Json<LoginIn>,
 ) -> Result<Json<Value>, ApiError> {
-    check_login_limit(&state, &ip)?;
+    let username = body.username.trim().to_string();
+    check_login_limit(&state, &ip, &username)?;
     require_turnstile(&state, &body.turnstile, "login", &ip).await?;
-    let username = body.username.trim();
-    let user = state.db.user_by_username(username).await.map_err(db_err)?;
-    let ok = match &user {
-        Some(user) if !user.password_hash.is_empty() => {
-            auth::verify_password(&body.password, &user.password_hash)
-        }
-        _ => {
-            auth::verify_password(&body.password, dummy_password_hash());
+    let user = state.db.user_by_username(&username).await.map_err(db_err)?;
+    let password = body.password.clone();
+    let stored = user
+        .as_ref()
+        .filter(|user| !user.password_hash.is_empty())
+        .map(|user| user.password_hash.clone());
+    let ok = tokio::task::spawn_blocking(move || match stored {
+        Some(hash) => auth::verify_password(&password, &hash),
+        None => {
+            auth::verify_password(&password, dummy_password_hash());
             false
         }
-    };
+    })
+    .await
+    .unwrap_or(false);
     if !ok || body.password.is_empty() || body.password.len() > auth::PASSWORD_MAX {
-        record_login_failure(&state, &ip);
+        record_login_failure(&state, &ip, &username);
         let status = if body.password.len() > auth::PASSWORD_MAX {
             StatusCode::BAD_REQUEST
         } else {
@@ -4715,7 +4732,7 @@ async fn login(
         return Err(ApiError::new(status, detail));
     }
     let user = user.expect("checked");
-    clear_login_failures(&state, &ip);
+    clear_login_failures(&state, &ip, &username);
     state.db.touch_login(user.id).await.map_err(db_err)?;
     Ok(Json(session_payload(&state, &user).await?))
 }
@@ -4728,41 +4745,42 @@ async fn register(
     if !state.allow_register {
         return Err(ApiError::new(StatusCode::FORBIDDEN, "暂未开放注册"));
     }
-    check_login_limit(&state, &ip)?;
+    let attempted = body.username.trim().to_string();
+    check_login_limit(&state, &ip, &attempted)?;
     require_turnstile(&state, &body.turnstile, "register", &ip).await?;
     let username = match auth::validate_username(&body.username) {
         Ok(name) => name,
         Err(msg) => {
-            record_login_failure(&state, &ip);
+            record_login_failure(&state, &ip, &attempted);
             return Err(ApiError::new(StatusCode::BAD_REQUEST, msg));
         }
     };
     if body.password.len() < auth::PASSWORD_MIN {
-        record_login_failure(&state, &ip);
+        record_login_failure(&state, &ip, &attempted);
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("密码至少{}位", auth::PASSWORD_MIN),
         ));
     }
     if body.password.len() > auth::PASSWORD_MAX {
-        record_login_failure(&state, &ip);
+        record_login_failure(&state, &ip, &attempted);
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("密码最长{}位", auth::PASSWORD_MAX),
         ));
     }
     if body.code.trim().is_empty() {
-        record_login_failure(&state, &ip);
+        record_login_failure(&state, &ip, &attempted);
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "注册需要邀请码，请向管理员索取",
         ));
     }
-    let hash = auth::hash_password(&body.password, None);
+    let hash = hash_password_off(body.password.clone()).await?;
     let id = match state.db.register(&body.code, &username, &hash).await {
         Ok(id) => id,
         Err(RegisterError::Rejected(msg)) => {
-            record_login_failure(&state, &ip);
+            record_login_failure(&state, &ip, &attempted);
             return Err(ApiError::new(StatusCode::BAD_REQUEST, msg));
         }
         Err(RegisterError::Db(err)) => return Err(db_err(err)),
@@ -4789,23 +4807,24 @@ async fn wechat_login(
             "未配置微信小程序 app_id/app_secret",
         ));
     }
-    check_login_limit(&state, &ip)?;
+    check_login_limit(&state, &ip, "")?;
     let openid = match wechat::exchange(&body.code, &app_id, &secret).await {
         Ok(openid) => openid,
         Err(err) => {
-            record_login_failure(&state, &ip);
+            record_login_failure(&state, &ip, "");
             return Err(wechat_err(err));
         }
     };
+    check_login_limit(&state, &ip, &openid)?;
     let id =
         match wechat::account(&state.db, state.allow_register, &openid, &body.invite_code).await {
             Ok(id) => id,
             Err(err) => {
-                record_login_failure(&state, &ip);
+                record_login_failure(&state, &ip, &openid);
                 return Err(wechat_err(err));
             }
         };
-    clear_login_failures(&state, &ip);
+    clear_login_failures(&state, &ip, &openid);
     state.db.touch_login(id).await.map_err(db_err)?;
     let user = state
         .db
@@ -5640,11 +5659,11 @@ async fn change_password(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "新密码最长128位"));
     }
     if !user.password_hash.is_empty()
-        && !auth::verify_password(&body.old_password, &user.password_hash)
+        && !verify_password_off(body.old_password.clone(), user.password_hash.clone()).await
     {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "原密码错误"));
     }
-    let hash = auth::hash_password(&body.new_password, None);
+    let hash = hash_password_off(body.new_password.clone()).await?;
     state
         .db
         .set_password(user.id, &hash)
@@ -5658,7 +5677,7 @@ async fn change_password(
         .expect("user");
     Ok(Json(json!({
         "ok": true,
-        "token": auth::create_token(fresh.id, &fresh.username, &state.secret, fresh.token_version, now_secs()),
+        "token": auth::create_token(fresh.id, &fresh.username, &state.secret, fresh.token_version, now_secs(), &fresh.created_at),
     })))
 }
 
@@ -5684,7 +5703,7 @@ fn valid_bark_key(key: &str) -> bool {
 async fn session_payload(state: &AppState, user: &User) -> Result<Value, ApiError> {
     let now = now_secs();
     Ok(json!({
-        "token": auth::create_token(user.id, &user.username, &state.secret, user.token_version, now),
+        "token": auth::create_token(user.id, &user.username, &state.secret, user.token_version, now, &user.created_at),
         "user": enrich_user(&state.db, user).await.map_err(db_err)?,
     }))
 }
@@ -6093,19 +6112,50 @@ async fn user_from_token(state: &AppState, token: &str) -> Result<User, ApiError
         .user_by_id(claims.uid)
         .await
         .map_err(db_err)?
-        .filter(|user| user.token_version == claims.ver && user.username == claims.name)
+        .filter(|user| {
+            user.token_version == claims.ver
+                && user.username == claims.name
+                && !claims.created_at.is_empty()
+                && user.created_at == claims.created_at
+        })
         .ok_or_else(|| ApiError::new(StatusCode::UNAUTHORIZED, "未登录"))?;
     Ok(user)
 }
 
 async fn attach_ip(mut req: Request<Body>, next: Next) -> Response {
-    let ip = req
-        .extensions()
-        .get::<ConnectInfo<SocketAddr>>()
-        .map(|ConnectInfo(addr)| addr.ip().to_string())
-        .unwrap_or_else(|| "local".into());
+    let ip = {
+        let peer = req
+            .extensions()
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| addr.ip());
+        let forwarded = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|value| value.to_str().ok());
+        let real_ip = req
+            .headers()
+            .get("x-real-ip")
+            .and_then(|value| value.to_str().ok());
+        client_ip::resolve_client_ip(peer, forwarded, real_ip, trusted_proxy_nets())
+    };
     req.extensions_mut().insert(ClientIp(ip));
     next.run(req).await
+}
+
+fn trusted_proxy_nets() -> &'static [client_ip::Net] {
+    static NETS: OnceLock<Vec<client_ip::Net>> = OnceLock::new();
+    NETS.get_or_init(|| match std::env::var("TRUSTED_PROXIES") {
+        Ok(raw) if !raw.trim().is_empty() => {
+            let nets = client_ip::parse_trusted(&raw);
+            if nets.is_empty() {
+                Vec::new()
+            } else {
+                nets
+            }
+        }
+        _ => client_ip::default_trusted(),
+    })
+    .as_slice()
 }
 
 fn dummy_password_hash() -> &'static str {
@@ -6115,18 +6165,76 @@ fn dummy_password_hash() -> &'static str {
     })
 }
 
-fn check_login_limit(state: &AppState, ip: &str) -> Result<(), ApiError> {
+async fn hash_password_off(password: String) -> Result<String, ApiError> {
+    tokio::task::spawn_blocking(move || auth::hash_password(&password, None))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "服务器错误"))
+}
+
+async fn verify_password_off(password: String, hash: String) -> bool {
+    tokio::task::spawn_blocking(move || auth::verify_password(&password, &hash))
+        .await
+        .unwrap_or(false)
+}
+
+fn login_keys(ip: &str, account: &str) -> Vec<String> {
+    let mut keys = vec![format!("ip:{ip}")];
+    let account = account.trim().to_lowercase();
+    if !account.is_empty() {
+        keys.push(format!("acct:{account}"));
+    }
+    keys
+}
+
+fn login_hit_count(hits: &[u64], now: u64) -> usize {
+    hits.iter()
+        .filter(|t| now.saturating_sub(**t) < LOGIN_WINDOW_SECS)
+        .count()
+}
+
+fn prune_login_limit(limit: &mut LoginLimit, now: u64) {
+    limit.hits.retain(|_, hits| {
+        hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
+        !hits.is_empty()
+    });
+    limit.pruned_at = now;
+}
+
+fn maybe_prune_login_limit(limit: &mut LoginLimit, now: u64) {
+    if now.saturating_sub(limit.pruned_at) >= 60 {
+        prune_login_limit(limit, now);
+    }
+}
+
+fn login_limited(limit: &LoginLimit, ip: &str, account: &str, now: u64) -> bool {
+    login_keys(ip, account).into_iter().any(|key| {
+        limit
+            .hits
+            .get(&key)
+            .is_some_and(|hits| login_hit_count(hits, now) >= LOGIN_MAX_FAILURES)
+    })
+}
+
+fn record_limited(limit: &mut LoginLimit, ip: &str, account: &str, now: u64) {
+    maybe_prune_login_limit(limit, now);
+    for key in login_keys(ip, account) {
+        let hits = limit.hits.entry(key).or_default();
+        hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
+        hits.push(now);
+    }
+}
+
+fn clear_limited(limit: &mut LoginLimit, ip: &str, account: &str) {
+    for key in login_keys(ip, account) {
+        limit.hits.remove(&key);
+    }
+}
+
+fn check_login_limit(state: &AppState, ip: &str, account: &str) -> Result<(), ApiError> {
     let now = now_secs();
-    let map = state.fails.lock().expect("login limit");
-    let count = map
-        .get(ip)
-        .map(|hits| {
-            hits.iter()
-                .filter(|t| now.saturating_sub(**t) < LOGIN_WINDOW_SECS)
-                .count()
-        })
-        .unwrap_or(0);
-    if count >= LOGIN_MAX_FAILURES {
+    let mut limit = state.fails.lock().expect("login limit");
+    maybe_prune_login_limit(&mut limit, now);
+    if login_limited(&limit, ip, account, now) {
         Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "尝试次数过多，请 5 分钟后再试",
@@ -6136,16 +6244,15 @@ fn check_login_limit(state: &AppState, ip: &str) -> Result<(), ApiError> {
     }
 }
 
-fn record_login_failure(state: &AppState, ip: &str) {
+fn record_login_failure(state: &AppState, ip: &str, account: &str) {
     let now = now_secs();
-    let mut map = state.fails.lock().expect("login limit");
-    let hits = map.entry(ip.to_string()).or_default();
-    hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
-    hits.push(now);
+    let mut limit = state.fails.lock().expect("login limit");
+    record_limited(&mut limit, ip, account, now);
 }
 
-fn clear_login_failures(state: &AppState, ip: &str) {
-    state.fails.lock().expect("login limit").remove(ip);
+fn clear_login_failures(state: &AppState, ip: &str, account: &str) {
+    let mut limit = state.fails.lock().expect("login limit");
+    clear_limited(&mut limit, ip, account);
 }
 
 fn db_err(err: sqlx::Error) -> ApiError {
@@ -6207,37 +6314,45 @@ async fn static_or_spa(State(state): State<AppState>, req: Request<Body>) -> Res
     if rel.split('/').any(|part| part == "..") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Some((path, fingerprinted)) = resolve_asset(&state.static_dir, rel) {
+    if let Some((path, fingerprinted)) = resolve_asset(&state.static_dir, rel).await {
         return file_response(
             &path,
             fingerprinted,
             req.method() == axum::http::Method::HEAD,
-        );
+        )
+        .await;
     }
     let first = rel.split('/').next().unwrap_or("");
     if rel.is_empty() || SPA.contains(&first) {
         let index = state.static_dir.join("index.html");
-        if index.is_file() {
-            return file_response(&index, false, req.method() == axum::http::Method::HEAD);
+        if is_file(&index).await {
+            return file_response(&index, false, req.method() == axum::http::Method::HEAD).await;
         }
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn resolve_asset(root: &Path, rel: &str) -> Option<(PathBuf, bool)> {
+async fn is_file(path: &Path) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .is_ok_and(|meta| meta.is_file())
+}
+
+async fn resolve_asset(root: &Path, rel: &str) -> Option<(PathBuf, bool)> {
     if rel.is_empty() {
         return None;
     }
     let direct = root.join(rel);
-    if direct.is_file() && inside(root, &direct) {
+    if is_file(&direct).await && inside(root, &direct) {
         return Some((direct, false));
     }
     let logical = unhash(rel)?;
     let path = root.join(&logical);
-    if !path.is_file() || !inside(root, &path) {
+    if !is_file(&path).await || !inside(root, &path) {
         return None;
     }
-    let digest = hex::encode(Sha256::digest(std::fs::read(&path).ok()?));
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    let digest = hex::encode(Sha256::digest(bytes));
     let hashed = rel.rsplit_once('.')?.0.rsplit_once('.')?.1;
     if !digest.starts_with(hashed) {
         return None;
@@ -6267,12 +6382,12 @@ fn inside(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
-fn file_response(path: &Path, fingerprinted: bool, head: bool) -> Response {
-    let name = path.to_string_lossy();
+async fn file_response(path: &Path, fingerprinted: bool, head: bool) -> Response {
+    let name = path.to_string_lossy().into_owned();
     let body = if head {
         Body::empty()
     } else {
-        match std::fs::read(path) {
+        match tokio::fs::read(path).await {
             Ok(bytes) => Body::from(bytes),
             Err(_) => return StatusCode::NOT_FOUND.into_response(),
         }
@@ -6649,7 +6764,7 @@ mod tests {
             secret: "test-secret".into(),
             allow_register: true,
             static_dir: path.clone(),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         };
         let err = apply_profile(
             &state,
@@ -6721,7 +6836,7 @@ mod tests {
             secret: "route-test-secret".into(),
             allow_register: false,
             static_dir: std::env::temp_dir(),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         };
         let token = auth::create_token(
             admin.id,
@@ -6729,6 +6844,7 @@ mod tests {
             &state.secret,
             admin.token_version,
             now_secs(),
+            &admin.created_at,
         );
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -6797,7 +6913,7 @@ mod tests {
             secret: "test-secret".into(),
             allow_register: true,
             static_dir: dir.join("static"),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         };
         let app = router(state);
         let res = app
@@ -6915,7 +7031,7 @@ mod tests {
             secret: "test-secret".into(),
             allow_register: false,
             static_dir: dir.join("static"),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         };
         let app = router(state);
         let login = app
@@ -7020,7 +7136,7 @@ mod tests {
             secret: "test-secret".into(),
             allow_register: false,
             static_dir: dir.join("static"),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         };
         let app = router(state);
         let login = app
@@ -7202,7 +7318,7 @@ mod tests {
             secret: "test-secret".into(),
             allow_register: false,
             static_dir: dir.join("static"),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         });
         let login = app
             .clone()
@@ -7313,7 +7429,7 @@ mod tests {
             secret: "test-secret".into(),
             allow_register: false,
             static_dir: dir.join("static"),
-            fails: Arc::new(Mutex::new(HashMap::new())),
+            fails: new_login_limit(),
         });
         let login = app
             .clone()
@@ -7383,5 +7499,97 @@ mod tests {
             .unwrap();
         assert_eq!(admin_user.status(), StatusCode::BAD_REQUEST);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn login_limit_tracks_ip_and_username_and_prunes_expired_keys() {
+        let mut limit = LoginLimit::default();
+        for _ in 0..LOGIN_MAX_FAILURES {
+            record_limited(&mut limit, "1.1.1.1", "Alice", 1_000);
+        }
+        assert!(login_limited(&limit, "1.1.1.1", "bob", 1_000));
+        assert!(login_limited(&limit, "2.2.2.2", "alice", 1_000));
+        assert!(!login_limited(&limit, "2.2.2.2", "bob", 1_000));
+        clear_limited(&mut limit, "1.1.1.1", "alice");
+        assert!(!login_limited(&limit, "1.1.1.1", "carol", 1_000));
+        assert!(!login_limited(&limit, "8.8.8.8", "alice", 1_000));
+
+        let mut stale = LoginLimit {
+            hits: HashMap::from([("ip:9.9.9.9".into(), vec![10])]),
+            pruned_at: 10,
+        };
+        record_limited(&mut stale, "1.1.1.1", "bob", 10 + LOGIN_WINDOW_SECS + 60);
+        assert!(!stale.hits.contains_key("ip:9.9.9.9"));
+        assert!(stale.hits.contains_key("ip:1.1.1.1"));
+        prune_login_limit(&mut stale, 10 + LOGIN_WINDOW_SECS + 60 + LOGIN_WINDOW_SECS);
+        assert!(stale.hits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reused_user_id_cannot_redeem_the_previous_token() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-token-{}-{}.db",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, created_at) VALUES ('reader01', 'x', '2020-01-01 00:00:00')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let reader = db.user_by_username("reader01").await.unwrap().unwrap();
+        let state = AppState {
+            db: db.clone(),
+            secret: "token-secret".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let token = auth::create_token(
+            reader.id,
+            &reader.username,
+            &state.secret,
+            reader.token_version,
+            now_secs(),
+            &reader.created_at,
+        );
+        assert_eq!(
+            user_from_token(&state, &token)
+                .await
+                .unwrap_or_else(|err| panic!("{}", err.detail))
+                .id,
+            reader.id
+        );
+        db.delete_user(admin.id, reader.id).await.unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, token_version, created_at) VALUES (?, 'reader01', 'x', 0, '2024-05-01 00:00:00')",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(user_from_token(&state, &token).await.is_err());
+        let revived = db.user_by_username("reader01").await.unwrap().unwrap();
+        let fresh = auth::create_token(
+            revived.id,
+            &revived.username,
+            &state.secret,
+            revived.token_version,
+            now_secs(),
+            &revived.created_at,
+        );
+        assert_eq!(
+            user_from_token(&state, &fresh)
+                .await
+                .unwrap_or_else(|err| panic!("{}", err.detail))
+                .id,
+            revived.id
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

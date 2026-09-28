@@ -266,7 +266,10 @@ pub async fn list_documents(
     let page = if facets_only || start >= total {
         Vec::new()
     } else {
-        document_page(db, user_id, is_admin, group, day, &needle, page_limit, start).await?
+        document_page(
+            db, user_id, is_admin, group, day, &needle, page_limit, start,
+        )
+        .await?
     };
     Ok(json!({
         "groups": [],
@@ -351,13 +354,18 @@ async fn latest_document_page(
                 }
             }
             let media = source["media_id"].as_str().unwrap_or("");
-            if items.iter().any(|item| {
-                item["group_id"] == gid && item["media_id"] == media
-            }) {
+            if items
+                .iter()
+                .any(|item| item["group_id"] == gid && item["media_id"] == media)
+            {
                 continue;
             }
             let raw_day = source["last_success_at"].as_str().unwrap_or("");
-            let item_day = if raw_day.len() >= 10 { &raw_day[..10] } else { "" };
+            let item_day = if raw_day.len() >= 10 {
+                &raw_day[..10]
+            } else {
+                ""
+            };
             let name = source["title"]
                 .as_str()
                 .filter(|text| !text.is_empty())
@@ -419,9 +427,8 @@ async fn latest_document_days(
     is_admin: bool,
     group: &str,
 ) -> Result<Vec<String>, &'static str> {
-    let mut qb = QueryBuilder::new(
-        "SELECT DISTINCT d.day FROM ima_document_index d WHERE d.day != '' AND ",
-    );
+    let mut qb =
+        QueryBuilder::new("SELECT DISTINCT d.day FROM ima_document_index d WHERE d.day != '' AND ");
     push_visible(&mut qb, "d.group_id", is_admin, user_id);
     qb.push(" AND d.group_id = ");
     qb.push_bind(group.to_string());
@@ -508,12 +515,28 @@ fn push_document_union(
         "SELECT d.media_id, d.name, d.group_id, d.group_name, d.sort_date AS day, d.sort_date, d.abstract, d.downloaded_at, CASE WHEN d.pdf_path != '' THEN 1 ELSE 0 END AS has_pdf, CASE WHEN d.txt_path != '' THEN 1 ELSE 0 END AS has_txt FROM ima_document_index d WHERE ",
     );
     push_visible(qb, "d.group_id", is_admin, user_id);
-    push_match(qb, "d.group_id", "d.sort_date", "d.name", group, day, needle);
+    push_match(
+        qb,
+        "d.group_id",
+        "d.sort_date",
+        "d.name",
+        group,
+        day,
+        needle,
+    );
     qb.push(
         " AND NOT EXISTS (SELECT 1 FROM feishu_document_sources s WHERE s.enabled = 1 AND s.deleted_at IS NULL AND s.timeline_path != '' AND s.group_id = d.group_id AND s.media_id = d.media_id AND ",
     );
     push_visible(qb, "s.group_id", is_admin, user_id);
-    push_match(qb, "s.group_id", source_day, source_name, group, day, needle);
+    push_match(
+        qb,
+        "s.group_id",
+        source_day,
+        source_name,
+        group,
+        day,
+        needle,
+    );
     qb.push(" ) UNION ALL SELECT s.media_id, ");
     qb.push(source_name);
     qb.push(", s.group_id, ");
@@ -526,7 +549,15 @@ fn push_document_union(
         ", '', s.last_success_at, 0, 0 FROM feishu_document_sources s WHERE s.enabled = 1 AND s.deleted_at IS NULL AND s.timeline_path != '' AND ",
     );
     push_visible(qb, "s.group_id", is_admin, user_id);
-    push_match(qb, "s.group_id", source_day, source_name, group, day, needle);
+    push_match(
+        qb,
+        "s.group_id",
+        source_day,
+        source_name,
+        group,
+        day,
+        needle,
+    );
     qb.push(")");
 }
 
@@ -536,9 +567,7 @@ async fn document_group_visible(
     is_admin: bool,
     group: &str,
 ) -> Result<bool, &'static str> {
-    let mut qb = QueryBuilder::new(
-        "SELECT 1 FROM ima_document_index d WHERE d.group_id = ",
-    );
+    let mut qb = QueryBuilder::new("SELECT 1 FROM ima_document_index d WHERE d.group_id = ");
     qb.push_bind(group.to_string());
     qb.push(" AND ");
     push_visible(&mut qb, "d.group_id", is_admin, user_id);
@@ -589,6 +618,7 @@ async fn document_days(
         .map_err(|_| "读取文档失败")
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn document_page(
     db: &Db,
     user_id: i64,
@@ -1463,15 +1493,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let db = Db::open(&dir.join("t.db")).await.unwrap();
-        for (id, day, name) in [("old", "2024-01-01", "旧"), ("mid", "2024-06-01", "中"), ("new", "2024-12-01", "新")] {
-            db.insert_ima_document("reports", id, name, day, "", "").await.unwrap();
+        for (id, day, name) in [
+            ("old", "2024-01-01", "旧"),
+            ("mid", "2024-06-01", "中"),
+            ("new", "2024-12-01", "新"),
+        ] {
+            db.insert_ima_document("reports", id, name, day, "", "")
+                .await
+                .unwrap();
         }
-        let page = list_documents(&db, 1, true, "", "", "", "", 1, 0, false).await.unwrap();
+        let page = list_documents(&db, 1, true, "", "", "", "", 1, 0, false)
+            .await
+            .unwrap();
         assert_eq!(page["items"].as_array().unwrap().len(), 1);
         assert_eq!(page["items"][0]["name"], "新");
         assert_eq!(page["has_more"], true);
         assert_eq!(page["document_count"], 0);
-        let facets = list_documents(&db, 1, true, "", "", "", "", 1, 0, true).await.unwrap();
+        let facets = list_documents(&db, 1, true, "", "", "", "", 1, 0, true)
+            .await
+            .unwrap();
         assert!(facets["items"].as_array().unwrap().is_empty());
         assert_eq!(facets["document_count"], 3);
         let _ = std::fs::remove_dir_all(&dir);

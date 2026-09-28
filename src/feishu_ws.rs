@@ -151,7 +151,14 @@ async fn run(db: &Db, session_id: &str) -> Result<(), String> {
         } else {
             "https://open.feishu.cn"
         };
-        let endpoint = fetch_endpoint(domain, &app_id, &secret)?;
+        let endpoint = tokio::task::spawn_blocking({
+            let app_id = app_id.to_string();
+            let secret = secret.to_string();
+            let domain = domain.to_string();
+            move || fetch_endpoint(&domain, &app_id, &secret)
+        })
+        .await
+        .map_err(|err| err.to_string())??;
         match serve(db, session_id, &endpoint, &app_id, &secret, &brand).await {
             Ok(()) => return Ok(()),
             Err(err) => {

@@ -135,14 +135,7 @@ pub(crate) async fn run_with_endpoint(
     endpoint: &str,
     _os_lock: File,
 ) {
-    let Some(mut offset) = (match db.telegram_poll_acquire(&owner, LEASE_SECS).await {
-        Ok(offset) => offset,
-        Err(error) => {
-            tracing::error!("Telegram 入站租约初始化失败: {error}");
-            return;
-        }
-    }) else {
-        tracing::info!("Telegram 入站 worker 未取得租约");
+    let Some(mut offset) = wait_for_poll_lease(&db, &owner).await else {
         return;
     };
 
@@ -160,6 +153,22 @@ pub(crate) async fn run_with_endpoint(
                 tracing::warn!("Telegram 入站 worker 停止：租约已失效")
             }
             other => tracing::warn!("Telegram 入站 worker 停止: {other}"),
+        }
+    }
+}
+
+async fn wait_for_poll_lease(db: &Db, owner: &str) -> Option<i64> {
+    loop {
+        match db.telegram_poll_acquire(owner, LEASE_SECS).await {
+            Ok(Some(offset)) => return Some(offset),
+            Ok(None) => {
+                tracing::info!("Telegram 入站租约被占用，稍后重试");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            Err(error) => {
+                tracing::error!("Telegram 入站租约初始化失败: {error}");
+                return None;
+            }
         }
     }
 }
@@ -697,6 +706,33 @@ mod tests {
         assert!(!db.telegram_poll_release("two").await.unwrap());
         assert!(db.telegram_poll_release("one").await.unwrap());
         assert_eq!(db.telegram_poll_acquire("two", 60).await.unwrap(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn worker_retries_until_existing_lease_expires() {
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-telegram-lease-retry-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("vpush.db");
+        let db = Db::open(&db_path).await.unwrap();
+        db.telegram_poll_acquire("old", 60).await.unwrap();
+        let waiting = db.clone();
+        let worker = tokio::spawn(async move { wait_for_poll_lease(&waiting, "new").await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        sqlx::query("UPDATE telegram_poll_state SET lease_until = unixepoch() - 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let offset = tokio::time::timeout(Duration::from_secs(7), worker)
+            .await
+            .expect("worker gave up while another lease was still held")
+            .unwrap();
+        assert_eq!(offset, Some(0));
+        assert!(db.telegram_poll_is_owner("new").await.unwrap());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

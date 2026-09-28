@@ -227,7 +227,7 @@ async fn pull(
         {
             continue;
         }
-        crate::push::deliver(
+        crate::push::deliver_later(
             db,
             kol_id,
             &crate::feishu::Note {
@@ -240,8 +240,7 @@ async fn pull(
                 url: &tweet.url,
                 published_at: &tweet.published_at,
             },
-        )
-        .await;
+        );
     }
     Ok(())
 }

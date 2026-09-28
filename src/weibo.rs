@@ -226,7 +226,7 @@ async fn pull(
         if !push {
             continue;
         }
-        crate::push::deliver(
+        crate::push::deliver_later(
             db,
             kol_id,
             &crate::feishu::Note {
@@ -239,8 +239,7 @@ async fn pull(
                 url: &post.url,
                 published_at: &post.published_at,
             },
-        )
-        .await;
+        );
     }
     Ok(())
 }

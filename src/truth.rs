@@ -119,7 +119,7 @@ async fn poll(db: &Db) -> Result<(), String> {
         {
             continue;
         }
-        crate::push::deliver(
+        crate::push::deliver_later(
             db,
             id,
             &crate::feishu::Note {
@@ -132,8 +132,7 @@ async fn poll(db: &Db) -> Result<(), String> {
                 url: &entry.url,
                 published_at: &entry.published_at,
             },
-        )
-        .await;
+        );
     }
     Ok(())
 }

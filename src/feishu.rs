@@ -23,6 +23,7 @@ pub async fn notify(db: &Db, note: Note<'_>) -> Result<(), String> {
         return Err("飞书 webhook 必须是 https://open.feishu.cn 或 open.larksuite.com".into());
     }
     let body = serde_json::to_string(&card(&note)).map_err(|e| e.to_string())?;
+    let _slot = crate::push::hold_push_slot().await;
     tokio::task::spawn_blocking(move || post(&url, &body))
         .await
         .map_err(|e| e.to_string())?
@@ -571,6 +572,7 @@ async fn send_im(
     })
     .to_string();
     let id_type = id_type.to_string();
+    let _slot = crate::push::hold_push_slot().await;
     tokio::task::spawn_blocking(move || {
         let token = tenant_token(&base, &app_id, &secret)?;
         let url = format!("{base}/open-apis/im/v1/messages?receive_id_type={id_type}");

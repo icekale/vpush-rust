@@ -2860,7 +2860,8 @@ async fn feishu_asset(
         }
         Err(msg) => return Err(ApiError::new(StatusCode::NOT_FOUND, msg)),
     };
-    let bytes = std::fs::read(&path)
+    let bytes = tokio::fs::read(&path)
+        .await
         .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "飞书文档资源不存在"))?;
     Response::builder()
         .header(header::CONTENT_TYPE, feishu_docs::asset_type(&path))
@@ -6207,42 +6208,45 @@ async fn static_or_spa(State(state): State<AppState>, req: Request<Body>) -> Res
     if rel.split('/').any(|part| part == "..") {
         return StatusCode::NOT_FOUND.into_response();
     }
-    if let Some((path, fingerprinted)) = resolve_asset(&state.static_dir, rel) {
-        return file_response(
-            &path,
-            fingerprinted,
-            req.method() == axum::http::Method::HEAD,
-        );
+    let head = req.method() == axum::http::Method::HEAD;
+    if let Some((path, fingerprinted, bytes)) = load_static(&state.static_dir, rel, !head).await {
+        return file_response(&path, fingerprinted, head, bytes);
     }
     let first = rel.split('/').next().unwrap_or("");
     if rel.is_empty() || SPA.contains(&first) {
         let index = state.static_dir.join("index.html");
         if index.is_file() {
-            return file_response(&index, false, req.method() == axum::http::Method::HEAD);
+            return file_from_path(&index, false, head).await;
         }
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-fn resolve_asset(root: &Path, rel: &str) -> Option<(PathBuf, bool)> {
+async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf, bool, Vec<u8>)> {
     if rel.is_empty() {
         return None;
     }
     let direct = root.join(rel);
     if direct.is_file() && inside(root, &direct) {
-        return Some((direct, false));
+        let bytes = if read_body {
+            tokio::fs::read(&direct).await.ok()?
+        } else {
+            Vec::new()
+        };
+        return Some((direct, false, bytes));
     }
     let logical = unhash(rel)?;
     let path = root.join(&logical);
     if !path.is_file() || !inside(root, &path) {
         return None;
     }
-    let digest = hex::encode(Sha256::digest(std::fs::read(&path).ok()?));
+    let bytes = tokio::fs::read(&path).await.ok()?;
+    let digest = hex::encode(Sha256::digest(&bytes));
     let hashed = rel.rsplit_once('.')?.0.rsplit_once('.')?.1;
     if !digest.starts_with(hashed) {
         return None;
     }
-    Some((path, true))
+    Some((path, true, bytes))
 }
 
 fn unhash(rel: &str) -> Option<String> {
@@ -6267,15 +6271,24 @@ fn inside(root: &Path, path: &Path) -> bool {
     path.starts_with(root)
 }
 
-fn file_response(path: &Path, fingerprinted: bool, head: bool) -> Response {
+async fn file_from_path(path: &Path, fingerprinted: bool, head: bool) -> Response {
+    let bytes = if head {
+        Vec::new()
+    } else {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => bytes,
+            Err(_) => return StatusCode::NOT_FOUND.into_response(),
+        }
+    };
+    file_response(path, fingerprinted, head, bytes)
+}
+
+fn file_response(path: &Path, fingerprinted: bool, head: bool, bytes: Vec<u8>) -> Response {
     let name = path.to_string_lossy();
     let body = if head {
         Body::empty()
     } else {
-        match std::fs::read(path) {
-            Ok(bytes) => Body::from(bytes),
-            Err(_) => return StatusCode::NOT_FOUND.into_response(),
-        }
+        Body::from(bytes)
     };
     let cache = if fingerprinted {
         "public, max-age=31536000, immutable"
@@ -6850,6 +6863,8 @@ mod tests {
             res.headers().get(header::CACHE_CONTROL).unwrap(),
             "public, max-age=31536000, immutable"
         );
+        let hashed_body = to_bytes(res.into_body(), 1024).await.unwrap();
+        assert_eq!(&hashed_body[..], b"console.log(1)");
 
         let login = app
             .clone()

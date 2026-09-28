@@ -33,6 +33,78 @@ pub fn ensure_listener(db: Db, session_id: String) {
     });
 }
 
+pub fn spawn_shared(db: Db) {
+    if std::env::var("FEISHU_SHARED_LISTENER").ok().as_deref() == Some("0") {
+        return;
+    }
+    let app_id = std::env::var("FEISHU_APP_ID").unwrap_or_default();
+    let secret = std::env::var("FEISHU_APP_SECRET").unwrap_or_default();
+    if app_id.trim().is_empty() || secret.trim().is_empty() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = run_shared(&db, &app_id, &secret).await {
+                tracing::warn!("飞书共享机器人将重试: {err}");
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+async fn run_shared(db: &Db, app_id: &str, secret: &str) -> Result<(), String> {
+    let endpoint = tokio::task::spawn_blocking({
+        let app_id = app_id.to_string();
+        let secret = secret.to_string();
+        move || fetch_endpoint("https://open.feishu.cn", &app_id, &secret)
+    })
+    .await
+    .map_err(|err| err.to_string())??;
+    let (mut socket, _) = tokio_tungstenite::connect_async(&endpoint.url)
+        .await
+        .map_err(|err| err.to_string())?;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    socket
+        .send(Message::Binary(
+            encode_frame(&ping_frame(endpoint.service)).into(),
+        ))
+        .await
+        .map_err(|err| err.to_string())?;
+    loop {
+        let message = tokio::time::timeout(Duration::from_secs(20), socket.next()).await;
+        let message = match message {
+            Err(_) => {
+                socket
+                    .send(Message::Binary(
+                        encode_frame(&ping_frame(endpoint.service)).into(),
+                    ))
+                    .await
+                    .map_err(|err| err.to_string())?;
+                continue;
+            }
+            Ok(Some(Ok(message))) => message,
+            Ok(Some(Err(err))) => return Err(err.to_string()),
+            Ok(None) => return Err("连接已关闭".into()),
+        };
+        let bytes = match message {
+            Message::Binary(bytes) => bytes.to_vec(),
+            Message::Close(_) => return Err("连接已关闭".into()),
+            _ => continue,
+        };
+        let (reply, outgoing) = handle_shared_frame(db, &bytes, now_secs()).await?;
+        if let Some((chat_id, text)) = outgoing {
+            crate::feishu::send_shared_text(&chat_id, &text).await?;
+        }
+        if let Some(reply) = reply {
+            socket
+                .send(Message::Binary(reply.into()))
+                .await
+                .map_err(|err| err.to_string())?;
+        }
+    }
+}
+
 pub async fn resume(db: Db) {
     if !listeners_enabled() {
         return;
@@ -221,6 +293,194 @@ where
     });
     frame.payload = br#"{"code":200}"#.to_vec();
     Ok(Some(encode_frame(&frame)))
+}
+
+static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub async fn handle_shared_frame(
+    db: &Db,
+    bytes: &[u8],
+    now: i64,
+) -> Result<(Option<Vec<u8>>, Option<(String, String)>), String> {
+    let mut frame = decode_frame(bytes)?;
+    if frame.method != 1 || header(&frame, "type") != "event" {
+        return Ok((None, None));
+    }
+    let payload: Value = serde_json::from_slice(&frame.payload).unwrap_or(Value::Null);
+    let outgoing = match payload
+        .pointer("/header/event_type")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
+        "im.message.receive_v1" => shared_message(db, &payload, now).await?,
+        "card.action.trigger" => shared_card(db, &payload, now).await?,
+        _ => None,
+    };
+    frame.headers.push(Header {
+        key: "biz_rt".into(),
+        value: "1".into(),
+    });
+    frame.payload = br#"{"code":200}"#.to_vec();
+    Ok((Some(encode_frame(&frame)), outgoing))
+}
+
+async fn shared_message(
+    db: &Db,
+    payload: &Value,
+    now: i64,
+) -> Result<Option<(String, String)>, String> {
+    let message_id = payload
+        .pointer("/event/message/message_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    if !remember_message(message_id) {
+        return Ok(None);
+    }
+    if payload
+        .pointer("/event/message/chat_type")
+        .and_then(Value::as_str)
+        != Some("p2p")
+        || payload
+            .pointer("/event/message/message_type")
+            .and_then(Value::as_str)
+            != Some("text")
+    {
+        return Ok(None);
+    }
+    let chat_id = payload
+        .pointer("/event/message/chat_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let open_id = payload
+        .pointer("/event/sender/sender_id/open_id")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let content = payload
+        .pointer("/event/message/content")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let text = serde_json::from_str::<Value>(content)
+        .ok()
+        .and_then(|item| item.get("text").and_then(Value::as_str).map(str::to_owned))
+        .unwrap_or_default();
+    let text = text
+        .split_whitespace()
+        .filter(|part| !part.starts_with('@'))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if chat_id.is_empty() || open_id.is_empty() || text.is_empty() {
+        return Ok(None);
+    }
+    if let Some(raw_code) = crate::telegram_bot::bind_request(&text) {
+        let Some(code) = crate::telegram_bot::normalize_bind_code(&raw_code) else {
+            return Ok(Some((chat_id.to_owned(), "绑定码无效或已过期。".into())));
+        };
+        db.release_feishu_placeholder(open_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        let reply = match db
+            .consume_bind_code(&code, "feishu_open_id", open_id, now)
+            .await
+        {
+            Ok(Some(user_id)) => {
+                db.set_user_text(user_id, "feishu_chat_id", chat_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                "绑定成功。发送 /mysubs 查看订阅。".to_owned()
+            }
+            Ok(None) => "绑定码无效或已过期。".to_owned(),
+            Err(err) => catalog_message(err),
+        };
+        return Ok(Some((chat_id.to_owned(), reply)));
+    }
+    let user = db
+        .upsert_feishu_identity(open_id, chat_id, "")
+        .await
+        .map_err(catalog_message)?;
+    let reply = crate::telegram_bot::reply_for(db, &user, &text, now).await;
+    Ok(Some((chat_id.to_owned(), reply.text)))
+}
+
+async fn shared_card(
+    db: &Db,
+    payload: &Value,
+    now: i64,
+) -> Result<Option<(String, String)>, String> {
+    let open_id = payload
+        .pointer("/event/operator/open_id")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            payload
+                .pointer("/event/operator/operator_id/open_id")
+                .and_then(Value::as_str)
+        })
+        .unwrap_or("");
+    let Some(user) = db
+        .user_by_feishu_open_id(open_id)
+        .await
+        .map_err(|err| err.to_string())?
+    else {
+        return Ok(None);
+    };
+    if user.feishu_chat_id.is_empty() {
+        return Ok(None);
+    }
+    let Some(command) = card_command(payload) else {
+        return Ok(None);
+    };
+    let reply = crate::telegram_bot::reply_for(db, &user, &command, now).await;
+    Ok(Some((user.feishu_chat_id, reply.text)))
+}
+
+fn card_command(payload: &Value) -> Option<String> {
+    let value = payload.pointer("/event/action/value")?;
+    let action = value.get("action").and_then(Value::as_str)?;
+    let kol = value
+        .get("kol_id")
+        .and_then(Value::as_i64)
+        .map(|id| id.to_string())
+        .or_else(|| {
+            value
+                .get("kol_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        });
+    match action {
+        "sub" => Some(format!("/sub {}", kol?)),
+        "unsub" => Some(format!("/unsub {}", kol?)),
+        "list" => Some(format!(
+            "/list {}",
+            value.get("page").and_then(Value::as_i64).unwrap_or(1)
+        )),
+        _ => None,
+    }
+}
+
+fn remember_message(id: &str) -> bool {
+    if id.is_empty() {
+        return true;
+    }
+    let mut seen = SEEN.lock().expect("feishu seen");
+    if seen.iter().any(|item| item == id) {
+        return false;
+    }
+    seen.push(id.to_owned());
+    if seen.len() > 200 {
+        seen.remove(0);
+    }
+    true
+}
+
+fn catalog_message(err: crate::db::CatalogError) -> String {
+    use crate::db::CatalogError;
+    match err {
+        CatalogError::Missing(message)
+        | CatalogError::Bad(message)
+        | CatalogError::Limited(message)
+        | CatalogError::Conflict(message) => message.to_owned(),
+        CatalogError::Invalid(message) => message,
+        CatalogError::Db(err) => err.to_string(),
+    }
 }
 
 struct Endpoint {
@@ -563,5 +823,69 @@ mod tests {
             endpoint_from(&serde_json::json!({"code": 0, "data": {"URL": "https://evil"}}))
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn shared_private_message_replies_and_bind_moves_to_web_user() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        let frame = text_event("om_help", "ou_help", "oc_help", "p2p", "/help");
+        let (_, outgoing) = handle_shared_frame(&db, &frame, 1_000).await.unwrap();
+        assert!(outgoing.unwrap().1.contains("帮助"));
+        let user = db.user_by_feishu_open_id("ou_help").await.unwrap().unwrap();
+        assert_eq!(user.feishu_chat_id, "oc_help");
+        let (_, duplicate) = handle_shared_frame(&db, &frame, 1_000).await.unwrap();
+        assert!(duplicate.is_none());
+
+        let group = text_event("om_group", "ou_group", "oc_group", "group", "/help");
+        let (_, group_reply) = handle_shared_frame(&db, &group, 1_000).await.unwrap();
+        assert!(group_reply.is_none());
+        assert!(db
+            .user_by_feishu_open_id("ou_group")
+            .await
+            .unwrap()
+            .is_none());
+
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('web', 'hash')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let web_id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'web'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let (code, _) = db.issue_bind_code(web_id, 1_000).await.unwrap();
+        let hello = text_event("om_hello", "ou_bind", "oc_bind", "p2p", "你好");
+        handle_shared_frame(&db, &hello, 1_000).await.unwrap();
+        let bind = text_event(
+            "om_bind",
+            "ou_bind",
+            "oc_bind",
+            "p2p",
+            &format!("/bind {code}"),
+        );
+        let (_, bound) = handle_shared_frame(&db, &bind, 1_000).await.unwrap();
+        assert!(bound.unwrap().1.contains("绑定成功"));
+        let web = db.user_by_id(web_id).await.unwrap().unwrap();
+        assert_eq!(web.feishu_open_id, "ou_bind");
+        assert_eq!(web.feishu_chat_id, "oc_bind");
+    }
+
+    fn text_event(id: &str, open_id: &str, chat_id: &str, chat_type: &str, text: &str) -> Vec<u8> {
+        event_frame(
+            &serde_json::to_vec(&json!({
+                "header": {"event_type": "im.message.receive_v1"},
+                "event": {
+                    "sender": {"sender_id": {"open_id": open_id}},
+                    "message": {
+                        "message_id": id,
+                        "chat_id": chat_id,
+                        "chat_type": chat_type,
+                        "message_type": "text",
+                        "content": serde_json::to_string(&json!({"text": text})).unwrap()
+                    }
+                }
+            }))
+            .unwrap(),
+        )
     }
 }

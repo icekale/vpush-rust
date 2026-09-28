@@ -98,36 +98,52 @@ pub async fn handle_message(
         return Ok(None);
     }
 
-    let command = parse_command(text);
     let user = db
         .get_or_create_telegram_user(chat_id, &message.display_name, true)
         .await
         .map_err(catalog_error)?
         .ok_or_else(|| "Telegram 私聊身份无效".to_string())?;
-    let result = match command {
-        Some(Command::Start(Some(code)) | Command::Bind(code)) => {
-            bind(db, chat_id, &code, now).await
-        }
-        Some(Command::Start(None)) => Ok(response_with_keyboard(
-            "欢迎使用 VPush。\n\n".to_owned() + help_text(),
-            start_keyboard(),
-        )),
-        Some(Command::Help) => Ok(response_with_keyboard(help_text(), common_keyboard())),
-        Some(Command::List(page)) => list(db, &user, page).await,
-        Some(Command::Search(keyword)) => search(db, &user, &keyword).await,
-        Some(Command::Subscribe(reference, kind)) => subscribe(db, &user, &reference, &kind).await,
-        Some(Command::Unsubscribe(reference)) => unsubscribe(db, &user, &reference).await,
-        Some(Command::MySubscriptions) => my_subscriptions(db, &user).await,
-        Some(Command::Ask(platform, raw, name)) => {
-            ask(db, &user, &platform, &raw, &name, now).await
-        }
-        None => Ok(response(help_text())),
+    let result = if let Some(code) = bind_request(text) {
+        bind(db, chat_id, &code, now).await
+    } else {
+        Ok(reply_for(db, &user, text, now).await)
     };
     let response = match result {
         Ok(response) => response,
         Err(message) => response(message),
     };
     Ok(Some(response))
+}
+
+pub fn bind_request(text: &str) -> Option<String> {
+    match parse_command(text) {
+        Some(Command::Bind(code) | Command::Start(Some(code))) => Some(code),
+        _ => None,
+    }
+}
+
+pub async fn reply_for(db: &Db, user: &User, text: &str, now: i64) -> TelegramResponse {
+    let result = match parse_command(text) {
+        Some(Command::Start(Some(_)) | Command::Bind(_)) => {
+            Ok(response("请发送网页生成的绑定码。"))
+        }
+        Some(Command::Start(None)) => Ok(response_with_keyboard(
+            "欢迎使用 VPush。\n\n".to_owned() + help_text(),
+            start_keyboard(),
+        )),
+        Some(Command::Help) => Ok(response_with_keyboard(help_text(), common_keyboard())),
+        Some(Command::List(page)) => list(db, user, page).await,
+        Some(Command::Search(keyword)) => search(db, user, &keyword).await,
+        Some(Command::Subscribe(reference, kind)) => subscribe(db, user, &reference, &kind).await,
+        Some(Command::Unsubscribe(reference)) => unsubscribe(db, user, &reference).await,
+        Some(Command::MySubscriptions) => my_subscriptions(db, user).await,
+        Some(Command::Ask(platform, raw, name)) => ask(db, user, &platform, &raw, &name, now).await,
+        None => Ok(response(help_text())),
+    };
+    match result {
+        Ok(response) => response,
+        Err(message) => response(message),
+    }
 }
 
 pub async fn handle_callback(
@@ -1211,7 +1227,7 @@ fn display_name(item: &Value) -> &str {
         .unwrap_or("订阅源")
 }
 
-fn normalize_bind_code(raw: &str) -> Option<String> {
+pub fn normalize_bind_code(raw: &str) -> Option<String> {
     let normalized: String = raw
         .chars()
         .filter(|character| !character.is_ascii_whitespace())

@@ -2768,6 +2768,85 @@ impl Db {
         Err(CatalogError::Bad("无法分配 Telegram 用户名"))
     }
 
+    pub async fn user_by_feishu_open_id(&self, open_id: &str) -> Result<Option<User>, sqlx::Error> {
+        let row =
+            sqlx::query("SELECT * FROM users WHERE feishu_open_id = ? AND feishu_open_id != ''")
+                .bind(open_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(user_from_row))
+    }
+
+    pub async fn upsert_feishu_identity(
+        &self,
+        open_id: &str,
+        chat_id: &str,
+        display_name: &str,
+    ) -> Result<User, CatalogError> {
+        let open_id = feishu_identity(open_id)?;
+        let chat_id = feishu_identity(chat_id)?;
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query("SELECT * FROM users WHERE feishu_open_id = ? LIMIT 2")
+            .bind(open_id)
+            .fetch_all(&mut *tx)
+            .await?;
+        if existing.len() > 1 {
+            return Err(CatalogError::Bad("飞书身份重复"));
+        }
+        if let Some(row) = existing.into_iter().next() {
+            let user = user_from_row(row);
+            if user.feishu_chat_id != chat_id {
+                sqlx::query("UPDATE users SET feishu_chat_id = ? WHERE id = ?")
+                    .bind(chat_id)
+                    .bind(user.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+            tx.commit().await?;
+            return self
+                .user_by_id(user.id)
+                .await?
+                .ok_or(CatalogError::Bad("飞书用户不存在"));
+        }
+        let preferred: String = display_name.trim().chars().take(30).collect();
+        let fallback: String = format!("fs_{open_id}").chars().take(30).collect();
+        for candidate in [preferred.as_str(), fallback.as_str()] {
+            if candidate.is_empty() {
+                continue;
+            }
+            let inserted = sqlx::query(
+                "INSERT OR IGNORE INTO users (username, feishu_open_id, feishu_chat_id) VALUES (?, ?, ?)",
+            )
+            .bind(candidate)
+            .bind(open_id)
+            .bind(chat_id)
+            .execute(&mut *tx)
+            .await?;
+            if inserted.rows_affected() != 0 {
+                let row = sqlx::query("SELECT * FROM users WHERE feishu_open_id = ?")
+                    .bind(open_id)
+                    .fetch_one(&mut *tx)
+                    .await?;
+                tx.commit().await?;
+                return Ok(user_from_row(row));
+            }
+        }
+        Err(CatalogError::Bad("无法分配飞书用户名"))
+    }
+
+    pub async fn release_feishu_placeholder(&self, open_id: &str) -> Result<bool, sqlx::Error> {
+        let removed = sqlx::query(
+            "DELETE FROM users WHERE feishu_open_id = ? AND password_hash = '' AND is_admin = 0
+             AND telegram_chat_id = '' AND wechat_openid = ''
+             AND NOT EXISTS (SELECT 1 FROM subscriptions WHERE user_id = users.id)
+             AND NOT EXISTS (SELECT 1 FROM feishu_personal_bots WHERE user_id = users.id)",
+        )
+        .bind(open_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(removed.rows_affected() != 0)
+    }
+
     pub async fn user_by_openid(&self, openid: &str) -> Result<Option<User>, sqlx::Error> {
         let row =
             sqlx::query("SELECT * FROM users WHERE wechat_openid = ? AND wechat_openid != ''")
@@ -8062,6 +8141,19 @@ pub struct KolPatch<'a> {
     pub original_only: Option<bool>,
     pub recommend_weight: Option<i64>,
     pub visible_users: Option<&'a [String]>,
+}
+
+fn feishu_identity(value: &str) -> Result<&str, CatalogError> {
+    let value = value.trim();
+    if (1..=80).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        Ok(value)
+    } else {
+        Err(CatalogError::Bad("飞书身份无效"))
+    }
 }
 
 #[derive(Debug)]

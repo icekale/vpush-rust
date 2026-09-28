@@ -248,6 +248,13 @@ async fn send_shared(db: &Db, user_id: i64, message: Message<'_>) -> Result<(), 
     }
 }
 
+pub async fn send_shared_text(chat_id: &str, text: &str) -> Result<(), String> {
+    let Some((app_id, secret)) = shared_app() else {
+        return Err("未配置飞书应用".into());
+    };
+    send_text_im(&app_id, &secret, "feishu", chat_id, "", text).await
+}
+
 fn shared_app() -> Option<(String, String)> {
     let app_id = std::env::var("FEISHU_APP_ID").unwrap_or_default();
     let secret = std::env::var("FEISHU_APP_SECRET").unwrap_or_default();

@@ -42,8 +42,11 @@ pub async fn test_user(
             Err(err) => results.push(outcome("telegram", Err(err))),
         }
     }
-    if picked.feishu && crate::feishu::configured(db).await.unwrap_or(false) {
-        results.push(outcome("feishu", crate::feishu::send_text(db, &text).await));
+    if picked.feishu {
+        results.push(outcome(
+            "feishu",
+            crate::feishu::deliver_text(db, user.id, &text).await,
+        ));
     }
     if picked.webpush && db.webpush_count(user.id).await.unwrap_or(0) > 0 {
         results.push(outcome(
@@ -89,9 +92,12 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
         send_telegram(&token, &user.telegram_chat_id, text).await?;
         sent = true;
     }
-    if picked.feishu && crate::feishu::configured(db).await.unwrap_or(false) {
-        crate::feishu::send_text(db, text).await?;
-        sent = true;
+    if picked.feishu {
+        match crate::feishu::deliver_text(db, user_id, text).await {
+            Ok(()) => sent = true,
+            Err(err) if err == "飞书未绑定" => {}
+            Err(err) => return Err(err),
+        }
     }
     if picked.webpush && db.webpush_count(user_id).await.unwrap_or(0) > 0 {
         crate::webpush::send_text(db, user_id, text).await?;
@@ -115,7 +121,6 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     let rich_messages = telegram_rich_messages(db).await;
     let now = beijing_minutes();
     let telegram_post = load_telegram_identity(db, kol_id, note.platform, note.external_id).await;
-    let mut want_feishu = false;
     for target in &targets {
         if !target.notify_enabled || dnd_blocks(target, now) {
             continue;
@@ -235,7 +240,32 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             }
         }
         if channels.feishu {
-            want_feishu = true;
+            match crate::feishu::deliver_user(db, target.user_id, note).await {
+                Ok(()) => {
+                    remember_success(
+                        db,
+                        kol_id,
+                        (note.platform, note.external_id),
+                        "feishu",
+                        target.user_id,
+                    )
+                    .await;
+                }
+                Err(err) => {
+                    tracing::warn!(kol = kol_id, user = target.user_id, "飞书推送失败: {err}");
+                    note_push_failure(db, &format!("飞书：{err}")).await;
+                    remember_failure_logged(
+                        db,
+                        kol_id,
+                        (note.platform, note.external_id),
+                        "feishu",
+                        target.user_id,
+                        &err,
+                        unix,
+                    )
+                    .await;
+                }
+            }
         }
         if channels.webpush {
             if let Err(err) =
@@ -265,9 +295,6 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             }
         }
     }
-    if !want_feishu {
-        return;
-    }
     if let Err(err) = crate::feishu::notify(
         db,
         Note {
@@ -283,24 +310,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     )
     .await
     {
-        tracing::warn!(kol = kol_id, "飞书推送失败: {err}");
-        note_push_failure(db, &format!("飞书：{err}")).await;
-        let unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|item| item.as_secs() as i64)
-            .unwrap_or(0);
-        remember_failure_logged(
-            db,
-            kol_id,
-            (note.platform, note.external_id),
-            "feishu",
-            0,
-            &err,
-            unix,
-        )
-        .await;
-    } else {
-        remember_success(db, kol_id, (note.platform, note.external_id), "feishu", 0).await;
+        tracing::warn!(kol = kol_id, "飞书群机器人失败: {err}");
     }
 }
 
@@ -445,8 +455,7 @@ where
         let external_id: String = row.get("external_id");
         let post_id: i64 = row.get("post_id");
         let attempts: i64 = row.get("attempts");
-        if channel != "feishu" {
-            let quiet = sqlx::query(
+        let quiet = sqlx::query(
                 "SELECT u.dnd_start, u.dnd_end, u.dnd_allow_favorite, COALESCE(s.favorite, 0) AS favorite
                  FROM users u JOIN posts p ON p.id = ?
                  LEFT JOIN subscriptions s ON s.user_id = u.id AND s.kol_id = p.kol_id
@@ -456,22 +465,22 @@ where
             .bind(user_id)
             .fetch_optional(db.pool())
             .await?;
-            if let Some(quiet) = quiet {
-                let target = PushTarget {
-                    notify_enabled: true,
-                    push_channels: String::new(),
-                    dnd_start: quiet.get("dnd_start"),
-                    dnd_end: quiet.get("dnd_end"),
-                    dnd_allow_favorite: quiet.get::<i64, _>("dnd_allow_favorite") != 0,
-                    favorite: quiet.get::<i64, _>("favorite") != 0,
-                    wecom_webhook: String::new(),
-                    bark_key: String::new(),
-                    user_id,
-                    telegram_chat_id: String::new(),
-                    telegram_bot_token: String::new(),
-                };
-                if dnd_blocks(&target, beijing_minutes()) {
-                    sqlx::query("UPDATE push_retries SET next_at = ? WHERE channel = ? AND user_id = ? AND platform = ? AND external_id = ?")
+        if let Some(quiet) = quiet {
+            let target = PushTarget {
+                notify_enabled: true,
+                push_channels: String::new(),
+                dnd_start: quiet.get("dnd_start"),
+                dnd_end: quiet.get("dnd_end"),
+                dnd_allow_favorite: quiet.get::<i64, _>("dnd_allow_favorite") != 0,
+                favorite: quiet.get::<i64, _>("favorite") != 0,
+                wecom_webhook: String::new(),
+                bark_key: String::new(),
+                user_id,
+                telegram_chat_id: String::new(),
+                telegram_bot_token: String::new(),
+            };
+            if dnd_blocks(&target, beijing_minutes()) {
+                sqlx::query("UPDATE push_retries SET next_at = ? WHERE channel = ? AND user_id = ? AND platform = ? AND external_id = ?")
                         .bind(now + 60)
                         .bind(&channel)
                         .bind(user_id)
@@ -479,8 +488,7 @@ where
                         .bind(&external_id)
                         .execute(db.pool())
                         .await?;
-                    continue;
-                }
+                continue;
             }
         }
         let subscribed: i64 = sqlx::query_scalar(
@@ -491,7 +499,7 @@ where
         .bind(post_id)
         .fetch_one(db.pool())
         .await?;
-        if channel != "feishu" && subscribed == 0 {
+        if subscribed == 0 {
             sqlx::query("DELETE FROM push_retries WHERE channel = ? AND user_id = ? AND platform = ? AND external_id = ?")
                 .bind(&channel)
                 .bind(user_id)
@@ -608,7 +616,7 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
                 .await
             }
             "webpush" => crate::webpush::send_text(db, user_id, &text).await,
-            "feishu" => crate::feishu::send_text(db, &text).await,
+            "feishu" => crate::feishu::deliver_text(db, user_id, &text).await,
             _ => Err("未知渠道".into()),
         }
     })

@@ -101,6 +101,13 @@ pub struct FeishuBot {
     pub app_id: String,
 }
 
+pub struct FeishuRoute {
+    pub app_id: String,
+    pub app_secret_ciphertext: String,
+    pub chat_id: String,
+    pub tenant_brand: String,
+}
+
 fn feishu_session_from_row(row: sqlx::sqlite::SqliteRow) -> FeishuSession {
     FeishuSession {
         session_id: row.get("session_id"),
@@ -3365,6 +3372,40 @@ impl Db {
         .bind(brand)
         .bind(open_id)
         .bind(chat_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn active_feishu_route(
+        &self,
+        user_id: i64,
+    ) -> Result<Option<FeishuRoute>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT app_id, app_secret_ciphertext, chat_id, tenant_brand
+             FROM feishu_personal_bots
+             WHERE user_id = ? AND status = 'active' AND chat_id != ''",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|row| FeishuRoute {
+            app_id: row.get("app_id"),
+            app_secret_ciphertext: row.get("app_secret_ciphertext"),
+            chat_id: row.get("chat_id"),
+            tenant_brand: row.get("tenant_brand"),
+        }))
+    }
+
+    pub async fn degrade_feishu_bot(&self, user_id: i64, error: &str) -> Result<(), sqlx::Error> {
+        let error: String = error.chars().take(300).collect();
+        sqlx::query(
+            "UPDATE feishu_personal_bots
+             SET status = 'degraded', last_error = ?
+             WHERE user_id = ? AND status = 'active'",
+        )
+        .bind(error)
+        .bind(user_id)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -8942,13 +8983,11 @@ mod tests {
             0
         );
         assert_eq!(
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COUNT(*) FROM subscriptions WHERE user_id = ?",
-            )
-            .bind(reader.id)
-            .fetch_one(db.pool())
-            .await
-            .unwrap(),
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM subscriptions WHERE user_id = ?",)
+                .bind(reader.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap(),
             0
         );
         assert!(db.list_admin_logs(20).await.unwrap().is_empty());
@@ -8963,9 +9002,9 @@ mod tests {
             .unwrap();
         assert!(approved.kol_id.is_some());
         let logs = db.list_admin_logs(20).await.unwrap();
-        assert!(logs.iter().any(|log| {
-            log["user_id"] == admin.id && log["action"] == "approve_kol_request"
-        }));
+        assert!(logs
+            .iter()
+            .any(|log| { log["user_id"] == admin.id && log["action"] == "approve_kol_request" }));
 
         let rejected = db
             .add_kol_request_without_category("weibo", "901", reader.id, "")
@@ -8977,9 +9016,9 @@ mod tests {
             .await
             .is_err());
         let logs = db.list_admin_logs(20).await.unwrap();
-        assert!(logs.iter().any(|log| {
-            log["user_id"] == admin.id && log["action"] == "reject_kol_request"
-        }));
+        assert!(logs
+            .iter()
+            .any(|log| { log["user_id"] == admin.id && log["action"] == "reject_kol_request" }));
         assert_eq!(
             sqlx::query_scalar::<_, i64>(
                 "SELECT COUNT(*) FROM kols WHERE platform = 'weibo' AND external_id = '901'",

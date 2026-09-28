@@ -28,6 +28,8 @@ pub struct TelegramCallback {
     pub chat_type: TelegramChatType,
     pub message_id: i64,
     pub data: String,
+    pub message_text: String,
+    pub message_keyboard: Vec<Vec<TelegramButton>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +42,7 @@ pub struct TelegramEditMessage {
 pub struct TelegramButton {
     pub text: String,
     pub callback_data: String,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +118,9 @@ pub async fn handle_message(
         Some(Command::Subscribe(reference, kind)) => subscribe(db, &user, &reference, &kind).await,
         Some(Command::Unsubscribe(reference)) => unsubscribe(db, &user, &reference).await,
         Some(Command::MySubscriptions) => my_subscriptions(db, &user).await,
-        Some(Command::Ask(platform, raw, name)) => ask(db, &user, &platform, &raw, &name, now).await,
+        Some(Command::Ask(platform, raw, name)) => {
+            ask(db, &user, &platform, &raw, &name, now).await
+        }
         None => Ok(response(help_text())),
     };
     let response = match result {
@@ -152,7 +157,7 @@ pub async fn handle_callback(
             false,
         )));
     };
-    let result = dispatch_callback(db, &user, callback.data.trim()).await;
+    let result = dispatch_callback(db, &user, &callback).await;
     let (response, edit) = match result {
         Ok((response, edit)) => (response, edit),
         Err(message) => (response(message), false),
@@ -163,8 +168,9 @@ pub async fn handle_callback(
 async fn dispatch_callback(
     db: &Db,
     user: &User,
-    data: &str,
+    callback: &TelegramCallback,
 ) -> Result<(TelegramResponse, bool), String> {
+    let data = callback.data.trim();
     let mut parts = data.split(':');
     let action = parts.next().unwrap_or_default();
     match action {
@@ -175,7 +181,13 @@ async fn dispatch_callback(
             callback_subscribe(db, user, parts.next().unwrap_or_default()).await
         }
         "unsub" if parts.clone().count() == 1 => {
-            callback_unsubscribe(db, user, parts.next().unwrap_or_default()).await
+            callback_unsub(db, user, callback, parts.next().unwrap_or_default()).await
+        }
+        "sec" if parts.clone().count() == 1 => {
+            callback_secondary(db, user, callback, parts.next().unwrap_or_default()).await
+        }
+        "secundo" | "unsubundo" if parts.clone().count() == 1 => {
+            callback_undo(db, user, callback, action, parts.next().unwrap_or_default()).await
         }
         "approve" if user.is_admin && parts.clone().count() == 1 => {
             callback_approve(db, user, parts.next().unwrap_or_default()).await
@@ -193,7 +205,6 @@ async fn dispatch_callback(
             callback_reject(db, user, parts.next().unwrap_or_default()).await
         }
         "approve" | "apcat" | "reject" => Err("仅管理员可以处理申请".into()),
-        "sec" | "secundo" | "unsubundo" => Ok((response("此按钮将在富消息支持后可用。"), false)),
         _ => Ok((response("按钮已失效，请重新发送 /list。"), false)),
     }
 }
@@ -291,13 +302,220 @@ async fn callback_subscribe(
     ))
 }
 
-async fn callback_unsubscribe(
+const UNDO_TTL_SECS: u64 = 30;
+
+struct UndoAction {
+    at: std::time::SystemTime,
+    kind: &'static str,
+    kol_id: i64,
+    subscribe_type: String,
+    favorite: bool,
+    secondary: bool,
+    text: String,
+    keyboard: Vec<Vec<TelegramButton>>,
+}
+
+fn undo_key(chat_id: &str, message_id: i64) -> String {
+    format!("{chat_id}:{message_id}")
+}
+
+fn undo_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, UndoAction>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, UndoAction>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn remember_undo(callback: &TelegramCallback, action: UndoAction) {
+    let mut store = undo_store().lock().unwrap_or_else(|err| err.into_inner());
+    store.insert(undo_key(&callback.chat_id, callback.message_id), action);
+}
+
+fn take_undo(callback: &TelegramCallback, kol_id: i64, kind: &str) -> Result<UndoAction, String> {
+    let mut store = undo_store().lock().unwrap_or_else(|err| err.into_inner());
+    let key = undo_key(&callback.chat_id, callback.message_id);
+    let Some(action) = store.remove(&key) else {
+        return Err("撤销超时或操作已失效（30 秒内可撤销）".into());
+    };
+    let fresh = action
+        .at
+        .elapsed()
+        .is_ok_and(|age| age.as_secs() <= UNDO_TTL_SECS);
+    if !fresh || action.kol_id != kol_id || action.kind != kind {
+        return Err("撤销超时或操作已失效（30 秒内可撤销）".into());
+    }
+    Ok(action)
+}
+
+async fn callback_unsub(
     db: &Db,
     user: &User,
+    callback: &TelegramCallback,
     raw_id: &str,
 ) -> Result<(TelegramResponse, bool), String> {
     let id = callback_id(Some(raw_id), None)?;
-    callback_unsubscribe_id(db, user, id).await
+    let kol = db
+        .kol_for(user.id, user.is_admin, id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "订阅源不存在或不可见".to_string())?;
+    if !is_subscribed(&kol) {
+        return Err("尚未订阅该订阅源".into());
+    }
+    let kind = kol
+        .get("subscribe_type")
+        .and_then(Value::as_str)
+        .unwrap_or("post")
+        .to_owned();
+    let favorite = kol
+        .get("favorite")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let secondary = kol
+        .get("secondary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    db.unsubscribe(user.id, id)
+        .await
+        .map_err(|err| err.to_string())?;
+    let name = display_name(&kol);
+    remember_undo(
+        callback,
+        UndoAction {
+            at: std::time::SystemTime::now(),
+            kind: "unsub",
+            kol_id: id,
+            subscribe_type: kind,
+            favorite,
+            secondary,
+            text: callback.message_text.clone(),
+            keyboard: callback.message_keyboard.clone(),
+        },
+    );
+    let text = if callback.message_text.is_empty() {
+        format!("已取消订阅 {name}。")
+    } else {
+        callback.message_text.clone()
+    };
+    Ok((
+        response_with_keyboard(
+            text,
+            Some(vec![vec![button(
+                &format!("撤销退订「{name}」"),
+                format!("unsubundo:{id}"),
+            )]]),
+        ),
+        true,
+    ))
+}
+
+async fn callback_secondary(
+    db: &Db,
+    user: &User,
+    callback: &TelegramCallback,
+    raw_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let id = callback_id(Some(raw_id), None)?;
+    let kol = db
+        .kol_for(user.id, user.is_admin, id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "订阅源不存在或不可见".to_string())?;
+    let name = display_name(&kol);
+    if !is_subscribed(&kol) {
+        return Ok((response(format!("未订阅「{name}」，无法设置次要")), true));
+    }
+    let was_secondary = kol
+        .get("secondary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    db.set_secondary(user.id, id, !was_secondary)
+        .await
+        .map_err(catalog_error)?;
+    remember_undo(
+        callback,
+        UndoAction {
+            at: std::time::SystemTime::now(),
+            kind: "sec",
+            kol_id: id,
+            subscribe_type: String::new(),
+            favorite: false,
+            secondary: was_secondary,
+            text: callback.message_text.clone(),
+            keyboard: callback.message_keyboard.clone(),
+        },
+    );
+    let text = if was_secondary {
+        format!("已恢复实时推送：「{name}」")
+    } else {
+        format!("已设为次要：「{name}」新帖合并推送")
+    };
+    Ok((
+        response_with_keyboard(
+            text,
+            Some(vec![vec![button("撤销", format!("secundo:{id}"))]]),
+        ),
+        true,
+    ))
+}
+
+async fn callback_undo(
+    db: &Db,
+    user: &User,
+    callback: &TelegramCallback,
+    action: &str,
+    raw_id: &str,
+) -> Result<(TelegramResponse, bool), String> {
+    let id = callback_id(Some(raw_id), None)?;
+    let kind = if action == "unsubundo" {
+        "unsub"
+    } else {
+        "sec"
+    };
+    let saved = match take_undo(callback, id, kind) {
+        Ok(saved) => saved,
+        Err(message) => return Ok((response(message), true)),
+    };
+    if kind == "unsub" {
+        db.subscribe(user.id, user.is_admin, id, &saved.subscribe_type)
+            .await
+            .map_err(catalog_error)?;
+        db.set_favorite(user.id, id, saved.favorite)
+            .await
+            .map_err(catalog_error)?;
+        db.set_secondary(user.id, id, saved.secondary)
+            .await
+            .map_err(catalog_error)?;
+    } else {
+        db.set_secondary(user.id, id, saved.secondary)
+            .await
+            .map_err(catalog_error)?;
+    }
+    let text = if saved.text.is_empty() {
+        "已撤销".to_owned()
+    } else {
+        saved.text
+    };
+    Ok((
+        response_with_keyboard(text, Some(saved.keyboard).filter(|rows| !rows.is_empty())),
+        true,
+    ))
+}
+
+fn button(text: &str, callback_data: String) -> TelegramButton {
+    TelegramButton {
+        text: text.to_owned(),
+        callback_data,
+        url: String::new(),
+    }
+}
+
+#[cfg(test)]
+fn expire_undo(chat_id: &str, message_id: i64) {
+    let mut store = undo_store().lock().unwrap_or_else(|err| err.into_inner());
+    if let Some(action) = store.get_mut(&undo_key(chat_id, message_id)) {
+        action.at = std::time::SystemTime::UNIX_EPOCH;
+    }
 }
 
 async fn callback_unsubscribe_id(
@@ -341,7 +559,10 @@ async fn callback_approve(
         let Some(category_id) = category.get("id").and_then(Value::as_i64) else {
             continue;
         };
-        let name = category.get("name").and_then(Value::as_str).unwrap_or("分类");
+        let name = category
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("分类");
         let mut row = Vec::new();
         push_button(&mut row, name, format!("apcat:{request_id}:{category_id}"));
         if !row.is_empty() {
@@ -475,7 +696,10 @@ async fn ask(
         .find(|item| item["id"].as_i64() == Some(request_id))
         .ok_or_else(|| "申请已创建但读取失败".to_string())?;
     let requester = request["requester"].as_str().unwrap_or("Telegram 用户");
-    let display = request["name"].as_str().filter(|value| !value.is_empty()).unwrap_or(raw);
+    let display = request["name"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .unwrap_or(raw);
     let text = format!(
         "收到添加申请 #{request_id}：{}（{}:{}），申请人：{}。",
         display,
@@ -597,9 +821,7 @@ fn parse_ask(args: &[&str]) -> Option<Command> {
         "xueqiu" | "雪球" => ("xueqiu", args.get(1).copied()?, 2),
         "weibo" | "微博" => ("weibo", args.get(1).copied()?, 2),
         _ if args[0].contains("xueqiu.com") => ("xueqiu", args[0], 1),
-        _ if args[0].contains("weibo.com") || args[0].contains("weibo.cn") => {
-            ("weibo", args[0], 1)
-        }
+        _ if args[0].contains("weibo.com") || args[0].contains("weibo.cn") => ("weibo", args[0], 1),
         _ => return None,
     };
     if raw.is_empty() || args.len() > name_start + 4 {
@@ -948,6 +1170,7 @@ fn push_button(row: &mut Vec<TelegramButton>, text: &str, callback_data: String)
         row.push(TelegramButton {
             text: text.to_owned(),
             callback_data,
+            url: String::new(),
         });
     }
 }
@@ -1065,6 +1288,8 @@ mod tests {
             chat_type: TelegramChatType::Private,
             message_id: 17,
             data: data.into(),
+            message_text: String::new(),
+            message_keyboard: Vec::new(),
         }
     }
 
@@ -1076,7 +1301,77 @@ mod tests {
             chat_type: TelegramChatType::Private,
             message_id: 18,
             data: data.into(),
+            message_text: String::new(),
+            message_keyboard: Vec::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn secondary_and_unsubscribe_buttons_undo_within_thirty_seconds() {
+        let db = db().await;
+        let id = db
+            .add_kol("weibo", "Alpha", "alpha", None, false, false, false)
+            .await
+            .unwrap();
+        handle_message(&db, private("/help"), 1_000).await.unwrap();
+        db.subscribe(1, false, id, "both").await.unwrap();
+        db.set_favorite(1, id, true).await.unwrap();
+        let mut callback = callback(&format!("sec:{id}"));
+        callback.message_id = 900;
+        callback.message_text = "通知正文".into();
+        callback.message_keyboard = vec![vec![button("原文", String::new())]];
+        callback.message_keyboard[0][0].url = "https://example.com/1".into();
+        callback.message_keyboard[0][0].callback_data.clear();
+
+        let toggled = handle_callback(&db, callback.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(toggled.text.contains("已设为次要"));
+        assert!(db.my_subscriptions(1).await.unwrap()[0]["secondary"]
+            .as_bool()
+            .unwrap());
+
+        callback.data = format!("secundo:{id}");
+        let restored = handle_callback(&db, callback.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.text, "通知正文");
+        assert_eq!(
+            restored.keyboard.unwrap()[0][0].url,
+            "https://example.com/1"
+        );
+        assert!(!db.my_subscriptions(1).await.unwrap()[0]["secondary"]
+            .as_bool()
+            .unwrap());
+
+        callback.data = format!("unsub:{id}");
+        let removed = handle_callback(&db, callback.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.text, "通知正文");
+        assert!(db.my_subscriptions(1).await.unwrap().is_empty());
+        callback.data = format!("unsubundo:{id}");
+        handle_callback(&db, callback.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let sub = &db.my_subscriptions(1).await.unwrap()[0];
+        assert_eq!(sub["subscribe_type"], "both");
+        assert!(sub["favorite"].as_bool().unwrap());
+
+        callback.data = format!("unsub:{id}");
+        handle_callback(&db, callback.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        expire_undo(&callback.chat_id, callback.message_id);
+        callback.data = format!("unsubundo:{id}");
+        let expired = handle_callback(&db, callback).await.unwrap().unwrap();
+        assert!(expired.text.contains("撤销超时"));
+        assert!(db.my_subscriptions(1).await.unwrap().is_empty());
     }
 
     #[test]
@@ -1689,14 +1984,10 @@ mod tests {
             .unwrap();
         let category = db.add_category("宏观").await.unwrap();
 
-        let xueqiu = handle_message(
-            &db,
-            private("/ask xueqiu 4514680565 Alpha"),
-            1_000,
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        let xueqiu = handle_message(&db, private("/ask xueqiu 4514680565 Alpha"), 1_000)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(xueqiu.text.contains("申请已提交"));
         assert_eq!(xueqiu.notifications.len(), 1);
         assert_eq!(xueqiu.notifications[0].chat_id, "admin-chat");
@@ -1817,11 +2108,7 @@ mod tests {
 
         let repeated = handle_callback(
             &db,
-            callback_for(
-                &format!("apcat:{request_id}:0"),
-                "admin-chat",
-                "admin-chat",
-            ),
+            callback_for(&format!("apcat:{request_id}:0"), "admin-chat", "admin-chat"),
         )
         .await
         .unwrap()
@@ -1829,9 +2116,9 @@ mod tests {
         assert!(repeated.text.contains("已处理"));
         assert_eq!(db.my_subscriptions(applicant.id).await.unwrap().len(), 1);
         let logs = db.list_admin_logs(20).await.unwrap();
-        assert!(logs.iter().any(|log| {
-            log["user_id"] == admin.id && log["action"] == "approve_kol_request"
-        }));
+        assert!(logs
+            .iter()
+            .any(|log| { log["user_id"] == admin.id && log["action"] == "approve_kol_request" }));
 
         let reject_applicant = handle_message(
             &db,
@@ -1847,7 +2134,10 @@ mod tests {
         .unwrap();
         assert!(reject_applicant.text.contains("申请已提交"));
         let reject_user = db.user_by_telegram_chat_id("43").await.unwrap().unwrap();
-        let rejected_id = db.list_kol_requests("pending", reject_user.id).await.unwrap()[0]["id"]
+        let rejected_id = db
+            .list_kol_requests("pending", reject_user.id)
+            .await
+            .unwrap()[0]["id"]
             .as_i64()
             .unwrap();
         let rejected = handle_callback(
@@ -1897,7 +2187,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(db.user_by_telegram_chat_id("duplicate-chat").await.unwrap().is_none());
+        assert!(db
+            .user_by_telegram_chat_id("duplicate-chat")
+            .await
+            .unwrap()
+            .is_none());
         assert!(db
             .get_or_create_telegram_user("duplicate-chat", "Duplicate", true)
             .await

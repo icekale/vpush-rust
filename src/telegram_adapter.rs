@@ -128,8 +128,69 @@ fn parse_callback(update_id: i64, value: &Value) -> Result<Option<BotUpdate>, St
             chat_type: TelegramChatType::Private,
             message_id,
             data: data.to_owned(),
+            message_text: message
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned(),
+            message_keyboard: inline_keyboard(message),
         },
     }))
+}
+
+fn inline_keyboard(message: &Value) -> Vec<Vec<TelegramButton>> {
+    let Some(rows) = message
+        .get("reply_markup")
+        .and_then(|markup| markup.get("inline_keyboard"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    rows.iter()
+        .take(8)
+        .filter_map(|row| {
+            let row = row.as_array()?;
+            let buttons = row
+                .iter()
+                .take(8)
+                .filter_map(|button| {
+                    let text = button
+                        .get("text")
+                        .and_then(Value::as_str)?
+                        .chars()
+                        .take(64)
+                        .collect::<String>();
+                    if text.is_empty() {
+                        return None;
+                    }
+                    let url = button.get("url").and_then(Value::as_str).unwrap_or("");
+                    if !url.is_empty() {
+                        if url.len() > 500
+                            || url.contains('@')
+                            || !(url.starts_with("https://") || url.starts_with("http://"))
+                        {
+                            return None;
+                        }
+                        return Some(TelegramButton {
+                            text,
+                            callback_data: String::new(),
+                            url: url.to_owned(),
+                        });
+                    }
+                    let callback = button.get("callback_data").and_then(Value::as_str)?;
+                    if callback.is_empty() || callback.len() > 64 {
+                        return None;
+                    }
+                    Some(TelegramButton {
+                        text,
+                        callback_data: callback.to_owned(),
+                        url: String::new(),
+                    })
+                })
+                .collect::<Vec<_>>();
+            (!buttons.is_empty()).then_some(buttons)
+        })
+        .collect()
 }
 
 fn id_string(value: &Value) -> Option<String> {
@@ -188,12 +249,18 @@ fn add_keyboard(body: &mut Value, keyboard: Option<&Vec<Vec<TelegramButton>>>) {
         .iter()
         .map(|row| {
             row.iter()
-                .filter(|button| button.callback_data.len() <= MAX_CALLBACK_BYTES)
+                .filter(|button| {
+                    !button.url.is_empty() || button.callback_data.len() <= MAX_CALLBACK_BYTES
+                })
                 .map(|button| {
-                    json!({
-                        "text": button.text,
-                        "callback_data": button.callback_data,
-                    })
+                    if button.url.is_empty() {
+                        json!({
+                            "text": button.text,
+                            "callback_data": button.callback_data,
+                        })
+                    } else {
+                        json!({"text": button.text, "url": button.url})
+                    }
                 })
                 .collect()
         })
@@ -392,6 +459,8 @@ mod tests {
                     chat_type: TelegramChatType::Private,
                     message_id: 7,
                     data: "mysubs".into(),
+                    message_text: "old".into(),
+                    message_keyboard: Vec::new(),
                 },
             }
         );
@@ -423,10 +492,12 @@ mod tests {
                 TelegramButton {
                     text: "ok".into(),
                     callback_data: "list:1".into(),
+                    url: String::new(),
                 },
                 TelegramButton {
                     text: "bad".into(),
                     callback_data: "x".repeat(65),
+                    url: String::new(),
                 },
             ]]),
             notifications: Vec::new(),
@@ -482,6 +553,8 @@ mod tests {
                 chat_type: TelegramChatType::Private,
                 message_id: 7,
                 data: format!("sub:{source_id}"),
+                message_text: String::new(),
+                message_keyboard: Vec::new(),
             },
         };
         let calls = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
@@ -560,6 +633,8 @@ mod tests {
                 chat_type: TelegramChatType::Private,
                 message_id: 7,
                 data: "help".into(),
+                message_text: String::new(),
+                message_keyboard: Vec::new(),
             }
         )
         .await

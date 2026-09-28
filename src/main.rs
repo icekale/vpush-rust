@@ -28,6 +28,7 @@ mod tags;
 mod telegram_adapter;
 mod telegram_bot;
 mod telegram_poll;
+mod translate;
 mod truth;
 mod twitter;
 mod url_guard;
@@ -39,6 +40,7 @@ mod wscn;
 mod xincai;
 mod xq_crypto;
 mod xueqiu;
+mod zh_simp;
 mod zsxq;
 mod zsxq_file;
 

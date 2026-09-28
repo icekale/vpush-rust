@@ -1,8 +1,13 @@
 //! X 时间线。只用后台保存的 Cookie 打网页 GraphQL，拉第一页。
 //! queryId 每 6 小时从 x.com 的前端包读取。Cookie 通道走 Chrome 124 的 TLS 指纹。
 
+use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use hmac::{Hmac, Mac};
+use sha1::Sha1;
 
 use serde_json::{json, Value};
 
@@ -10,8 +15,19 @@ use crate::db::Db;
 
 const USER_TWEETS: &str = "T1x2zehUOKCWNpKwZCpnbg";
 const USER_BY_NAME: &str = "Gb-d6r0vxPOADdG62OEBpQ";
-const BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
-const FEATURES: &str = r#"{"responsive_web_graphql_timeline_navigation_enabled":true,"longform_notetweets_consumption_enabled":true,"view_counts_everywhere_api_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"tweetypie_unmention_optimization_enabled":true,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"longform_notetweets_rich_text_read_enabled":true}"#;
+pub(crate) const BEARER: &str = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA";
+const FEATURES: &str = r#"{"rweb_video_screen_enabled":false,"rweb_tipjar_consumption_enabled":true,"responsive_web_graphql_exclude_directive_enabled":true,"verified_phone_label_enabled":false,"creator_subscriptions_tweet_preview_api_enabled":true,"responsive_web_graphql_timeline_navigation_enabled":true,"responsive_web_graphql_skip_user_profile_image_extensions_enabled":false,"tweetypie_unmention_optimization_enabled":true,"responsive_web_edit_tweet_api_enabled":true,"graphql_is_translatable_rweb_tweet_is_translatable_enabled":true,"view_counts_everywhere_api_enabled":true,"longform_notetweets_consumption_enabled":true,"responsive_web_twitter_article_tweet_consumption_enabled":false,"tweet_awards_web_tipping_enabled":false,"freedom_of_speech_not_reach_fetch_enabled":true,"standardized_nudges_misinfo":true,"tweet_with_visibility_results_prefer_gql_limited_actions_policy_enabled":true,"rweb_video_timestamps_enabled":true,"longform_notetweets_rich_text_read_enabled":true,"responsive_web_enhance_cards_enabled":false}"#;
+const APP_CONSUMER_KEY: &str = "3nVuSoBZnx6U4vzUxf5w";
+const APP_CONSUMER_SECRET: &str = "Bcs59EFbbsdF6Sl9Ng71smgStWEGwXXKSjYvPVt7qys";
+const APP_UA: &str = "TwitterAndroid/12.27.1 (Android 14; com.twitter.android)";
+const CHANNEL_COOLDOWN: u64 = 900;
+
+type HmacSha1 = Hmac<Sha1>;
+
+struct AppAuth {
+    token: String,
+    secret: String,
+}
 
 struct Tweet {
     external_id: String,
@@ -48,21 +64,43 @@ async fn poll(db: &Db) -> Result<(), String> {
     if kols.is_empty() {
         return Ok(());
     }
-    let Some(cookie) = cookie(db).await? else {
-        tracing::info!("X 抓取跳过：未配置含 auth_token 和 ct0 的 twitter_cookie");
+    let cookie = cookie(db).await?;
+    let app = app_auth(db).await?;
+    if cookie.is_none() && app.is_none() {
+        tracing::info!("X 抓取跳过：未配置 Cookie 或 App 凭证");
         return Ok(());
-    };
+    }
     let exit = crate::proxy_admin::acquire(db, "twitter").await?;
     let proxy = exit.as_ref().map(|item| item.url.clone());
     let proxy_id = exit.map(|item| item.id);
-    refresh_ids(&cookie, proxy.as_deref()).await;
+    if let Some(cookie) = &cookie {
+        refresh_ids(cookie, proxy.as_deref()).await;
+    }
+    let has_app = app.is_some();
+    let has_cookie = cookie.is_some();
     for (id, name, external_id) in kols {
+        if channels_cooling(has_app, has_cookie) {
+            tracing::info!("X 通道正在 429 冷却，剩余账号跳过");
+            break;
+        }
         let screen = screen_name(&external_id);
         if screen.is_empty() {
             tracing::warn!(kol = id, "无法识别 X 用户名");
             continue;
         }
-        match pull(db, &cookie, id, &name, &screen, proxy.clone()).await {
+        let prefer = channel_for(id, has_app, has_cookie);
+        match pull(
+            db,
+            cookie.as_deref(),
+            app.as_ref(),
+            prefer,
+            id,
+            &name,
+            &screen,
+            proxy.clone(),
+        )
+        .await
+        {
             Ok(()) => {
                 crate::proxy_admin::note(db, proxy_id, true, "").await;
                 let _ = db.note_kol_fetch(id, None).await;
@@ -71,6 +109,9 @@ async fn poll(db: &Db) -> Result<(), String> {
                 crate::proxy_admin::note(db, proxy_id, false, &err).await;
                 let _ = db.note_kol_fetch(id, Some(&err)).await;
                 tracing::warn!(kol = id, "{err}");
+                if err.contains("429") {
+                    break;
+                }
             }
         }
     }
@@ -95,7 +136,9 @@ async fn cookie(db: &Db) -> Result<Option<String>, String> {
 
 async fn pull(
     db: &Db,
-    cookie: &str,
+    cookie: Option<&str>,
+    app: Option<&AppAuth>,
+    prefer: &str,
     kol_id: i64,
     name: &str,
     screen: &str,
@@ -103,24 +146,11 @@ async fn pull(
 ) -> Result<(), String> {
     let user_id = if screen.chars().all(|c| c.is_ascii_digit()) {
         screen.to_string()
+    } else if let Some(id) = cached_user(screen) {
+        id
     } else {
-        let looked = graphql(
-            cookie,
-            "UserByScreenName",
-            &current_id("UserByScreenName"),
-            &json!({"screen_name": screen, "withSafetyModeUserFields": true}),
-            proxy.as_deref(),
-        )
-        .await?;
-        let result = &looked["data"]["user"]["result"];
-        let id = field(result, "rest_id");
-        if id.is_empty() {
-            return Err(format!("X 未找到用户 {screen}"));
-        }
-        let avatar = result["avatar"]["image_url"]
-            .as_str()
-            .unwrap_or("")
-            .replace("_normal", "_400x400");
+        let (id, avatar) = resolve_user(cookie, app, prefer, screen, proxy.as_deref()).await?;
+        remember_user(screen, &id);
         if avatar.starts_with("https://") {
             db.set_avatar(kol_id, &avatar)
                 .await
@@ -130,6 +160,8 @@ async fn pull(
     };
     let data = graphql(
         cookie,
+        app,
+        prefer,
         "UserTweets",
         &current_id("UserTweets"),
         &json!({
@@ -163,11 +195,23 @@ async fn pull(
         }
         let images = serde_json::to_string(&tweet.images).unwrap_or_else(|_| "[]".into());
         let kind = if tweet.reply { "reply" } else { "post" };
-        db.save_fetched(
+        let raw_title: String = tweet.content.chars().take(80).collect();
+        let (title, content, title_src, content_src) = crate::translate::for_new_post(
+            db,
+            "twitter",
+            &tweet.external_id,
+            &raw_title,
+            &tweet.content,
+            proxy.as_deref(),
+        )
+        .await;
+        db.save_fetched_src(
             kol_id,
             &tweet.external_id,
-            &tweet.content.chars().take(80).collect::<String>(),
-            &tweet.content,
+            &title,
+            &content,
+            &title_src,
+            &content_src,
             kind,
             &images,
             &tweet.url,
@@ -191,8 +235,8 @@ async fn pull(
                 platform: "twitter",
                 external_id: &tweet.external_id,
                 post_type: kind,
-                title: &tweet.content.chars().take(80).collect::<String>(),
-                content: &tweet.content,
+                title: &title,
+                content: &content,
                 url: &tweet.url,
                 published_at: &tweet.published_at,
             },
@@ -202,17 +246,102 @@ async fn pull(
     Ok(())
 }
 
+async fn resolve_user(
+    cookie: Option<&str>,
+    app: Option<&AppAuth>,
+    prefer: &str,
+    screen: &str,
+    proxy: Option<&str>,
+) -> Result<(String, String), String> {
+    let mut prefer = prefer;
+    if prefer == "cookie" {
+        if let Some(cookie) = cookie {
+            match typeahead(cookie, screen, proxy).await {
+                Ok(Some(found)) => return Ok(found),
+                Ok(None) => {}
+                Err(err) if err.contains("429") => {
+                    mark_cooling("cookie");
+                    if app.is_none() {
+                        return Err(err);
+                    }
+                    prefer = "app";
+                }
+                Err(err) => tracing::warn!("X typeahead: {err}"),
+            }
+        }
+    }
+    let looked = graphql(
+        cookie,
+        app,
+        prefer,
+        "UserByScreenName",
+        &current_id("UserByScreenName"),
+        &json!({"screen_name": screen, "withSafetyModeUserFields": true}),
+        proxy,
+    )
+    .await?;
+    let result = &looked["data"]["user"]["result"];
+    let id = field(result, "rest_id");
+    if id.is_empty() {
+        return Err(format!("X 未找到用户 {screen}"));
+    }
+    let avatar = result["avatar"]["image_url"]
+        .as_str()
+        .unwrap_or("")
+        .replace("_normal", "_400x400");
+    Ok((id, avatar))
+}
+
 async fn graphql(
-    cookie: &str,
+    cookie: Option<&str>,
+    app: Option<&AppAuth>,
+    prefer: &str,
     operation: &str,
     query_id: &str,
     variables: &Value,
     proxy: Option<&str>,
 ) -> Result<Value, String> {
-    post_graphql(cookie, operation, query_id, variables, proxy).await
+    let mut order = vec![prefer];
+    let other = if prefer == "app" { "cookie" } else { "app" };
+    let other_ready = match other {
+        "app" => app.is_some() && !cooling("app"),
+        "cookie" => cookie.is_some() && !cooling("cookie"),
+        _ => false,
+    };
+    if other_ready {
+        order.push(other);
+    }
+    let mut last = String::new();
+    for (index, channel) in order.iter().enumerate() {
+        let result = if *channel == "app" {
+            post_app(
+                app.ok_or_else(|| "X 未配置 App 凭证".to_string())?,
+                operation,
+                query_id,
+                variables,
+                proxy,
+            )
+            .await
+        } else {
+            post_graphql(cookie.unwrap_or(""), operation, query_id, variables, proxy).await
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) if err.contains("429") => {
+                mark_cooling(channel);
+                tracing::info!("X {channel} 通道撞 429，operation={operation}");
+                last = err;
+                if index + 1 == order.len() {
+                    return Err(last);
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    Err(last)
 }
 
-fn browser() -> Result<wreq::Client, String> {
+pub(crate) fn browser() -> Result<wreq::Client, String> {
     static CLIENT: OnceLock<Result<wreq::Client, String>> = OnceLock::new();
     match CLIENT.get_or_init(chrome_client) {
         Ok(client) => Ok(client.clone()),
@@ -274,6 +403,139 @@ async fn post_graphql(
         return Err(format!("X {operation} 返回错误"));
     }
     Ok(value)
+}
+
+async fn post_app(
+    auth: &AppAuth,
+    operation: &str,
+    query_id: &str,
+    variables: &Value,
+    proxy: Option<&str>,
+) -> Result<Value, String> {
+    let variables_json = variables.to_string();
+    let url = format!("https://api.x.com/graphql/{query_id}/{operation}");
+    let query = format!(
+        "features={}&variables={}",
+        oauth_escape(FEATURES),
+        oauth_escape(&variables_json)
+    );
+    let authorization = oauth1_authorization(
+        "POST",
+        &url,
+        &[
+            ("features", FEATURES),
+            ("variables", variables_json.as_str()),
+        ],
+        &auth.token,
+        &auth.secret,
+        &nonce(),
+        &now_secs().to_string(),
+    );
+    let features: Value = serde_json::from_str(FEATURES).unwrap_or(json!({}));
+    let body = json!({"variables": variables, "features": features}).to_string();
+    let mut request = browser()?
+        .post(format!("{url}?{query}"))
+        .header("Authorization", authorization)
+        .header("User-Agent", APP_UA)
+        .header("x-twitter-active-user", "yes")
+        .header("x-twitter-client-language", "zh-CN")
+        .header("Content-Type", "application/json")
+        .body(body);
+    if let Some(proxy) = proxy {
+        request = request.proxy(wreq::Proxy::all(proxy).map_err(|err| err.to_string())?);
+    }
+    let response = request.send().await.map_err(|err| err.to_string())?;
+    let status = response.status().as_u16();
+    let text = response.text().await.map_err(|err| err.to_string())?;
+    if status == 400 || status == 404 {
+        mark_ids_stale();
+        return Err(format!(
+            "X app {operation} HTTP {status}，queryId 可能已轮换"
+        ));
+    }
+    if status != 200 {
+        return Err(format!("X app {operation} HTTP {status}"));
+    }
+    let value: Value = serde_json::from_str(&text).map_err(|_| "X 响应不是 JSON".to_string())?;
+    if value
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+    {
+        return Err(format!("X app {operation} 返回错误"));
+    }
+    Ok(value)
+}
+
+async fn typeahead(
+    cookie: &str,
+    screen: &str,
+    proxy: Option<&str>,
+) -> Result<Option<(String, String)>, String> {
+    let url = format!(
+        "https://x.com/i/api/1.1/search/typeahead.json?q={}&result_type=users",
+        oauth_escape(screen)
+    );
+    let ct0 = pair(cookie, "ct0");
+    let mut request = browser()?
+        .get(&url)
+        .header("Authorization", format!("Bearer {BEARER}"))
+        .header("Cookie", cookie)
+        .header("x-csrf-token", &ct0)
+        .header("x-twitter-active-user", "yes");
+    if let Some(proxy) = proxy {
+        request = request.proxy(wreq::Proxy::all(proxy).map_err(|err| err.to_string())?);
+    }
+    let response = request.send().await.map_err(|err| err.to_string())?;
+    let status = response.status().as_u16();
+    if status == 429 {
+        return Err("X typeahead HTTP 429".into());
+    }
+    if status != 200 {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_str(&response.text().await.map_err(|err| err.to_string())?)
+        .map_err(|_| "X typeahead 不是 JSON".to_string())?;
+    let Some(users) = value["users"].as_array() else {
+        return Ok(None);
+    };
+    for user in users {
+        let name = user["screen_name"].as_str().unwrap_or("");
+        if !name.eq_ignore_ascii_case(screen) {
+            continue;
+        }
+        let id = user["id_str"].as_str().unwrap_or("").to_string();
+        if id.is_empty() {
+            return Ok(None);
+        }
+        let avatar = user["profile_image_url_https"]
+            .as_str()
+            .unwrap_or("")
+            .replace("_normal", "_400x400");
+        return Ok(Some((id, avatar)));
+    }
+    Ok(None)
+}
+
+async fn app_auth(db: &Db) -> Result<Option<AppAuth>, String> {
+    let mode = setting_or_env(db, "x_auth_mode", "X_AUTH_MODE").await?;
+    if mode != "oauth1" {
+        return Ok(None);
+    }
+    let token = setting_or_env(db, "x_oauth_token", "X_OAUTH_TOKEN").await?;
+    let secret = setting_or_env(db, "x_oauth_token_secret", "X_OAUTH_TOKEN_SECRET").await?;
+    if token.is_empty() || secret.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(AppAuth { token, secret }))
+}
+
+async fn setting_or_env(db: &Db, key: &str, env_key: &str) -> Result<String, String> {
+    let saved = db.setting(key).await.map_err(|err| err.to_string())?;
+    if let Some(saved) = saved.filter(|value| !value.is_empty()) {
+        return Ok(saved);
+    }
+    Ok(std::env::var(env_key).unwrap_or_default())
 }
 
 fn tweets(data: &Value, screen: &str) -> Vec<Tweet> {
@@ -466,6 +728,155 @@ fn screen_name(raw: &str) -> String {
         .unwrap_or(text)
         .trim_start_matches('@');
     seg.chars().take(15).collect()
+}
+
+fn channel_for(id: i64, has_app: bool, has_cookie: bool) -> &'static str {
+    if !has_app {
+        return "cookie";
+    }
+    if !has_cookie {
+        return "app";
+    }
+    let preferred = if id % 2 == 1 { "app" } else { "cookie" };
+    let other = if preferred == "app" { "cookie" } else { "app" };
+    if cooling(preferred) && !cooling(other) {
+        other
+    } else {
+        preferred
+    }
+}
+
+fn channels_cooling(has_app: bool, has_cookie: bool) -> bool {
+    (!has_app || cooling("app")) && (!has_cookie || cooling("cookie"))
+}
+
+fn cool_store() -> &'static Mutex<(u64, u64)> {
+    static COOL: OnceLock<Mutex<(u64, u64)>> = OnceLock::new();
+    COOL.get_or_init(|| Mutex::new((0, 0)))
+}
+
+fn cooling(channel: &str) -> bool {
+    let guard = cool_store().lock().unwrap_or_else(|err| err.into_inner());
+    let until = if channel == "app" { guard.0 } else { guard.1 };
+    now_secs() < until
+}
+
+fn mark_cooling(channel: &str) {
+    let mut guard = cool_store().lock().unwrap_or_else(|err| err.into_inner());
+    let until = now_secs() + CHANNEL_COOLDOWN;
+    if channel == "app" {
+        guard.0 = until;
+    } else {
+        guard.1 = until;
+    }
+}
+
+#[cfg(test)]
+fn clear_cooling() {
+    *cool_store().lock().unwrap_or_else(|err| err.into_inner()) = (0, 0);
+}
+
+fn user_ids() -> &'static Mutex<HashMap<String, String>> {
+    static USERS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    USERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_user(screen: &str) -> Option<String> {
+    user_ids()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(screen)
+        .cloned()
+}
+
+// ponytail: uid cache is process-local, same as Python; persist if restarts keep spending the lookup quota
+fn remember_user(screen: &str, id: &str) {
+    user_ids()
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .insert(screen.to_string(), id.to_string());
+}
+
+fn oauth_escape(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
+fn nonce() -> String {
+    const ALPH: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    let mut buf = [0u8; 32];
+    getrandom::getrandom(&mut buf).expect("rng");
+    buf.iter()
+        .map(|byte| ALPH[(*byte as usize) % ALPH.len()] as char)
+        .collect()
+}
+
+fn oauth1_authorization(
+    method: &str,
+    url: &str,
+    params: &[(&str, &str)],
+    token: &str,
+    secret: &str,
+    nonce: &str,
+    timestamp: &str,
+) -> String {
+    let mut fields = vec![
+        (
+            "oauth_consumer_key".to_string(),
+            APP_CONSUMER_KEY.to_string(),
+        ),
+        ("oauth_nonce".to_string(), nonce.to_string()),
+        (
+            "oauth_signature_method".to_string(),
+            "HMAC-SHA1".to_string(),
+        ),
+        ("oauth_timestamp".to_string(), timestamp.to_string()),
+        ("oauth_token".to_string(), token.to_string()),
+        ("oauth_version".to_string(), "1.0".to_string()),
+    ];
+    let param_str = {
+        let mut signing: Vec<(&str, &str)> = params.to_vec();
+        for (key, value) in &fields {
+            signing.push((key.as_str(), value.as_str()));
+        }
+        signing.sort_by(|left, right| left.0.cmp(right.0));
+        signing
+            .iter()
+            .map(|(key, value)| format!("{}={}", oauth_escape(key), oauth_escape(value)))
+            .collect::<Vec<_>>()
+            .join("&")
+    };
+    let base = format!(
+        "{}&{}&{}",
+        method.to_ascii_uppercase(),
+        oauth_escape(url),
+        oauth_escape(&param_str)
+    );
+    let key = format!(
+        "{}&{}",
+        oauth_escape(APP_CONSUMER_SECRET),
+        oauth_escape(secret)
+    );
+    let mut mac = HmacSha1::new_from_slice(key.as_bytes()).expect("hmac key");
+    mac.update(base.as_bytes());
+    let signature = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+    fields.push(("oauth_signature".to_string(), signature));
+    fields.sort_by(|left, right| left.0.cmp(&right.0));
+    format!(
+        "OAuth {}",
+        fields
+            .iter()
+            .map(|(key, value)| format!("{}=\"{}\"", oauth_escape(key), oauth_escape(value)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
 }
 
 fn pair(cookie: &str, name: &str) -> String {
@@ -694,6 +1105,37 @@ mod tests {
             Some("NAMEID001")
         );
         assert!(!allowed_asset("https://evil.example/main.js"));
+    }
+
+    #[test]
+    fn oauth1_header_matches_python_vector() {
+        clear_cooling();
+        let header = oauth1_authorization(
+            "POST",
+            "https://api.x.com/graphql/Gb-d6r0vxPOADdG62OEBpQ/UserByScreenName",
+            &[
+                ("features", FEATURES),
+                (
+                    "variables",
+                    r#"{"screen_name":"Twitter","withSafetyModeUserFields":true}"#,
+                ),
+            ],
+            "token",
+            "secret",
+            "abcDEF123",
+            "1700000000",
+        );
+        assert!(header.contains("oauth_signature=\"AYXpg%2BcHp0OJZvBMJzEw%2Bjj7kV4%3D\""));
+        assert_eq!(channel_for(1, true, true), "app");
+        assert_eq!(channel_for(2, true, true), "cookie");
+        assert_eq!(channel_for(2, false, true), "cookie");
+        assert_eq!(channel_for(2, true, false), "app");
+        mark_cooling("cookie");
+        assert_eq!(channel_for(2, true, true), "app");
+        assert!(channels_cooling(false, true));
+        clear_cooling();
+        remember_user("unit_test_screen_zzz", "99");
+        assert_eq!(cached_user("unit_test_screen_zzz").as_deref(), Some("99"));
     }
 
     #[test]

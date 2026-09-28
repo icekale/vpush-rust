@@ -56,14 +56,13 @@ fn acquire_os_lock(db_path: &Path) -> Option<File> {
             return None;
         }
     };
-    let file = match open_lock_file(&path) {
+    let file = match open_lock_file(&path).and_then(prepare_lock_file) {
         Ok(file) => file,
         Err(_) => {
-            tracing::warn!("Telegram 入站进程锁无法打开");
+            tracing::warn!("Telegram 入站进程锁无法安全初始化");
             return None;
         }
     };
-    set_lock_mode(&file);
     match file.try_lock() {
         Ok(()) => Some(file),
         Err(TryLockError::WouldBlock) => None,
@@ -80,23 +79,48 @@ fn open_lock_file(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW).mode(0o600);
     }
     options.open(path)
 }
+
+fn prepare_lock_file(file: File) -> io::Result<File> {
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Telegram lock is not a regular file",
+        ));
+    }
+    set_lock_mode(&file)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Telegram lock is not a regular file",
+        ));
+    }
+    Ok(file)
+}
+
 #[cfg(unix)]
-fn set_lock_mode(file: &File) {
+fn set_lock_mode(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
-    let mut permissions = file
-        .metadata()
-        .map(|metadata| metadata.permissions())
-        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o600));
+    let mut permissions = file.metadata()?.permissions();
     permissions.set_mode(0o600);
-    let _ = file.set_permissions(permissions);
+    file.set_permissions(permissions)?;
+    let mode = file.metadata()?.permissions().mode() & 0o7777;
+    if mode != 0o600 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Telegram lock mode is not 0600",
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(not(unix))]
-fn set_lock_mode(_file: &File) {}
+fn set_lock_mode(_file: &File) -> io::Result<()> {
+    Ok(())
+}
 
 fn new_owner() -> String {
     let mut bytes = [0u8; 24];
@@ -563,6 +587,57 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(db.telegram_poll_offset().await.unwrap(), 0);
         drop(resume_tx);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_lock_mode_is_hardened_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-telegram-lock-mode-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("vpush.db");
+        std::fs::write(&db_path, b"db").unwrap();
+        let path = lock_path(&db_path).unwrap();
+        std::fs::write(&path, b"lock").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let file = acquire_os_lock(&db_path).unwrap();
+        assert_eq!(
+            file.metadata().unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        drop(file);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_lock_is_refused_without_touching_target() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-telegram-lock-symlink-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("vpush.db");
+        std::fs::write(&db_path, b"db").unwrap();
+        let target = dir.join("target");
+        std::fs::write(&target, b"target").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o666)).unwrap();
+        symlink(&target, lock_path(&db_path).unwrap()).unwrap();
+        assert!(acquire_os_lock(&db_path).is_none());
+        assert_eq!(std::fs::read(&target).unwrap(), b"target");
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o666
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

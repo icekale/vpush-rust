@@ -223,7 +223,7 @@ async fn main() {
         std::env::var("TELEGRAM_BOT_TOKEN").ok().as_deref(),
     ) {
         let token = std::env::var("TELEGRAM_BOT_TOKEN").expect("Telegram token checked");
-        telegram_poll::spawn(db.clone(), token);
+        telegram_poll::spawn(db.clone(), token, Path::new(&db_path));
     }
     if let Ok(password) = std::env::var("WEB_ADMIN_PASSWORD") {
         if !password.is_empty() {

@@ -1,4 +1,7 @@
+use std::fs::{File, OpenOptions, TryLockError};
 use std::future::Future;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -24,12 +27,76 @@ pub(crate) fn enabled(inbound: Option<&str>, token: Option<&str>) -> bool {
     inbound == Some("1") && token.is_some_and(|token| !token.trim().is_empty())
 }
 
-pub(crate) fn spawn(db: Db, token: String) -> JoinHandle<()> {
+pub(crate) fn spawn(db: Db, token: String, db_path: &Path) -> Option<JoinHandle<()>> {
+    let Some(lock) = acquire_os_lock(db_path) else {
+        tracing::info!("Telegram 入站 worker 未取得进程锁");
+        return None;
+    };
     let owner = new_owner();
-    tokio::spawn(async move {
-        run_with_endpoint(db, token, owner, TELEGRAM_API_BASE).await;
-    })
+    Some(tokio::spawn(async move {
+        run_with_endpoint(db, token, owner, TELEGRAM_API_BASE, lock).await;
+    }))
 }
+
+fn lock_path(db_path: &Path) -> Result<PathBuf, String> {
+    let canonical = db_path
+        .canonicalize()
+        .map_err(|_| "Telegram 入站进程锁路径不可用".to_owned())?;
+    let stem = canonical
+        .file_stem()
+        .ok_or_else(|| "Telegram 入站进程锁路径不可用".to_owned())?;
+    Ok(canonical.with_file_name(format!("{}.telegram.lock", stem.to_string_lossy())))
+}
+
+fn acquire_os_lock(db_path: &Path) -> Option<File> {
+    let path = match lock_path(db_path) {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::warn!("{error}");
+            return None;
+        }
+    };
+    let file = match open_lock_file(&path) {
+        Ok(file) => file,
+        Err(_) => {
+            tracing::warn!("Telegram 入站进程锁无法打开");
+            return None;
+        }
+    };
+    set_lock_mode(&file);
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(TryLockError::WouldBlock) => None,
+        Err(TryLockError::Error(_)) => {
+            tracing::warn!("Telegram 入站进程锁无法获取");
+            None
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+#[cfg(unix)]
+fn set_lock_mode(file: &File) {
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = file
+        .metadata()
+        .map(|metadata| metadata.permissions())
+        .unwrap_or_else(|_| std::fs::Permissions::from_mode(0o600));
+    permissions.set_mode(0o600);
+    let _ = file.set_permissions(permissions);
+}
+
+#[cfg(not(unix))]
+fn set_lock_mode(_file: &File) {}
 
 fn new_owner() -> String {
     let mut bytes = [0u8; 24];
@@ -37,7 +104,13 @@ fn new_owner() -> String {
     hex::encode(bytes)
 }
 
-pub(crate) async fn run_with_endpoint(db: Db, token: String, owner: String, endpoint: &str) {
+pub(crate) async fn run_with_endpoint(
+    db: Db,
+    token: String,
+    owner: String,
+    endpoint: &str,
+    _os_lock: File,
+) {
     let Some(mut offset) = (match db.telegram_poll_acquire(&owner, LEASE_SECS).await {
         Ok(offset) => offset,
         Err(error) => {
@@ -490,6 +563,55 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(db.telegram_poll_offset().await.unwrap(), 0);
         drop(resume_tx);
+    }
+
+    #[tokio::test]
+    async fn sidecar_lock_fences_sql_lease_steal_until_first_worker_drops_it() {
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-telegram-lock-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("vpush.db");
+        let db = Db::open(&db_path).await.unwrap();
+        let first_lock = acquire_os_lock(&db_path).unwrap();
+        db.telegram_poll_acquire("first", 60).await.unwrap();
+        sqlx::query("UPDATE telegram_poll_state SET lease_until = unixepoch() - 1")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(
+            db.telegram_poll_acquire("second", 60).await.unwrap(),
+            Some(0)
+        );
+        assert!(acquire_os_lock(&db_path).is_none());
+        drop(first_lock);
+        assert!(acquire_os_lock(&db_path).is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn normal_worker_failure_releases_sidecar_lock() {
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-telegram-lock-failure-{}-{}",
+            std::process::id(),
+            unix_now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("vpush.db");
+        let db = Db::open(&db_path).await.unwrap();
+        let lock = acquire_os_lock(&db_path).unwrap();
+        run_with_endpoint(
+            db,
+            "test-token".to_owned(),
+            "owner".to_owned(),
+            "http://127.0.0.1:1",
+            lock,
+        )
+        .await;
+        assert!(acquire_os_lock(&db_path).is_some());
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]

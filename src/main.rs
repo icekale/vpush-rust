@@ -277,6 +277,7 @@ async fn main() {
     truth::spawn(state.db.clone());
     twitter::spawn(state.db.clone());
     maintenance::spawn(state.db.clone());
+    feishu_admin::spawn_sync(state.db.clone());
     feishu_ws::resume(state.db.clone()).await;
     feishu_ws::spawn_shared(state.db.clone());
     let app = router(state);

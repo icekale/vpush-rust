@@ -34,7 +34,7 @@ services:
     volumes:
       - ./data:/app/data
       - ./avatars:/app/static/avatars:ro
-      - ${IMA_ARCHIVE_HOST:-/srv/vpush-ima}:/app/ima-archive:ro
+      - ${IMA_ARCHIVE_HOST:-/srv/vpush-ima}:/app/ima-archive
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/"]
       interval: 30s

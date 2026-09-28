@@ -575,7 +575,10 @@ fn router(state: AppState) -> Router {
         .route("/api/ima-documents/{media_id}/pdf", get(ima_pdf))
         .route("/api/ima-documents/{media_id}/text", get(ima_text))
         .route("/api/ima-documents/{media_id}", get(feishu_document))
-        .route("/api/xincai/ingest", post(xincai_ingest))
+        .route(
+            "/api/xincai/ingest",
+            post(xincai_ingest).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
+        )
         .route("/api/news/sources", get(news_sources))
         .route("/api/news", get(news_list))
         .route("/api/news/seen", post(news_seen))

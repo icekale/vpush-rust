@@ -4028,7 +4028,9 @@ impl Db {
         sql.push(" OFFSET ");
         sql.push_bind(offset.max(0));
         let rows = sql.build().fetch_all(&self.pool).await?;
-        Ok(rows.iter().map(post_json).collect())
+        let mut posts: Vec<Value> = rows.iter().map(post_json).collect();
+        crate::imgbed::rewrite_posts(self, &mut posts).await?;
+        Ok(posts)
     }
 
     pub async fn add_push_log(
@@ -5428,7 +5430,9 @@ impl Db {
         .bind(f.offset)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().map(post_json).collect())
+        let mut posts: Vec<Value> = rows.iter().map(post_json).collect();
+        crate::imgbed::rewrite_posts(self, &mut posts).await?;
+        Ok(posts)
     }
 
     pub async fn kol_posts(
@@ -5459,7 +5463,9 @@ impl Db {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        Ok(Some(rows.iter().map(post_json).collect()))
+        let mut posts: Vec<Value> = rows.iter().map(post_json).collect();
+        crate::imgbed::rewrite_posts(self, &mut posts).await?;
+        Ok(Some(posts))
     }
 
     pub async fn dynamic_tags(&self) -> Result<Vec<String>, sqlx::Error> {
@@ -5645,6 +5651,7 @@ impl Db {
         .bind(published_at)
         .execute(&self.pool)
         .await?;
+        crate::imgbed::enqueue_images(self, images_json).await?;
         Ok(())
     }
 

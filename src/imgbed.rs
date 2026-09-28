@@ -1,5 +1,5 @@
 use std::io::Read;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -451,18 +451,15 @@ pub fn live_download(url: &str) -> Result<(Vec<u8>, String), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("源图下载失败".into());
     }
-    let response = ureq::AgentBuilder::new()
-        .resolver(crate::url_guard::public_resolver)
-        .timeout(std::time::Duration::from_secs(15))
-        .redirects(0)
-        .build()
-        .get(url)
-        .set("User-Agent", "Mozilla/5.0")
-        .call()
-        .map_err(|err| match err {
-            ureq::Error::Status(code, _) => format!("源图下载失败 HTTP {code}"),
-            _ => "源图下载失败".into(),
-        })?;
+    let response = if url_host(url) == "static-assets-1.truthsocial.com" {
+        if let Some(origin) = truth_origin() {
+            origin_response(url, origin)?
+        } else {
+            direct_response(url)?
+        }
+    } else {
+        direct_response(url)?
+    };
     let kind = response
         .content_type()
         .split(';')
@@ -627,6 +624,193 @@ fn urlencoding_path(value: &str) -> String {
         .map(urlencoding)
         .collect::<Vec<_>>()
         .join("/")
+}
+
+fn truth_origin() -> Option<IpAddr> {
+    std::env::var("TRUTH_IMAGE_ORIGIN")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse().ok())
+}
+
+fn truth_fetch_url(url: &str) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let path = path
+        .trim_start_matches("https://static-assets-1.truthsocial.com/")
+        .trim_start_matches("http://static-assets-1.truthsocial.com/");
+    format!("https://vpush.net/internal/img-fetch/{path}")
+}
+
+fn origin_response(url: &str, origin: IpAddr) -> Result<ureq::Response, String> {
+    // ponytail: ARM's address is challenged by Truth's CDN; DMIT is not
+    ureq::AgentBuilder::new()
+        .resolver(move |netloc: &str| {
+            let Some((host, port)) = netloc.rsplit_once(':') else {
+                return crate::url_guard::public_resolver(netloc);
+            };
+            if host == "vpush.net" {
+                let port: u16 = port.parse().unwrap_or(443);
+                return Ok(vec![SocketAddr::new(origin, port)]);
+            }
+            crate::url_guard::public_resolver(netloc)
+        })
+        .timeout(Duration::from_secs(20))
+        .redirects(0)
+        .build()
+        .get(&truth_fetch_url(url))
+        .set("User-Agent", "Mozilla/5.0")
+        .call()
+        .map_err(|err| match err {
+            ureq::Error::Status(code, _) => format!("源图下载失败 HTTP {code}"),
+            _ => "源图下载失败".into(),
+        })
+}
+
+fn direct_response(url: &str) -> Result<ureq::Response, String> {
+    ureq::AgentBuilder::new()
+        .resolver(crate::url_guard::public_resolver)
+        .timeout(Duration::from_secs(15))
+        .redirects(0)
+        .build()
+        .get(url)
+        .set("User-Agent", "Mozilla/5.0")
+        .call()
+        .map_err(|err| match err {
+            ureq::Error::Status(code, _) => format!("源图下载失败 HTTP {code}"),
+            _ => "源图下载失败".into(),
+        })
+}
+
+pub async fn enqueue_images(db: &Db, images_json: &str) -> Result<(), sqlx::Error> {
+    if !configured(db).await? {
+        return Ok(());
+    }
+    let Ok(urls) = serde_json::from_str::<Vec<Value>>(images_json) else {
+        return Ok(());
+    };
+    for url in urls {
+        let Some(url) = url.as_str().map(str::trim).filter(|url| mirror_source(url)) else {
+            continue;
+        };
+        sqlx::query(
+            "INSERT OR IGNORE INTO hosted_images (source_url, status) VALUES (?, 'pending')",
+        )
+        .bind(url)
+        .execute(db.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn configured(db: &Db) -> Result<bool, sqlx::Error> {
+    let stored_url = text(db, "imgbed_base_url").await?;
+    let base = nonempty(&stored_url).unwrap_or_else(|| env_text("IMGBED_BASE_URL"));
+    let token = !text(db, "imgbed_token").await?.is_empty() || !env_text("IMGBED_TOKEN").is_empty();
+    Ok(!base.is_empty() && token)
+}
+
+pub async fn rewrite_posts(db: &Db, posts: &mut [Value]) -> Result<(), sqlx::Error> {
+    let host = base_host(db).await?;
+    if host.is_empty() {
+        return Ok(());
+    }
+    let mut urls = Vec::new();
+    for post in posts.iter() {
+        let Some(images) = post.get("images").and_then(Value::as_array) else {
+            continue;
+        };
+        for image in images {
+            let Some(url) = image.as_str().map(str::trim) else {
+                continue;
+            };
+            if mirror_source(url) && !urls.iter().any(|seen: &String| seen == url) {
+                urls.push(url.to_string());
+            }
+        }
+    }
+    if urls.is_empty() {
+        return Ok(());
+    }
+    use sqlx::Row;
+    let mut hosted = std::collections::HashMap::new();
+    for chunk in urls.chunks(200) {
+        let mut sql = String::from(
+            "SELECT source_url, hosted_url FROM hosted_images WHERE status = 'ready' AND hosted_url != '' AND source_url IN (",
+        );
+        for (i, _) in chunk.iter().enumerate() {
+            if i > 0 {
+                sql.push(',');
+            }
+            sql.push('?');
+        }
+        sql.push(')');
+        let mut query = sqlx::query(&sql);
+        for url in chunk {
+            query = query.bind(url);
+        }
+        for row in query.fetch_all(db.pool()).await? {
+            let source: String = row.get("source_url");
+            let url: String = row.get("hosted_url");
+            if url_host(&url) == host && url.starts_with("https://") {
+                hosted.insert(source, url);
+            }
+        }
+    }
+    for post in posts.iter_mut() {
+        let Some(images) = post.get_mut("images").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for image in images {
+            let raw = image.as_str().unwrap_or("").trim().to_string();
+            if let Some(url) = hosted.get(&raw) {
+                *image = Value::String(url.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn base_host(db: &Db) -> Result<String, sqlx::Error> {
+    let stored = text(db, "imgbed_base_url").await?;
+    Ok(url_host(
+        &nonempty(&stored).unwrap_or_else(|| env_text("IMGBED_BASE_URL")),
+    ))
+}
+
+fn mirror_source(url: &str) -> bool {
+    let path = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if path.ends_with(".mp4") || path.ends_with(".webm") {
+        return false;
+    }
+    matches!(
+        url_host(url).as_str(),
+        "pbs.twimg.com" | "video.twimg.com" | "abs.twimg.com" | "static-assets-1.truthsocial.com"
+    )
+}
+
+fn url_host(url: &str) -> String {
+    let Some(rest) = url
+        .trim()
+        .strip_prefix("https://")
+        .or_else(|| url.trim().strip_prefix("http://"))
+    else {
+        return String::new();
+    };
+    if rest.contains('@') {
+        return String::new();
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority
+        .rsplit_once(':')
+        .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+        .map(|(host, _)| host)
+        .unwrap_or(authority);
+    host.to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -811,5 +995,107 @@ mod tests {
         let error: String = sqlx::query_scalar("SELECT last_error FROM hosted_images WHERE source_url = 'https://cdn.example/soon.jpg'").fetch_one(db.pool()).await.unwrap();
         assert!(error.is_empty());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn rewrite_swaps_ready_mirror_only() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-rewrite-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("imgbed_base_url", "https://img.example.com")
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO hosted_images (source_url, status, hosted_url) VALUES
+             ('https://pbs.twimg.com/a.jpg', 'ready', 'https://img.example.com/file/a.jpg'),
+             ('https://pbs.twimg.com/b.jpg', 'pending', ''),
+             ('https://video.twimg.com/v.mp4', 'ready', 'https://img.example.com/file/v.mp4'),
+             ('https://pbs.twimg.com/evil.jpg', 'ready', 'https://evil.example/a.jpg')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let mut posts = vec![json!({
+            "images": [
+                "https://pbs.twimg.com/a.jpg",
+                "https://pbs.twimg.com/b.jpg",
+                "https://video.twimg.com/v.mp4",
+                "https://pbs.twimg.com/evil.jpg",
+                "https://img.example/a.jpg"
+            ]
+        })];
+        rewrite_posts(&db, &mut posts).await.unwrap();
+        let images = posts[0]["images"].as_array().unwrap();
+        assert_eq!(images[0], "https://img.example.com/file/a.jpg");
+        assert_eq!(images[1], "https://pbs.twimg.com/b.jpg");
+        assert_eq!(images[2], "https://video.twimg.com/v.mp4");
+        assert_eq!(images[3], "https://pbs.twimg.com/evil.jpg");
+        assert_eq!(images[4], "https://img.example/a.jpg");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn save_fetched_queues_mirrorable_images() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-enqueue-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("imgbed_base_url", "https://img.example.com")
+            .await
+            .unwrap();
+        db.set_setting("imgbed_token", "secret").await.unwrap();
+        let kol = db
+            .add_kol("twitter", "甲", "111", None, false, false, false)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO hosted_images (source_url, status, hosted_url) VALUES ('https://pbs.twimg.com/a.jpg', 'ready', 'https://img.example.com/a.jpg')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let images = r#"["https://pbs.twimg.com/a.jpg","https://pbs.twimg.com/b.jpg","https://video.twimg.com/v.mp4","https://img.example/a.jpg"]"#;
+        db.save_fetched(kol, "p1", "", "正文", "post", images, "", "2026-09-28")
+            .await
+            .unwrap();
+        let ready: String = sqlx::query_scalar(
+            "SELECT status FROM hosted_images WHERE source_url = 'https://pbs.twimg.com/a.jpg'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let pending: String = sqlx::query_scalar(
+            "SELECT status FROM hosted_images WHERE source_url = 'https://pbs.twimg.com/b.jpg'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM hosted_images")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(ready, "ready");
+        assert_eq!(pending, "pending");
+        assert_eq!(rows, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn truth_fetch_url_points_at_the_origin_gate() {
+        let url = "https://static-assets-1.truthsocial.com/tmtg:prime-ts-assets/a.jpg";
+        let fetch = truth_fetch_url(url);
+        assert_eq!(
+            fetch,
+            "https://vpush.net/internal/img-fetch/tmtg:prime-ts-assets/a.jpg"
+        );
     }
 }

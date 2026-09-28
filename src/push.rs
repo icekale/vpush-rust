@@ -189,7 +189,11 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             tokio::join!(
                 async {
                     if channels.wecom && wecom_bound(&target.wecom_webhook) {
-                        if let Err(err) = wecom(&target.wecom_webhook, note).await {
+                        let detail = match &telegram_post {
+                            Ok(Some(post)) if post.detail.is_object() => Some(&post.detail),
+                            _ => None,
+                        };
+                        if let Err(err) = wecom(&target.wecom_webhook, note, detail).await {
                             tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
                             note_push_failure(db, &format!("企业微信：{err}")).await;
                             remember_failure_logged(
@@ -676,7 +680,7 @@ where
 pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
     let rich_messages = telegram_rich_messages(db).await;
     retry_due(db, now, |post_id, channel, user_id| async move {
-        let row = sqlx::query("SELECT k.name, p.platform, p.external_id, p.post_type, p.title, p.content, p.url, p.published_at FROM posts p JOIN kols k ON k.id = p.kol_id WHERE p.id = ?")
+        let row = sqlx::query("SELECT k.name, p.platform, p.external_id, p.post_type, p.title, p.content, p.url, p.published_at, COALESCE(p.detail, '') AS detail FROM posts p JOIN kols k ON k.id = p.kol_id WHERE p.id = ?")
             .bind(post_id)
             .fetch_optional(db.pool())
             .await
@@ -690,23 +694,32 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
         let content: String = row.get("content");
         let url: String = row.get("url");
         let published_at: String = row.get("published_at");
-        let text = {
-            let note = Note {
-                kol_name: &name,
-                platform: &platform,
-                external_id: &external_id,
-                post_type: &post_type,
-                title: &title,
-                content: &content,
-                url: &url,
-                published_at: &published_at,
-            };
-            plain(&note)
+        let note = Note {
+            kol_name: &name,
+            platform: &platform,
+            external_id: &external_id,
+            post_type: &post_type,
+            title: &title,
+            content: &content,
+            url: &url,
+            published_at: &published_at,
         };
+        let text = plain(&note);
         match channel.as_str() {
             "wecom" => {
                 let url: String = sqlx::query_scalar("SELECT wecom_webhook FROM users WHERE id = ?").bind(user_id).fetch_one(db.pool()).await.map_err(|err| err.to_string())?;
-                send_wecom_text(&url, &text).await
+                let body = if platform == "combination" {
+                    let raw: String = row.get("detail");
+                    let detail: Value = serde_json::from_str(&raw).unwrap_or(Value::Null);
+                    if detail.is_object() {
+                        wecom_combination(&note, &detail)
+                    } else {
+                        text
+                    }
+                } else {
+                    text
+                };
+                send_wecom_text(&url, &body).await
             }
             "bark" => {
                 let key: String = sqlx::query_scalar("SELECT bark_key FROM users WHERE id = ?").bind(user_id).fetch_one(db.pool()).await.map_err(|err| err.to_string())?;
@@ -832,8 +845,116 @@ fn beijing_minutes() -> u32 {
     ((secs + 8 * 3600) % 86400 / 60) as u32
 }
 
-async fn wecom(url: &str, note: &Note<'_>) -> Result<(), String> {
-    send_wecom_text(url, &plain(note)).await
+async fn wecom(url: &str, note: &Note<'_>, detail: Option<&Value>) -> Result<(), String> {
+    let text = match detail {
+        Some(detail) if note.platform == "combination" && detail.is_object() => {
+            wecom_combination(note, detail)
+        }
+        _ => plain(note),
+    };
+    send_wecom_text(url, &text).await
+}
+
+fn wecom_combination(note: &Note<'_>, detail: &Value) -> String {
+    let mut lines = vec![
+        format!("**📌 {} · 雪球组合 · 调仓**", note.kol_name),
+        String::new(),
+    ];
+    if let Some(stats) = detail["stats"].as_array() {
+        let line = stats
+            .iter()
+            .filter_map(|pair| {
+                let pair = pair.as_array()?;
+                Some(format!(
+                    "**{}** {}",
+                    detail_text(pair.first()?),
+                    detail_text(pair.get(1)?)
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("　");
+        if !line.is_empty() {
+            lines.push(line);
+            lines.push(String::new());
+        }
+    }
+    if let Some(actions) = detail["actions"].as_array() {
+        for action in actions.iter().filter(|action| action.is_object()) {
+            let kind = action["type"].as_str().unwrap_or("调整");
+            let icon = match kind {
+                "清仓" => "🗑",
+                "新建" => "🆕",
+                "增持" => "➕",
+                "减持" => "➖",
+                _ => "•",
+            };
+            let stock = action["stock"].as_str().unwrap_or("");
+            let symbol = action["symbol"].as_str().unwrap_or("");
+            let mut head = format!("{icon} **{kind}** {stock}");
+            if !symbol.is_empty() {
+                head.push_str(&format!("（{symbol}）"));
+            }
+            lines.push(head);
+            lines.push(format!(
+                "{} → {}",
+                action["prev"].as_str().unwrap_or("0.0%"),
+                action["target"].as_str().unwrap_or("0.0%")
+            ));
+            let price = detail_text(&action["price"]);
+            if !price.is_empty() {
+                lines.push(format!("成交价 {price}"));
+            }
+            lines.push(String::new());
+        }
+    }
+    let cash = detail_text(&detail["cash"]);
+    if !cash.is_empty() {
+        lines.push(format!("💵 现金 **{cash}**"));
+    }
+    if let Some(holdings) = detail["holdings"].as_array() {
+        let rows = holdings
+            .iter()
+            .filter(|holding| {
+                holding["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty())
+                    && !holding["weight"].is_null()
+            })
+            .map(|holding| {
+                format!(
+                    "{}（{}） {}%",
+                    holding["name"].as_str().unwrap_or(""),
+                    holding["symbol"].as_str().unwrap_or(""),
+                    detail_text(&holding["weight"])
+                )
+            })
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            lines.push("现有持仓".into());
+            lines.extend(rows);
+        }
+    }
+    if !note.published_at.is_empty() {
+        lines.push(format!("🕐 {}", note.published_at));
+    }
+    if !note.url.is_empty() {
+        lines.push(format!("[查看原文]({})", note.url));
+    }
+    // ponytail: 4096 字节是企微上限，超长直接截断。
+    truncate_bytes(&lines.join("\n").trim_end(), 4000)
+}
+
+fn truncate_bytes(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max.saturating_sub(3);
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut out = text[..end].to_string();
+    out.push('…');
+    out
 }
 
 async fn send_wecom_text(url: &str, text: &str) -> Result<(), String> {
@@ -1312,6 +1433,149 @@ fn detail_text(value: &Value) -> String {
     }
 }
 
+fn action_mark(kind: &str) -> &'static str {
+    match kind {
+        "清仓" => "🗑",
+        "新建" => "🆕",
+        "增持" => "➕",
+        "减持" => "➖",
+        _ => "•",
+    }
+}
+
+fn cell_html(parts: &[&str]) -> String {
+    parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| escape_html(part, 80, 200))
+        .collect::<Vec<_>>()
+        .join("<br>")
+}
+
+fn html_table(headers: &[(&str, &str)], rows: &[Vec<String>], caption: &str) -> String {
+    let head: String = headers
+        .iter()
+        .map(|(label, align)| format!("<th align=\"{align}\">{}</th>", escape_html(label, 20, 40)))
+        .collect();
+    let body: String = rows
+        .iter()
+        .map(|row| {
+            let cells: String = row
+                .iter()
+                .enumerate()
+                .map(|(index, cell)| {
+                    let align = headers.get(index).map(|header| header.1).unwrap_or("left");
+                    format!("<td align=\"{align}\">{cell}</td>")
+                })
+                .collect();
+            format!("<tr>{cells}</tr>")
+        })
+        .collect();
+    let caption = if caption.is_empty() {
+        String::new()
+    } else {
+        format!("<caption>{}</caption>", escape_html(caption, 40, 80))
+    };
+    format!("<table striped>{caption}<thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>")
+}
+
+fn append_combination_rich(html: &mut String, post: &TelegramPost) {
+    if let Some(stats) = post.detail["stats"].as_array() {
+        let labels: Vec<String> = stats
+            .iter()
+            .filter_map(|pair| {
+                let pair = pair.as_array()?;
+                Some(format!(
+                    "{} {}",
+                    detail_text(pair.first()?),
+                    detail_text(pair.get(1)?)
+                ))
+            })
+            .collect();
+        if !labels.is_empty() {
+            add_html(html, &rich_line(&escape_html(&labels.join(" · "), 350, 600)));
+        }
+    }
+    if let Some(actions) = post.detail["actions"].as_array() {
+        let actions: Vec<&Value> = actions.iter().filter(|action| action.is_object()).take(12).collect();
+        let has_prices = actions.iter().any(|action| !detail_text(&action["price"]).is_empty());
+        let rows: Vec<Vec<String>> = actions
+            .iter()
+            .map(|action| {
+                let kind = action["type"].as_str().unwrap_or("调整");
+                let stock = action["stock"].as_str().unwrap_or("");
+                let symbol = action["symbol"].as_str().unwrap_or("");
+                let target = cell_html(&[stock, symbol]);
+                let mut row = vec![
+                    cell_html(&[&format!("{} {kind}", action_mark(kind))]),
+                    target,
+                    cell_html(&[&format!(
+                        "{} → {}",
+                        action["prev"].as_str().unwrap_or("0.0%"),
+                        action["target"].as_str().unwrap_or("0.0%")
+                    )]),
+                ];
+                if has_prices {
+                    let price = detail_text(&action["price"]);
+                    row.push(cell_html(&[if price.is_empty() { "—" } else { &price }]));
+                }
+                row
+            })
+            .collect();
+        if !rows.is_empty() {
+            let mut headers = vec![("操作", "left"), ("标的", "left"), ("仓位", "right")];
+            if has_prices {
+                headers.push(("成交价", "right"));
+            }
+            add_html(html, &html_table(&headers, &rows, ""));
+        }
+    }
+    if let Some(holdings) = post.detail["holdings"].as_array() {
+        let rows: Vec<Vec<String>> = holdings
+            .iter()
+            .filter(|holding| {
+                holding["name"].as_str().is_some_and(|name| !name.trim().is_empty())
+                    && !holding["weight"].is_null()
+            })
+            .take(15)
+            .map(|holding| {
+                let name = holding["name"].as_str().unwrap_or("");
+                let symbol = holding["symbol"].as_str().unwrap_or("");
+                let label = if symbol.trim().is_empty() {
+                    name.to_string()
+                } else {
+                    format!("{name}（{symbol}）")
+                };
+                vec![
+                    cell_html(&[&label]),
+                    cell_html(&[&format!("{}%", detail_text(&holding["weight"]))]),
+                ]
+            })
+            .collect();
+        if !rows.is_empty() {
+            add_html(
+                html,
+                &html_table(&[("持仓", "left"), ("仓位", "right")], &rows, "现有持仓"),
+            );
+        }
+    }
+    let mut foot = Vec::new();
+    let cash = detail_text(&post.detail["cash"]);
+    if !cash.is_empty() {
+        foot.push(format!("💵 现金 {cash}"));
+    }
+    if !post.published_at.is_empty() {
+        foot.push(format!("🕐 {}", post.published_at));
+    }
+    if !foot.is_empty() {
+        add_html(
+            html,
+            &format!("<footer>{}</footer>", escape_html(&foot.join(" · "), 160, 300)),
+        );
+    }
+}
+
 fn render_telegram_post(
     post: &TelegramPost,
     favorite: bool,
@@ -1363,87 +1627,9 @@ fn render_telegram_post(
             add_html(&mut html, &body);
         }
     }
-    if post.platform == "combination" && post.detail.is_object() {
-        if let Some(stats) = post.detail["stats"].as_array() {
-            let labels: Vec<String> = stats
-                .iter()
-                .filter_map(|pair| {
-                    let pair = pair.as_array()?;
-                    Some(format!(
-                        "{} {}",
-                        detail_text(pair.first()?),
-                        detail_text(pair.get(1)?)
-                    ))
-                })
-                .collect();
-            if !labels.is_empty() {
-                add_html(
-                    &mut html,
-                    &rich_line(&escape_html(&labels.join(" · "), 350, 600)),
-                );
-            }
-        }
-        if let Some(actions) = post.detail["actions"].as_array() {
-            for action in actions.iter().take(12) {
-                if !action.is_object() {
-                    continue;
-                }
-                let kind = action["type"].as_str().unwrap_or("调整");
-                let mark = match kind {
-                    "清仓" => "🗑",
-                    "新建" => "🆕",
-                    "增持" => "➕",
-                    "减持" => "➖",
-                    _ => "•",
-                };
-                let stock = action["stock"].as_str().unwrap_or("");
-                let symbol = action["symbol"].as_str().unwrap_or("");
-                let name = if symbol.is_empty() {
-                    stock.to_string()
-                } else {
-                    format!("{stock}（{symbol}）")
-                };
-                let prev = action["prev"].as_str().unwrap_or("0.0%");
-                let target = action["target"].as_str().unwrap_or("0.0%");
-                let line = format!("{mark} {kind}　{name}\n{prev} → {target}");
-                add_html(&mut html, &rich_paragraphs(&escape_html(&line, 300, 500)));
-                if !action["price"].is_null() {
-                    add_html(
-                        &mut html,
-                        &rich_line(&escape_html(
-                            &format!("成交价 {}", detail_text(&action["price"])),
-                            40,
-                            120,
-                        )),
-                    );
-                }
-            }
-        }
-        if let Some(holdings) = post.detail["holdings"].as_array() {
-            let mut printed = false;
-            for holding in holdings.iter().take(15) {
-                let Some(name) = holding["name"].as_str().filter(|s| !s.is_empty()) else {
-                    continue;
-                };
-                if holding["weight"].is_null() {
-                    continue;
-                }
-                if !printed {
-                    add_html(&mut html, "<p>现有持仓</p>");
-                    printed = true;
-                }
-                let symbol = holding["symbol"].as_str().unwrap_or("");
-                let line = format!("{name}（{symbol}） {}%", detail_text(&holding["weight"]));
-                add_html(&mut html, &rich_line(&escape_html(&line, 200, 350)));
-            }
-        }
-        let cash = detail_text(&post.detail["cash"]);
-        if !cash.is_empty() {
-            add_html(
-                &mut html,
-                &rich_line(&escape_html(&format!("💵 现金 {cash}"), 40, 100)),
-            );
-        }
+    let combination = post.platform == "combination" && post.detail.is_object();
+    if combination {
+        append_combination_rich(&mut html, post);
     } else {
         let mut meta = Vec::new();
         if !post.category.is_empty() {
@@ -1468,7 +1654,7 @@ fn render_telegram_post(
             );
         }
     }
-    if !post.published_at.is_empty() {
+    if !combination && !post.published_at.is_empty() {
         add_html(
             &mut html,
             &format!(
@@ -2437,9 +2623,10 @@ mod tests {
             html,
             concat!(
                 "<p><b>📌 甲&lt;&amp; · 雪球组合 · 调仓</b></p>",
-                "<p>今日 +1.2% · 净值 1.031</p><p>➕ 增持　甲&lt;&amp;（SH1）<br>1% → 2%</p>",
-                "<p>成交价 10&lt;&amp;</p><p>现有持仓</p><p>乙（SZ2） 12.5%</p>",
-                "<p>💵 现金 20%</p><footer>🕐 2026-09-28 12:00</footer>"
+                "<p>今日 +1.2% · 净值 1.031</p>",
+                "<table striped><thead><tr><th align=\"left\">操作</th><th align=\"left\">标的</th><th align=\"right\">仓位</th><th align=\"right\">成交价</th></tr></thead><tbody><tr><td align=\"left\">➕ 增持</td><td align=\"left\">甲&lt;&amp;<br>SH1</td><td align=\"right\">1% → 2%</td><td align=\"right\">10&lt;&amp;</td></tr></tbody></table>",
+                "<table striped><caption>现有持仓</caption><thead><tr><th align=\"left\">持仓</th><th align=\"right\">仓位</th></tr></thead><tbody><tr><td align=\"left\">乙（SZ2）</td><td align=\"right\">12.5%</td></tr></tbody></table>",
+                "<footer>💵 现金 20% · 🕐 2026-09-28 12:00</footer>"
             )
         );
     }
@@ -3102,6 +3289,48 @@ mod tests {
         assert_eq!(
             send_bark_text("", "t", "b").await.unwrap_err(),
             "Bark 未绑定"
+        );
+    }
+
+    #[test]
+    fn wecom_combination_matches_python_layout() {
+        let note = Note {
+            kol_name: "甲&",
+            platform: "combination",
+            external_id: "c1",
+            post_type: "post",
+            title: "ignored",
+            content: r#"{"raw":true}"#,
+            url: "https://xueqiu.com/P/ZH1",
+            published_at: "2026-09-28 12:00",
+        };
+        let detail = serde_json::json!({
+            "stats": [["今日收益", "+1.2%"], ["净值", "1.031"]],
+            "actions": [{
+                "type": "增持",
+                "stock": "甲&",
+                "symbol": "SH1",
+                "prev": "1%",
+                "target": "2%",
+                "price": "10<"
+            }],
+            "holdings": [{"name": "乙", "symbol": "SZ2", "weight": 12.5}],
+            "cash": "20%"
+        });
+        assert_eq!(
+            wecom_combination(&note, &detail),
+            concat!(
+                "**📌 甲& · 雪球组合 · 调仓**\n\n",
+                "**今日收益** +1.2%　**净值** 1.031\n\n",
+                "➕ **增持** 甲&（SH1）\n",
+                "1% → 2%\n",
+                "成交价 10<\n\n",
+                "💵 现金 **20%**\n",
+                "现有持仓\n",
+                "乙（SZ2） 12.5%\n",
+                "🕐 2026-09-28 12:00\n",
+                "[查看原文](https://xueqiu.com/P/ZH1)"
+            )
         );
     }
 

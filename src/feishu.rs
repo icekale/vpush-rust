@@ -28,50 +28,278 @@ pub async fn notify(db: &Db, note: Note<'_>) -> Result<(), String> {
         .map_err(|e| e.to_string())?
 }
 
+pub struct CardContext<'a> {
+    pub category: &'a str,
+    pub tags: &'a Value,
+    pub detail: &'a Value,
+    pub favorite: bool,
+    pub keyword: bool,
+}
+
+fn empty_value() -> &'static Value {
+    static EMPTY: std::sync::LazyLock<Value> = std::sync::LazyLock::new(|| Value::Null);
+    &EMPTY
+}
+
 pub fn card(note: &Note<'_>) -> Value {
-    let platform = if note.platform == "xueqiu" {
-        "雪球"
-    } else {
-        note.platform
-    };
+    card_with(
+        note,
+        &CardContext {
+            category: "",
+            tags: empty_value(),
+            detail: empty_value(),
+            favorite: false,
+            keyword: false,
+        },
+    )
+}
+
+pub fn card_with(note: &Note<'_>, ctx: &CardContext<'_>) -> Value {
+    if note.platform == "combination" && ctx.detail.is_object() {
+        return combination_card(note, ctx.detail);
+    }
+    let platform = platform_label(note.platform);
     let mut title = format!("📌 {} · {platform}", note.kol_name);
     if note.post_type == "reply" {
         title.push_str(" · 回复");
     }
-    let content = {
-        let text = if note.content.is_empty() {
-            note.title
-        } else {
-            note.content
-        };
-        let text = if text.is_empty() {
-            "（无正文）"
-        } else {
-            text
-        };
-        truncate(text, 2000)
-    };
+    let content = truncate(body_text(note.content, note.title), 2000);
+    let mut meta = Vec::new();
+    let badges = badges(ctx.favorite, ctx.keyword);
+    if !badges.is_empty() {
+        meta.push(badges);
+    }
+    if !ctx.category.is_empty() {
+        meta.push(format!("🗂 {}", ctx.category));
+    }
+    if let Some(tags) = ctx.tags.as_array() {
+        let tags = tags
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|tag| !tag.is_empty())
+            .take(12)
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !tags.is_empty() {
+            meta.push(format!("🏷 {tags}"));
+        }
+    }
+    meta.push(format!("🕐 {}", note.published_at));
     let mut elements = vec![
         json!({"tag": "div", "text": {"tag": "lark_md", "content": content}}),
         json!({"tag": "hr"}),
-        json!({"tag": "div", "text": {"tag": "lark_md", "content": format!("🕐 {}", note.published_at)}}),
+        json!({"tag": "div", "text": {"tag": "lark_md", "content": meta.join("\n")}}),
     ];
-    if note.url.starts_with("https://") || note.url.starts_with("http://") {
-        elements.push(json!({
-            "tag": "button",
-            "text": {"tag": "plain_text", "content": "查看原文"},
-            "type": "primary",
-            "behaviors": [{"type": "open_url", "default_url": note.url}]
-        }));
+    if show_original(note.platform, note.url) {
+        elements.push(link_button("查看原文", note.url, "primary"));
     }
+    interactive(
+        &title,
+        &summary(&[&title, &preview(note.content, note.title)]),
+        "blue",
+        elements,
+    )
+}
+
+fn combination_card(note: &Note<'_>, detail: &Value) -> Value {
+    let title = format!("📌 {} · 雪球组合 · 调仓", note.kol_name);
+    let mut elements = Vec::new();
+    let mut summary_extra = String::new();
+    if let Some(stats) = detail["stats"].as_array() {
+        let line = stats
+            .iter()
+            .filter_map(|pair| {
+                let pair = pair.as_array()?;
+                Some(format!(
+                    "**{}** {}",
+                    pair.first()?.as_str().unwrap_or(""),
+                    pair.get(1)?.as_str().unwrap_or("")
+                ))
+            })
+            .collect::<Vec<_>>()
+            .join("　");
+        if !line.is_empty() {
+            summary_extra = stats
+                .iter()
+                .filter_map(|pair| {
+                    let pair = pair.as_array()?;
+                    Some(format!(
+                        "{} {}",
+                        pair.first()?.as_str().unwrap_or(""),
+                        pair.get(1)?.as_str().unwrap_or("")
+                    ))
+                })
+                .collect::<Vec<_>>()
+                .join("　");
+            elements.push(json!({"tag": "div", "text": {"tag": "lark_md", "content": line}}));
+            elements.push(json!({"tag": "hr"}));
+        }
+    }
+    if let Some(actions) = detail["actions"].as_array() {
+        for action in actions.iter().take(12).filter(|action| action.is_object()) {
+            let kind = action["type"].as_str().unwrap_or("调整");
+            let icon = match kind {
+                "清仓" => "🗑",
+                "新建" => "🆕",
+                "增持" => "➕",
+                "减持" => "➖",
+                _ => "•",
+            };
+            let stock = action["stock"].as_str().unwrap_or("");
+            let symbol = action["symbol"].as_str().unwrap_or("");
+            let name = if symbol.is_empty() {
+                stock.to_string()
+            } else {
+                format!("{stock}（{symbol}）")
+            };
+            if summary_extra.is_empty() {
+                summary_extra = if stock.is_empty() {
+                    kind.to_string()
+                } else {
+                    format!("{kind} {stock}")
+                };
+            }
+            let mut text = format!(
+                "{icon} **{kind}** {name}\n{} → {}",
+                action["prev"].as_str().unwrap_or("0.0%"),
+                action["target"].as_str().unwrap_or("0.0%")
+            );
+            let price = scalar(&action["price"]);
+            if !price.is_empty() {
+                text.push_str(&format!("\n成交价 {price}"));
+            }
+            elements.push(json!({"tag": "div", "text": {"tag": "lark_md", "content": text}}));
+        }
+    }
+    if let Some(cash) = detail["cash"].as_str().filter(|cash| !cash.is_empty()) {
+        elements.push(json!({"tag": "div", "text": {"tag": "lark_md", "content": format!("💵 现金 **{cash}**")}}));
+    }
+    if let Some(holdings) = detail["holdings"].as_array() {
+        let lines = holdings
+            .iter()
+            .filter(|holding| {
+                holding["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty())
+                    && !holding["weight"].is_null()
+            })
+            .take(15)
+            .map(|holding| {
+                format!(
+                    "{}（{}） {}%",
+                    holding["name"].as_str().unwrap_or(""),
+                    holding["symbol"].as_str().unwrap_or(""),
+                    scalar(&holding["weight"])
+                )
+            })
+            .collect::<Vec<_>>();
+        if !lines.is_empty() {
+            elements.push(json!({
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": format!("**现有持仓**\n{}", lines.join("\n"))}
+            }));
+        }
+    }
+    elements.push(json!({"tag": "hr"}));
+    elements.push(json!({"tag": "div", "text": {"tag": "lark_md", "content": format!("🕐 {}", note.published_at)}}));
+    if show_original(note.platform, note.url) {
+        elements.push(link_button("查看原文", note.url, "primary"));
+    }
+    interactive(
+        &title,
+        &summary(&[&title, &summary_extra]),
+        "blue",
+        elements,
+    )
+}
+
+fn interactive(title: &str, summary: &str, template: &str, elements: Vec<Value>) -> Value {
     json!({
         "msg_type": "interactive",
         "card": {
             "schema": "2.0",
-            "header": {"title": {"tag": "plain_text", "content": title}, "template": "blue"},
+            "config": {"width_mode": "fill", "summary": {"content": summary}},
+            "header": {"title": {"tag": "plain_text", "content": title}, "template": template},
             "body": {"elements": elements}
         }
     })
+}
+
+fn link_button(text: &str, url: &str, kind: &str) -> Value {
+    json!({
+        "tag": "button",
+        "text": {"tag": "plain_text", "content": text},
+        "type": kind,
+        "behaviors": [{"type": "open_url", "default_url": url}]
+    })
+}
+
+fn platform_label(platform: &str) -> &str {
+    match platform {
+        "xueqiu" => "雪球",
+        "combination" => "雪球组合",
+        "weibo" => "微博",
+        "twitter" => "X",
+        "zsxq" => "知识星球",
+        "truth" => "Truth Social",
+        other => other,
+    }
+}
+
+fn show_original(platform: &str, url: &str) -> bool {
+    platform != "zsxq" && (url.starts_with("https://") || url.starts_with("http://"))
+}
+
+fn body_text<'a>(content: &'a str, title: &'a str) -> &'a str {
+    if !content.is_empty() {
+        content
+    } else if !title.is_empty() {
+        title
+    } else {
+        "（无正文）"
+    }
+}
+
+fn preview(content: &str, title: &str) -> String {
+    let flat = body_text(content, title)
+        .chars()
+        .map(|ch| if ch == '\n' { ' ' } else { ch })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate(&flat, 60)
+}
+
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn badges(favorite: bool, keyword: bool) -> String {
+    match (favorite, keyword) {
+        (true, true) => "🔔 特别关注 · 🔑 命中关键词".into(),
+        (true, false) => "🔔 特别关注".into(),
+        (false, true) => "🔑 命中关键词".into(),
+        (false, false) => String::new(),
+    }
+}
+
+fn summary(parts: &[&str]) -> String {
+    let text = parts
+        .iter()
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("：");
+    let text: String = text
+        .chars()
+        .filter(|ch| *ch != '\u{1FAE9}' && *ch != '\u{1FAEA}')
+        .collect();
+    truncate(&text, 100)
 }
 
 async fn webhook(db: &Db) -> Result<Option<String>, String> {
@@ -150,7 +378,12 @@ pub fn definitive(err: &str) -> bool {
         .any(|word| err.contains(word))
 }
 
-pub async fn deliver_user(db: &Db, user_id: i64, note: &Note<'_>) -> Result<(), String> {
+pub async fn deliver_user(
+    db: &Db,
+    user_id: i64,
+    note: &Note<'_>,
+    ctx: &CardContext<'_>,
+) -> Result<(), String> {
     if let Some(route) = db
         .active_feishu_route(user_id)
         .await
@@ -166,6 +399,7 @@ pub async fn deliver_user(db: &Db, user_id: i64, note: &Note<'_>) -> Result<(), 
                     &route.chat_id,
                     "",
                     note,
+                    ctx,
                 )
                 .await
                 {
@@ -181,7 +415,7 @@ pub async fn deliver_user(db: &Db, user_id: i64, note: &Note<'_>) -> Result<(), 
             Err(_) => tracing::warn!(user_id, "飞书个人凭据无法解密，改用共享应用"),
         }
     }
-    send_shared(db, user_id, Message::Card(note)).await
+    send_shared(db, user_id, Message::Card(note, ctx)).await
 }
 
 pub async fn deliver_text(db: &Db, user_id: i64, text: &str) -> Result<(), String> {
@@ -218,7 +452,7 @@ pub async fn deliver_text(db: &Db, user_id: i64, text: &str) -> Result<(), Strin
 }
 
 enum Message<'a> {
-    Card(&'a Note<'a>),
+    Card(&'a Note<'a>, &'a CardContext<'a>),
     Text(&'a str),
 }
 
@@ -241,7 +475,9 @@ async fn send_shared(db: &Db, user_id: i64, message: Message<'_>) -> Result<(), 
         return Err("飞书未绑定".into());
     };
     match message {
-        Message::Card(note) => send_card(&app_id, &secret, "feishu", chat_id, open_id, note).await,
+        Message::Card(note, ctx) => {
+            send_card(&app_id, &secret, "feishu", chat_id, open_id, note, ctx).await
+        }
         Message::Text(text) => {
             send_text_im(&app_id, &secret, "feishu", chat_id, open_id, text).await
         }
@@ -280,8 +516,10 @@ async fn send_card(
     chat_id: &str,
     open_id: &str,
     note: &Note<'_>,
+    ctx: &CardContext<'_>,
 ) -> Result<(), String> {
-    let content = serde_json::to_string(&card(note)["card"]).map_err(|err| err.to_string())?;
+    let content =
+        serde_json::to_string(&card_with(note, ctx)["card"]).map_err(|err| err.to_string())?;
     send_im(
         app_id,
         secret,
@@ -466,5 +704,82 @@ mod tests {
         assert!(allowed("https://open.feishu.cn/open-apis/bot/v2/hook/abc"));
         assert!(!allowed("http://open.feishu.cn/hook"));
         assert!(!allowed("https://example.com/hook"));
+    }
+
+    #[test]
+    fn card_includes_badges_and_hides_zsxq_original() {
+        let note = Note {
+            kol_name: "甲",
+            platform: "zsxq",
+            external_id: "1",
+            post_type: "post",
+            title: "标题",
+            content: "正文",
+            url: "https://wx.zsxq.com/1",
+            published_at: "2026-09-28 12:00",
+        };
+        let tags = json!(["半导体"]);
+        let card = card_with(
+            &note,
+            &CardContext {
+                category: "行业",
+                tags: &tags,
+                detail: empty_value(),
+                favorite: true,
+                keyword: true,
+            },
+        );
+        let meta = card["card"]["body"]["elements"][2]["text"]["content"]
+            .as_str()
+            .unwrap();
+        assert!(meta.contains("特别关注"));
+        assert!(meta.contains("命中关键词"));
+        assert!(meta.contains("行业"));
+        assert!(meta.contains("半导体"));
+        assert!(card["card"]["body"]["elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["tag"] != "button"));
+        assert!(card["card"]["config"]["summary"]["content"]
+            .as_str()
+            .unwrap()
+            .contains("知识星球"));
+    }
+
+    #[test]
+    fn combination_card_lists_rebalance_without_raw_json() {
+        let note = Note {
+            kol_name: "组合甲",
+            platform: "combination",
+            external_id: "1",
+            post_type: "rebalance",
+            title: "调仓",
+            content: "{\"raw\":true}",
+            url: "https://xueqiu.com/P/ZH1",
+            published_at: "2026-09-28 12:00",
+        };
+        let detail = json!({
+            "stats": [["总收益", "12.0%"]],
+            "actions": [{"type": "增持", "stock": "贵州茅台", "symbol": "SH600519", "prev": "1.0%", "target": "2.0%", "price": "1800"}],
+            "cash": "5.0%",
+            "holdings": [{"name": "贵州茅台", "symbol": "SH600519", "weight": 2}]
+        });
+        let card = card_with(
+            &note,
+            &CardContext {
+                category: "",
+                tags: empty_value(),
+                detail: &detail,
+                favorite: false,
+                keyword: false,
+            },
+        );
+        let body = card["card"]["body"]["elements"].to_string();
+        assert!(body.contains("增持"));
+        assert!(body.contains("贵州茅台"));
+        assert!(body.contains("现金"));
+        assert!(body.contains("现有持仓"));
+        assert!(!body.contains("raw"));
     }
 }

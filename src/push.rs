@@ -240,7 +240,30 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             }
         }
         if channels.feishu {
-            match crate::feishu::deliver_user(db, target.user_id, note).await {
+            let empty = serde_json::Value::Null;
+            let (category, tags, detail, favorite, keyword) = match &telegram_post {
+                Ok(Some(post)) => {
+                    let (favorite, keyword) = telegram_reasons(db, post, target.user_id)
+                        .await
+                        .unwrap_or((target.favorite, false));
+                    (
+                        post.category.as_str(),
+                        &post.tags,
+                        &post.detail,
+                        favorite,
+                        keyword,
+                    )
+                }
+                _ => ("", &empty, &empty, target.favorite, false),
+            };
+            let ctx = crate::feishu::CardContext {
+                category,
+                tags,
+                detail,
+                favorite,
+                keyword,
+            };
+            match crate::feishu::deliver_user(db, target.user_id, note, &ctx).await {
                 Ok(()) => {
                     remember_success(
                         db,
@@ -617,7 +640,32 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
                 .await
             }
             "webpush" => crate::webpush::send_text(db, user_id, &text).await,
-            "feishu" => crate::feishu::deliver_text(db, user_id, &text).await,
+            "feishu" => {
+                let post = load_telegram_post(db, post_id)
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| "帖子不存在".to_string())?;
+                let (favorite, keyword) =
+                    telegram_reasons(db, &post, user_id).await.unwrap_or((false, false));
+                let note = Note {
+                    kol_name: &post.kol_name,
+                    platform: &post.platform,
+                    external_id: &external_id,
+                    post_type: &post.post_type,
+                    title: &post.title,
+                    content: &post.content,
+                    url: &post.url,
+                    published_at: &post.published_at,
+                };
+                let ctx = crate::feishu::CardContext {
+                    category: &post.category,
+                    tags: &post.tags,
+                    detail: &post.detail,
+                    favorite,
+                    keyword,
+                };
+                crate::feishu::deliver_user(db, user_id, &note, &ctx).await
+            }
             _ => Err("未知渠道".into()),
         }
     })

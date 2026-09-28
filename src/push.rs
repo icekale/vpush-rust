@@ -124,7 +124,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             if let Err(err) = wecom(&target.wecom_webhook, note).await {
                 tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
                 note_push_failure(db, &format!("企业微信：{err}")).await;
-                let _ = remember_failure(
+                remember_failure_logged(
                     db,
                     kol_id,
                     (note.platform, note.external_id),
@@ -140,7 +140,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             if let Err(err) = bark(&target.bark_key, note).await {
                 tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
                 note_push_failure(db, &format!("Bark：{err}")).await;
-                let _ = remember_failure(
+                remember_failure_logged(
                     db,
                     kol_id,
                     (note.platform, note.external_id),
@@ -173,7 +173,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     if let Err(err) = result {
                         tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
                         note_push_failure(db, &format!("Telegram：{err}")).await;
-                        let _ = remember_failure(
+                        remember_failure_logged(
                             db,
                             kol_id,
                             (note.platform, note.external_id),
@@ -188,7 +188,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                 Err(err) => {
                     tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
                     note_push_failure(db, &format!("Telegram：{err}")).await;
-                    let _ = remember_failure(
+                    remember_failure_logged(
                         db,
                         kol_id,
                         (note.platform, note.external_id),
@@ -210,7 +210,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             {
                 tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
                 note_push_failure(db, &format!("浏览器：{err}")).await;
-                let _ = remember_failure(
+                remember_failure_logged(
                     db,
                     kol_id,
                     (note.platform, note.external_id),
@@ -247,7 +247,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             .duration_since(UNIX_EPOCH)
             .map(|item| item.as_secs() as i64)
             .unwrap_or(0);
-        let _ = remember_failure(
+        remember_failure_logged(
             db,
             kol_id,
             (note.platform, note.external_id),
@@ -275,6 +275,20 @@ async fn note_push_failure(db: &Db, detail: &str) {
 }
 
 const RETRY_DELAYS: [i64; 3] = [60, 300, 900];
+
+async fn remember_failure_logged(
+    db: &Db,
+    kol_id: i64,
+    identity: (&str, &str),
+    channel: &str,
+    user_id: i64,
+    error: &str,
+    now: i64,
+) {
+    if let Err(err) = remember_failure(db, kol_id, identity, channel, user_id, error, now).await {
+        tracing::warn!(kol = kol_id, channel, "记录推送失败以便重试失败: {err}");
+    }
+}
 
 pub async fn remember_failure(
     db: &Db,
@@ -1371,6 +1385,33 @@ mod tests {
         assert!(!html.contains("<&"));
         assert!(!html.ends_with("&am"));
         assert!(html.contains("🕐 2026-09-28"));
+    }
+
+    #[tokio::test]
+    async fn remember_failure_surfaces_closed_database_errors() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-push-closed-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.pool().close().await;
+        let err = remember_failure(
+            &db,
+            1,
+            ("xueqiu", "missing"),
+            "telegram",
+            1,
+            "send failed",
+            1_000,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("closed") || err.to_string().contains("Pool"));
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

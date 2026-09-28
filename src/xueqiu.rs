@@ -191,7 +191,7 @@ async fn save(db: &Db, kol_id: i64, kol_name: &str, batch: Batch) -> Result<(), 
         if !push {
             continue;
         }
-        crate::push::deliver(
+        crate::push::deliver_later(
             db,
             kol_id,
             &crate::feishu::Note {
@@ -204,8 +204,7 @@ async fn save(db: &Db, kol_id: i64, kol_name: &str, batch: Batch) -> Result<(), 
                 url: &post.url,
                 published_at: &post.published_at,
             },
-        )
-        .await;
+        );
     }
     Ok(())
 }

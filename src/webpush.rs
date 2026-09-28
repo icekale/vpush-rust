@@ -188,6 +188,7 @@ async fn send_payload(db: &Db, user_id: i64, payload: &Value) -> Result<(), Stri
             }
         };
         let endpoint = sub.endpoint.clone();
+        let _slot = crate::push::hold_push_slot().await;
         let posted =
             tokio::task::spawn_blocking(move || post_encrypted(&endpoint, encrypted, auth))
                 .await

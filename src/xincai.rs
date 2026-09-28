@@ -130,12 +130,12 @@ fn build_row(
             .unwrap_or(""),
         MAX_BODY,
     );
-    let content = plain(&html);
+    let images = image_urls(&html);
     let summary = clip(
         &plain(
             item.get("text")
                 .and_then(|value| value.as_str())
-                .unwrap_or(content.as_str()),
+                .unwrap_or(html.as_str()),
         ),
         2000,
     );
@@ -165,7 +165,7 @@ fn build_row(
             }
         },
         summary,
-        content,
+        content: html,
         url: public_url(
             item.get("url")
                 .and_then(|value| value.as_str())
@@ -206,8 +206,46 @@ fn build_row(
                     .and_then(|value| value.as_i64())
                     .unwrap_or(0)
             }),
-        images: image_urls(&html),
+        images,
+        topics: topic_list(item),
+        fetched_at: {
+            let fetched = normalize_ts(
+                item.get("fetchedAt")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(""),
+                now,
+            );
+            if fetched.is_empty() { now.to_string() } else { fetched }
+        },
+        content_hash: clip(
+            item.get("contentHash")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim(),
+            64,
+        ),
+        platform: clip(
+            item.get("platform")
+                .and_then(|value| value.as_str())
+                .unwrap_or("")
+                .trim(),
+            20,
+        ),
     })
+}
+
+fn topic_list(item: &serde_json::Map<String, Value>) -> String {
+    let Some(list) = item.get("topics").and_then(|value| value.as_array()) else {
+        return "[]".into();
+    };
+    let names: Vec<String> = list
+        .iter()
+        .filter_map(|value| value.as_str())
+        .map(|value| clip(value.trim(), 20))
+        .filter(|value| !value.is_empty())
+        .take(3)
+        .collect();
+    serde_json::to_string(&names).unwrap_or_else(|_| "[]".into())
 }
 
 fn issue_object(item: &serde_json::Map<String, Value>) -> Option<&serde_json::Map<String, Value>> {
@@ -378,7 +416,7 @@ mod tests {
         let body = json!({
             "group": "心裁",
             "articles": [
-                {"sourceId": "si35", "sourceName": "财新周刊", "externalId": "a1", "title": "标题", "html": "<p>你好</p>", "url": "https://example.com/a", "publishedAt": "2024-01-02T00:00:00Z"},
+                {"sourceId": "si35", "sourceName": "财新周刊", "externalId": "a1", "title": "标题", "platform": "caixin", "topics": ["政经", "市场"], "html": "<p>你好</p>", "url": "https://example.com/a", "publishedAt": "2024-01-02T00:00:00Z"},
                 {"title": "没有编号"},
                 {"sourceId": "si35", "sourceName": "财新周刊", "externalId": "a2", "title": "越界", "url": "file:///etc/passwd", "html": "x"}
             ]
@@ -404,7 +442,27 @@ mod tests {
             .as_i64()
             .unwrap();
         let article = db.news_article(user.id, article_id).await.unwrap().unwrap();
-        assert_eq!(article["content"], "改过");
+        assert_eq!(article["content"], "<p>改过</p>");
+        assert_eq!(article["content_html"], "<p>改过</p>");
+        assert_eq!(article["source_platform"], "caixin");
+        assert_eq!(article["topics"], json!(["政经", "市场"]));
+        let figure = json!({"articles": [{"sourceId": "ft", "sourceName": "FT · 中国", "externalId": "f1", "title": "图", "platform": "ft", "html": "<figure><img src=\"https://img.example/a.jpg\"></figure>", "text": "正文 & 说明", "url": "https://example.com/f"}]});
+        ingest(&db, &figure).await.unwrap();
+        let listed = db.list_news(user.id, 0, "", false, 20, 0).await.unwrap();
+        let figure_id = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["title"] == "图")
+            .unwrap()["id"]
+            .as_i64()
+            .unwrap();
+        let figure = db.news_article(user.id, figure_id).await.unwrap().unwrap();
+        let html = figure["content_html"].as_str().unwrap();
+        assert!(html.contains("<img"));
+        assert!(html.contains("正文 &amp; 说明"));
+        assert_eq!(figure["source_platform"], "ft");
+        assert!(figure["has_image"].as_bool().unwrap());
         let sources = db.admin_news_sources().await.unwrap();
         assert_eq!(sources[0]["kind"], "magazine");
         assert_eq!(sources[0]["feeds"][0]["enabled"], false);

@@ -110,6 +110,61 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
     }
 }
 
+struct OwnedNote {
+    kol_name: String,
+    platform: String,
+    external_id: String,
+    post_type: String,
+    title: String,
+    content: String,
+    url: String,
+    published_at: String,
+}
+
+impl OwnedNote {
+    fn as_note(&self) -> Note<'_> {
+        Note {
+            kol_name: &self.kol_name,
+            platform: &self.platform,
+            external_id: &self.external_id,
+            post_type: &self.post_type,
+            title: &self.title,
+            content: &self.content,
+            url: &self.url,
+            published_at: &self.published_at,
+        }
+    }
+}
+
+/// 入库之后再推。一个新帖一个任务。
+/// ponytail: 突发时会挤同一条 SQLite 连接，到时再收成一条队列。
+pub fn deliver_later(db: &Db, kol_id: i64, note: &Note<'_>) {
+    let db = db.clone();
+    let note = OwnedNote {
+        kol_name: note.kol_name.to_string(),
+        platform: note.platform.to_string(),
+        external_id: note.external_id.to_string(),
+        post_type: note.post_type.to_string(),
+        title: note.title.to_string(),
+        content: note.content.to_string(),
+        url: note.url.to_string(),
+        published_at: note.published_at.to_string(),
+    };
+    tokio::spawn(async move {
+        deliver(&db, kol_id, &note.as_note()).await;
+    });
+}
+
+/// ponytail: 4 in-flight push HTTP. Upstream 429s before these 4 cores do.
+fn push_slots() -> &'static tokio::sync::Semaphore {
+    static SLOTS: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    SLOTS.get_or_init(|| tokio::sync::Semaphore::new(4))
+}
+
+pub(crate) async fn hold_push_slot() -> tokio::sync::SemaphorePermit<'static> {
+    push_slots().acquire().await.expect("push slots stay open")
+}
+
 pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     let targets = match db.push_targets(kol_id).await {
         Ok(targets) => targets,
@@ -121,223 +176,246 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     let rich_messages = telegram_rich_messages(db).await;
     let now = beijing_minutes();
     let telegram_post = load_telegram_identity(db, kol_id, note.platform, note.external_id).await;
-    for target in &targets {
-        if !target.notify_enabled || dnd_blocks(target, now) {
-            continue;
-        }
-        let channels = channels(&target.push_channels);
-        let unix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|item| item.as_secs() as i64)
-            .unwrap_or(0);
-        if channels.wecom && wecom_bound(&target.wecom_webhook) {
-            if let Err(err) = wecom(&target.wecom_webhook, note).await {
-                tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
-                note_push_failure(db, &format!("企业微信：{err}")).await;
-                remember_failure_logged(
-                    db,
-                    kol_id,
-                    (note.platform, note.external_id),
-                    "wecom",
-                    target.user_id,
-                    &err,
-                    unix,
-                )
-                .await;
-            } else {
-                remember_success(
-                    db,
-                    kol_id,
-                    (note.platform, note.external_id),
-                    "wecom",
-                    target.user_id,
-                )
-                .await;
+    let users = async {
+        for target in &targets {
+            if !target.notify_enabled || dnd_blocks(target, now) {
+                continue;
             }
-        }
-        if channels.bark && valid_bark_key(&target.bark_key) {
-            if let Err(err) = bark(&target.bark_key, note).await {
-                tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
-                note_push_failure(db, &format!("Bark：{err}")).await;
-                remember_failure_logged(
-                    db,
-                    kol_id,
-                    (note.platform, note.external_id),
-                    "bark",
-                    target.user_id,
-                    &err,
-                    unix,
-                )
-                .await;
-            } else {
-                remember_success(
-                    db,
-                    kol_id,
-                    (note.platform, note.external_id),
-                    "bark",
-                    target.user_id,
-                )
-                .await;
-            }
-        }
-        if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
-            let key = crate::feishu_personal::credential_key().unwrap_or_default();
-            match telegram_secret(&target.telegram_bot_token, &key) {
-                Ok(token) => {
-                    let result = match &telegram_post {
-                        Ok(Some(post)) => {
-                            send_telegram_post(
-                                &token,
-                                &target.telegram_chat_id,
-                                Some(post),
-                                target.user_id,
+            let channels = channels(&target.push_channels);
+            let unix = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|item| item.as_secs() as i64)
+                .unwrap_or(0);
+            tokio::join!(
+                async {
+                    if channels.wecom && wecom_bound(&target.wecom_webhook) {
+                        if let Err(err) = wecom(&target.wecom_webhook, note).await {
+                            tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
+                            note_push_failure(db, &format!("企业微信：{err}")).await;
+                            remember_failure_logged(
                                 db,
-                                rich_messages,
+                                kol_id,
+                                (note.platform, note.external_id),
+                                "wecom",
+                                target.user_id,
+                                &err,
+                                unix,
                             )
-                            .await
+                            .await;
+                        } else {
+                            remember_success(
+                                db,
+                                kol_id,
+                                (note.platform, note.external_id),
+                                "wecom",
+                                target.user_id,
+                            )
+                            .await;
                         }
-                        Ok(None) => Err("帖子不存在".into()),
-                        Err(err) => Err(format!("读取帖子失败: {err}")),
-                    };
-                    if let Err(err) = result {
-                        tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
-                        note_push_failure(db, &format!("Telegram：{err}")).await;
-                        remember_failure_logged(
-                            db,
-                            kol_id,
-                            (note.platform, note.external_id),
-                            "telegram",
-                            target.user_id,
-                            &err,
-                            unix,
-                        )
-                        .await;
-                    } else {
-                        remember_success(
-                            db,
-                            kol_id,
-                            (note.platform, note.external_id),
-                            "telegram",
-                            target.user_id,
-                        )
-                        .await;
                     }
-                }
-                Err(err) => {
-                    tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
-                    note_push_failure(db, &format!("Telegram：{err}")).await;
-                    remember_failure_logged(
-                        db,
-                        kol_id,
-                        (note.platform, note.external_id),
-                        "telegram",
-                        target.user_id,
-                        &err,
-                        unix,
-                    )
-                    .await;
-                }
-            }
+                },
+                async {
+                    if channels.bark && valid_bark_key(&target.bark_key) {
+                        if let Err(err) = bark(&target.bark_key, note).await {
+                            tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
+                            note_push_failure(db, &format!("Bark：{err}")).await;
+                            remember_failure_logged(
+                                db,
+                                kol_id,
+                                (note.platform, note.external_id),
+                                "bark",
+                                target.user_id,
+                                &err,
+                                unix,
+                            )
+                            .await;
+                        } else {
+                            remember_success(
+                                db,
+                                kol_id,
+                                (note.platform, note.external_id),
+                                "bark",
+                                target.user_id,
+                            )
+                            .await;
+                        }
+                    }
+                },
+                async {
+                    if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
+                        let key = crate::feishu_personal::credential_key().unwrap_or_default();
+                        match telegram_secret(&target.telegram_bot_token, &key) {
+                            Ok(token) => {
+                                let result = match &telegram_post {
+                                    Ok(Some(post)) => {
+                                        send_telegram_post(
+                                            &token,
+                                            &target.telegram_chat_id,
+                                            Some(post),
+                                            target.user_id,
+                                            db,
+                                            rich_messages,
+                                        )
+                                        .await
+                                    }
+                                    Ok(None) => Err("帖子不存在".into()),
+                                    Err(err) => Err(format!("读取帖子失败: {err}")),
+                                };
+                                if let Err(err) = result {
+                                    tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
+                                    note_push_failure(db, &format!("Telegram：{err}")).await;
+                                    remember_failure_logged(
+                                        db,
+                                        kol_id,
+                                        (note.platform, note.external_id),
+                                        "telegram",
+                                        target.user_id,
+                                        &err,
+                                        unix,
+                                    )
+                                    .await;
+                                } else {
+                                    remember_success(
+                                        db,
+                                        kol_id,
+                                        (note.platform, note.external_id),
+                                        "telegram",
+                                        target.user_id,
+                                    )
+                                    .await;
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
+                                note_push_failure(db, &format!("Telegram：{err}")).await;
+                                remember_failure_logged(
+                                    db,
+                                    kol_id,
+                                    (note.platform, note.external_id),
+                                    "telegram",
+                                    target.user_id,
+                                    &err,
+                                    unix,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                },
+                async {
+                    if channels.feishu {
+                        let empty = serde_json::Value::Null;
+                        let (category, tags, detail, favorite, keyword) = match &telegram_post {
+                            Ok(Some(post)) => {
+                                let (favorite, keyword) =
+                                    telegram_reasons(db, post, target.user_id)
+                                        .await
+                                        .unwrap_or((target.favorite, false));
+                                (
+                                    post.category.as_str(),
+                                    &post.tags,
+                                    &post.detail,
+                                    favorite,
+                                    keyword,
+                                )
+                            }
+                            _ => ("", &empty, &empty, target.favorite, false),
+                        };
+                        let ctx = crate::feishu::CardContext {
+                            category,
+                            tags,
+                            detail,
+                            favorite,
+                            keyword,
+                        };
+                        match crate::feishu::deliver_user(db, target.user_id, note, &ctx).await {
+                            Ok(()) => {
+                                remember_success(
+                                    db,
+                                    kol_id,
+                                    (note.platform, note.external_id),
+                                    "feishu",
+                                    target.user_id,
+                                )
+                                .await;
+                            }
+                            Err(err) if err == "飞书未绑定" => {}
+                            Err(err) => {
+                                tracing::warn!(
+                                    kol = kol_id,
+                                    user = target.user_id,
+                                    "飞书推送失败: {err}"
+                                );
+                                note_push_failure(db, &format!("飞书：{err}")).await;
+                                remember_failure_logged(
+                                    db,
+                                    kol_id,
+                                    (note.platform, note.external_id),
+                                    "feishu",
+                                    target.user_id,
+                                    &err,
+                                    unix,
+                                )
+                                .await;
+                            }
+                        }
+                    }
+                },
+                async {
+                    if channels.webpush {
+                        if let Err(err) =
+                            crate::webpush::notify_note(db, target.user_id, note, target.favorite)
+                                .await
+                        {
+                            if !unbound_skip(&err) {
+                                tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
+                                note_push_failure(db, &format!("浏览器：{err}")).await;
+                                remember_failure_logged(
+                                    db,
+                                    kol_id,
+                                    (note.platform, note.external_id),
+                                    "webpush",
+                                    target.user_id,
+                                    &err,
+                                    unix,
+                                )
+                                .await;
+                            }
+                        } else {
+                            remember_success(
+                                db,
+                                kol_id,
+                                (note.platform, note.external_id),
+                                "webpush",
+                                target.user_id,
+                            )
+                            .await;
+                        }
+                    }
+                },
+            );
         }
-        if channels.feishu {
-            let empty = serde_json::Value::Null;
-            let (category, tags, detail, favorite, keyword) = match &telegram_post {
-                Ok(Some(post)) => {
-                    let (favorite, keyword) = telegram_reasons(db, post, target.user_id)
-                        .await
-                        .unwrap_or((target.favorite, false));
-                    (
-                        post.category.as_str(),
-                        &post.tags,
-                        &post.detail,
-                        favorite,
-                        keyword,
-                    )
-                }
-                _ => ("", &empty, &empty, target.favorite, false),
-            };
-            let ctx = crate::feishu::CardContext {
-                category,
-                tags,
-                detail,
-                favorite,
-                keyword,
-            };
-            match crate::feishu::deliver_user(db, target.user_id, note, &ctx).await {
-                Ok(()) => {
-                    remember_success(
-                        db,
-                        kol_id,
-                        (note.platform, note.external_id),
-                        "feishu",
-                        target.user_id,
-                    )
-                    .await;
-                }
-                Err(err) if err == "飞书未绑定" => {}
-                Err(err) => {
-                    tracing::warn!(kol = kol_id, user = target.user_id, "飞书推送失败: {err}");
-                    note_push_failure(db, &format!("飞书：{err}")).await;
-                    remember_failure_logged(
-                        db,
-                        kol_id,
-                        (note.platform, note.external_id),
-                        "feishu",
-                        target.user_id,
-                        &err,
-                        unix,
-                    )
-                    .await;
-                }
-            }
+    };
+    let group = async {
+        if let Err(err) = crate::feishu::notify(
+            db,
+            Note {
+                kol_name: note.kol_name,
+                platform: note.platform,
+                external_id: note.external_id,
+                post_type: note.post_type,
+                title: note.title,
+                content: note.content,
+                url: note.url,
+                published_at: note.published_at,
+            },
+        )
+        .await
+        {
+            tracing::warn!(kol = kol_id, "飞书群机器人失败: {err}");
         }
-        if channels.webpush {
-            if let Err(err) =
-                crate::webpush::notify_note(db, target.user_id, note, target.favorite).await
-            {
-                if !unbound_skip(&err) {
-                    tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
-                    note_push_failure(db, &format!("浏览器：{err}")).await;
-                    remember_failure_logged(
-                        db,
-                        kol_id,
-                        (note.platform, note.external_id),
-                        "webpush",
-                        target.user_id,
-                        &err,
-                        unix,
-                    )
-                    .await;
-                }
-            } else {
-                remember_success(
-                    db,
-                    kol_id,
-                    (note.platform, note.external_id),
-                    "webpush",
-                    target.user_id,
-                )
-                .await;
-            }
-        }
-    }
-    if let Err(err) = crate::feishu::notify(
-        db,
-        Note {
-            kol_name: note.kol_name,
-            platform: note.platform,
-            external_id: note.external_id,
-            post_type: note.post_type,
-            title: note.title,
-            content: note.content,
-            url: note.url,
-            published_at: note.published_at,
-        },
-    )
-    .await
-    {
-        tracing::warn!(kol = kol_id, "飞书群机器人失败: {err}");
-    }
+    };
+    tokio::join!(users, group);
 }
 
 async fn note_push_failure(db: &Db, detail: &str) {
@@ -764,6 +842,7 @@ async fn send_wecom_text(url: &str, text: &str) -> Result<(), String> {
     }
     let body = serde_json::json!({"msgtype": "text", "text": {"content": text}}).to_string();
     let url = url.to_string();
+    let _slot = hold_push_slot().await;
     tokio::task::spawn_blocking(move || post_json(&url, &body))
         .await
         .map_err(|err| err.to_string())?
@@ -788,6 +867,7 @@ async fn send_bark_text(key: &str, title: &str, body: &str) -> Result<(), String
         url_encode(title),
         url_encode(body)
     );
+    let _slot = hold_push_slot().await;
     tokio::task::spawn_blocking(move || post_json(&url, ""))
         .await
         .map_err(|err| err.to_string())?
@@ -1389,6 +1469,7 @@ async fn send_telegram_post(
     validate_telegram_send(token, chat_id)?;
     let token = token.to_string();
     let chat_id = chat_id.to_string();
+    let _slot = hold_push_slot().await;
     tokio::task::spawn_blocking(move || {
         telegram_deliver_post_media(
             &token,
@@ -2032,6 +2113,7 @@ async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), Str
     validate_telegram_send(token, chat_id)?;
     let body = telegram_message_body(chat_id, text, None, None);
     let token = token.to_string();
+    let _slot = hold_push_slot().await;
     tokio::task::spawn_blocking(move || telegram_post(&token, "sendMessage", &body))
         .await
         .map_err(|_| "Telegram network error".to_string())?

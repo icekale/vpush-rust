@@ -1814,7 +1814,7 @@ impl Db {
                 (*source_id, *feed_id)
             } else {
                 let source_id = self
-                    .xincai_source(&item.slug, &item.name, group, &item.kind)
+                    .xincai_source(&item.slug, &item.name, group, &item.kind, &item.platform)
                     .await?;
                 let feed_id = self.xincai_feed(source_id).await?;
                 seen.push((item.key.clone(), source_id, feed_id));
@@ -1823,15 +1823,19 @@ impl Db {
             sqlx::query(
                 "INSERT INTO news_articles
                     (source_id, feed_id, external_id, title, summary, content, url, author, published_at,
-                     issue_key, issue_label, issue_title, issue_cover, section, toc_order, images)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     issue_key, issue_label, issue_title, issue_cover, section, toc_order, images, topics,
+                     fetched_at, content_hash)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                  ON CONFLICT(source_id, external_id) DO UPDATE SET
                     feed_id = excluded.feed_id, title = excluded.title, summary = excluded.summary,
                     content = excluded.content, url = excluded.url, author = excluded.author,
                     published_at = excluded.published_at, issue_key = excluded.issue_key,
                     issue_label = excluded.issue_label, issue_title = excluded.issue_title,
                     issue_cover = excluded.issue_cover, section = excluded.section,
-                    toc_order = excluded.toc_order, images = excluded.images",
+                    toc_order = excluded.toc_order, images = excluded.images,
+                    topics = CASE WHEN excluded.topics = '[]' THEN news_articles.topics ELSE excluded.topics END,
+                    fetched_at = excluded.fetched_at,
+                    content_hash = CASE WHEN excluded.content_hash = '' THEN news_articles.content_hash ELSE excluded.content_hash END",
             )
             .bind(source_id)
             .bind(feed_id)
@@ -1849,6 +1853,9 @@ impl Db {
             .bind(&item.section)
             .bind(item.toc_order)
             .bind(&item.images)
+            .bind(&item.topics)
+            .bind(&item.fetched_at)
+            .bind(&item.content_hash)
             .execute(&self.pool)
             .await?;
             saved += 1;
@@ -1870,6 +1877,7 @@ impl Db {
         name: &str,
         group: &str,
         kind: &str,
+        platform: &str,
     ) -> Result<i64, CatalogError> {
         let kind = if kind == "magazine" {
             "magazine"
@@ -1889,6 +1897,7 @@ impl Db {
                 row.get("group_name"),
                 kind,
                 group,
+                platform,
             )
             .await?;
             return Ok(row.get("id"));
@@ -1914,15 +1923,16 @@ impl Db {
                     .execute(&self.pool)
                     .await?;
             }
-            self.touch_xincai_source(id, row.get("kind"), row.get("group_name"), kind, group)
+            self.touch_xincai_source(id, row.get("kind"), row.get("group_name"), kind, group, platform)
                 .await?;
             return Ok(id);
         }
-        let id = sqlx::query("INSERT INTO news_sources (slug, name, group_name, kind, internal) VALUES (?, ?, ?, ?, 1)")
+        let id = sqlx::query("INSERT INTO news_sources (slug, name, group_name, kind, internal, platform) VALUES (?, ?, ?, ?, 1, ?)")
             .bind(slug)
             .bind(name)
             .bind(group)
             .bind(kind)
+            .bind(platform)
             .execute(&self.pool)
             .await?
             .last_insert_rowid();
@@ -1942,11 +1952,19 @@ impl Db {
         current_group: String,
         kind: &str,
         group: &str,
+        platform: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE news_sources SET internal = 1 WHERE id = ? AND internal = 0")
             .bind(id)
             .execute(&self.pool)
             .await?;
+        if !platform.is_empty() {
+            sqlx::query("UPDATE news_sources SET platform = ? WHERE id = ? AND COALESCE(platform, '') = ''")
+                .bind(platform)
+                .bind(id)
+                .execute(&self.pool)
+                .await?;
+        }
         if kind == "magazine" && current_kind != "magazine" {
             sqlx::query("UPDATE news_sources SET kind = 'magazine' WHERE id = ?")
                 .bind(id)
@@ -1973,7 +1991,7 @@ impl Db {
             return Ok(row.get("id"));
         }
         Ok(sqlx::query(
-            "INSERT INTO news_feeds (source_id, name, url, enabled) VALUES (?, '推送', '', 0)",
+            "INSERT INTO news_feeds (source_id, name, url, normalized_url, enabled) VALUES (?, '推送', '', '', 0)",
         )
         .bind(source_id)
         .execute(&self.pool)
@@ -2341,8 +2359,9 @@ impl Db {
     ) -> Result<Value, sqlx::Error> {
         let like = like_pattern(q);
         let rows = sqlx::query(
-            "SELECT a.id, a.source_id, s.name AS source_name, f.name AS feed_name,
-                    a.title, a.summary, a.url, a.author, a.published_at,
+            "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
+                    a.title, a.summary, a.url, a.author, a.published_at, a.topics,
+                    CASE WHEN a.images NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_image,
                     CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
@@ -2393,8 +2412,9 @@ impl Db {
         article_id: i64,
     ) -> Result<Option<Value>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT a.id, a.source_id, s.name AS source_name, f.name AS feed_name,
-                    a.title, a.summary, a.content, a.url, a.author, a.published_at,
+            "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
+                    a.title, a.summary, a.content, a.url, a.author, a.published_at, a.topics,
+                    CASE WHEN a.images NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_image,
                     CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
@@ -7554,7 +7574,7 @@ fn news_item(row: &sqlx::sqlite::SqliteRow, full: bool) -> Value {
         "id": row.get::<i64, _>("id"),
         "source_id": row.get::<i64, _>("source_id"),
         "source_name": row.get::<String, _>("source_name"),
-        "source_platform": "",
+        "source_platform": row.get::<String, _>("source_platform"),
         "feed_name": row.get::<Option<String>, _>("feed_name").unwrap_or_default(),
         "title": row.get::<String, _>("title"),
         "summary": row.get::<String, _>("summary"),
@@ -7563,13 +7583,55 @@ fn news_item(row: &sqlx::sqlite::SqliteRow, full: bool) -> Value {
         "published_at": row.get::<String, _>("published_at"),
         "is_read": is_read,
         "is_new": !is_read,
-        "has_image": false,
-        "topics": [],
+        "has_image": row.get::<i64, _>("has_image") != 0,
+        "topics": topics_of(&row.get::<String, _>("topics")),
     });
     if full {
-        value["content"] = json!(row.get::<String, _>("content"));
+        let content: String = row.get("content");
+        let summary: String = row.get("summary");
+        value["content"] = json!(&content);
+        value["content_html"] = json!(reader_html(&content, &summary));
     }
     value
+}
+
+fn topics_of(raw: &str) -> Value {
+    let Ok(list) = serde_json::from_str::<Vec<Value>>(raw) else {
+        return json!([]);
+    };
+    Value::Array(
+        list.into_iter()
+            .filter_map(|item| {
+                item.as_str()
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(|item| Value::String(item.to_string()))
+            })
+            .collect(),
+    )
+}
+
+fn reader_html(content: &str, summary: &str) -> String {
+    if !crate::news::plain(content).trim().is_empty() {
+        return content.to_string();
+    }
+    let summary = summary.trim();
+    if summary.is_empty() {
+        return content.to_string();
+    }
+    let para = format!("<p>{}</p>", escape_html(summary));
+    if content.contains("<img") {
+        format!("{content}{para}")
+    } else {
+        para
+    }
+}
+
+fn escape_html(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn request_json(row: &sqlx::sqlite::SqliteRow) -> Value {
@@ -7952,6 +8014,13 @@ async fn ensure_news_admin_columns(pool: &SqlitePool) -> Result<(), sqlx::Error>
         )
         .await?;
     }
+    if !sources.is_empty() && !sources.iter().any(|column| column == "platform") {
+        add_column(
+            pool,
+            "ALTER TABLE news_sources ADD COLUMN platform TEXT NOT NULL DEFAULT ''",
+        )
+        .await?;
+    }
     sqlx::query("UPDATE news_sources SET internal = 1 WHERE slug LIKE 'xincai-%' AND internal = 0")
         .execute(pool)
         .await?;
@@ -7963,6 +8032,7 @@ async fn ensure_news_admin_columns(pool: &SqlitePool) -> Result<(), sqlx::Error>
         ("consecutive_failures", "INTEGER NOT NULL DEFAULT 0"),
         ("last_success_at", "TEXT NOT NULL DEFAULT ''"),
         ("last_error_detail", "TEXT NOT NULL DEFAULT ''"),
+        ("normalized_url", "TEXT NOT NULL DEFAULT ''"),
     ];
     for (name, def) in columns {
         if feeds.iter().any(|column| column == name) {
@@ -8006,6 +8076,8 @@ async fn ensure_news_article_columns(pool: &SqlitePool) -> Result<(), sqlx::Erro
         ("toc_order", "INTEGER NOT NULL DEFAULT 0"),
         ("images", "TEXT NOT NULL DEFAULT '[]'"),
         ("fetched_at", "TEXT NOT NULL DEFAULT ''"),
+        ("content_hash", "TEXT NOT NULL DEFAULT ''"),
+        ("topics", "TEXT NOT NULL DEFAULT '[]'"),
     ];
     for (name, def) in columns {
         if existing.iter().any(|column| column == name) {
@@ -8271,6 +8343,10 @@ pub struct XincaiRow {
     pub section: String,
     pub toc_order: i64,
     pub images: String,
+    pub topics: String,
+    pub platform: String,
+    pub fetched_at: String,
+    pub content_hash: String,
 }
 
 #[derive(Debug)]

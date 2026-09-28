@@ -290,7 +290,38 @@ pub fn evaluate_cicc(status: &Value, settings: &Value, now: i64) -> Vec<(String,
             format!("⚠️ 存储机状态已超过 {stale_min} 分钟未刷新，采集/状态服务可能异常。"),
         ));
     }
+    if let Some(alert) = lab_stale_alert(status) {
+        out.push(alert);
+    }
     out
+}
+
+fn lab_stale_alert(status: &Value) -> Option<(String, String)> {
+    if status.get("source").and_then(Value::as_str) != Some("arm-lab") {
+        return None;
+    }
+    if status.get("stale").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let log = status
+        .pointer("/lab/log")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let rc = status.pointer("/lab/last_rc").and_then(Value::as_i64);
+    let age = status.pointer("/lab/age_secs").and_then(Value::as_i64);
+    let message = if log.is_empty() {
+        "⚠️ 中金 ARM 采集没有可读的 cicc-host-sync 日志。".to_string()
+    } else if let Some(rc) = rc.filter(|rc| *rc != 0) {
+        format!("⚠️ 中金 ARM 采集失败：{log} 退出码 {rc}。")
+    } else if let Some(age) = age.filter(|age| *age >= 3600) {
+        format!(
+            "⚠️ 中金 ARM 采集日志 {log} 已约 {} 小时未成功完成。",
+            age.max(0) / 3600
+        )
+    } else {
+        format!("⚠️ 中金 ARM 采集状态过期：{log}。")
+    };
+    Some(("lab_stale".into(), message))
 }
 
 pub async fn check_cicc<F, Fut>(
@@ -827,6 +858,114 @@ mod tests {
         .unwrap();
         assert_eq!(again, 0);
         assert!(sent.is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn arm_lab_stale_alerts_without_using_the_thirty_minute_clock() {
+        let settings = json!({"stale_minutes": 30});
+        let fresh = json!({
+            "available": true,
+            "stale": false,
+            "source": "arm-lab",
+            "lab": {
+                "last_run": "2026-09-28T03:00:48+08:00",
+                "last_rc": 0,
+                "log": "cicc-host-sync-20260928-030048.log",
+                "age_secs": 20 * 3600
+            }
+        });
+        assert!(evaluate_cicc(&fresh, &settings, 9_999_999).is_empty());
+        let fallback = json!({"available": true, "stale": true});
+        assert!(evaluate_cicc(&fallback, &settings, 9_999_999).is_empty());
+        let missing = json!({
+            "available": true,
+            "stale": true,
+            "source": "arm-lab",
+            "lab": {"last_run": null, "last_rc": null, "log": null, "age_secs": null}
+        });
+        let missing_alerts = evaluate_cicc(&missing, &settings, 0);
+        assert_eq!(missing_alerts.len(), 1);
+        assert_eq!(missing_alerts[0].0, "lab_stale");
+        assert!(missing_alerts[0].1.contains("没有可读"));
+        assert!(!missing_alerts[0].1.contains("未刷新"));
+        let aged = json!({
+            "available": true,
+            "stale": true,
+            "source": "arm-lab",
+            "lab": {
+                "last_run": "2026-09-26T03:00:48+08:00",
+                "last_rc": 0,
+                "log": "cicc-host-sync-20260926-030048.log",
+                "age_secs": 50 * 3600
+            }
+        });
+        let aged_alerts = evaluate_cicc(&aged, &settings, 0);
+        assert_eq!(aged_alerts.len(), 1);
+        assert_eq!(aged_alerts[0].0, "lab_stale");
+        assert!(aged_alerts[0].1.contains("50"));
+        assert!(!aged_alerts[0].1.contains("未刷新"));
+        let failed = json!({
+            "available": true,
+            "stale": true,
+            "source": "arm-lab",
+            "lab": {
+                "last_run": "2026-09-28T03:00:48+08:00",
+                "last_rc": 2,
+                "log": "cicc-host-sync-20260928-030048.log",
+                "age_secs": 10
+            }
+        });
+        let failed_alerts = evaluate_cicc(&failed, &settings, 0);
+        assert_eq!(failed_alerts.len(), 1);
+        assert!(failed_alerts[0].1.contains("退出码 2"));
+        assert!(!failed_alerts[0].1.contains("dry_run"));
+    }
+
+    #[tokio::test]
+    async fn arm_lab_stale_alert_keeps_the_daily_cooldown() {
+        let path = temp_db();
+        let db = Db::open(&path).await.unwrap();
+        let status = json!({
+            "available": true,
+            "stale": true,
+            "source": "arm-lab",
+            "lab": {
+                "last_run": "2026-09-26T03:00:48+08:00",
+                "last_rc": 0,
+                "log": "cicc-host-sync-20260926-030048.log",
+                "age_secs": 40 * 3600
+            }
+        });
+        let now = 2_000_000;
+        let mut sent = Vec::new();
+        let count = check_cicc(&db, now, &status, |message| {
+            sent.push(message);
+            async {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(count, 1);
+        assert!(sent[0].contains("cicc-host-sync-20260926-030048.log"));
+        assert!(sent[0].contains("40"));
+        assert!(!sent[0].contains("未刷新"));
+        sent.clear();
+        let cooled = check_cicc(&db, now + 400, &status, |message| {
+            sent.push(message);
+            async {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(cooled, 0);
+        assert!(sent.is_empty());
+        let again = check_cicc(&db, now + 86_400, &status, |message| {
+            sent.push(message);
+            async {}
+        })
+        .await
+        .unwrap();
+        assert_eq!(again, 1);
+        assert_eq!(sent.len(), 1);
         let _ = std::fs::remove_file(&path);
     }
 }

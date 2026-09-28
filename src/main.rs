@@ -4725,9 +4725,8 @@ async fn login(
     Json(body): Json<LoginIn>,
 ) -> Result<Json<Value>, ApiError> {
     let username = body.username.trim().to_string();
-    check_login_limit(&state, &ip, &username)?;
-    pace_login(&state, &username).await;
     require_turnstile(&state, &body.turnstile, "login", &ip).await?;
+    admit_password_attempt(&state, &ip, &username).await?;
     let user = state.db.user_by_username(&username).await.map_err(db_err)?;
     let password = body.password.clone();
     let stored = user
@@ -4744,7 +4743,6 @@ async fn login(
     .await
     .unwrap_or(false);
     if !ok || body.password.is_empty() || body.password.len() > auth::PASSWORD_MAX {
-        record_login_failure(&state, &ip, &username);
         let status = if body.password.len() > auth::PASSWORD_MAX {
             StatusCode::BAD_REQUEST
         } else {
@@ -4758,7 +4756,7 @@ async fn login(
         return Err(ApiError::new(status, detail));
     }
     let user = user.expect("checked");
-    clear_login_failures(&state, &ip, &username);
+    release_login_success(&state, &ip, &username);
     state.db.touch_login(user.id).await.map_err(db_err)?;
     Ok(Json(session_payload(&state, &user).await?))
 }
@@ -4772,32 +4770,25 @@ async fn register(
         return Err(ApiError::new(StatusCode::FORBIDDEN, "暂未开放注册"));
     }
     let attempted = body.username.trim().to_string();
-    check_login_limit(&state, &ip, &attempted)?;
-    pace_login(&state, &attempted).await;
     require_turnstile(&state, &body.turnstile, "register", &ip).await?;
+    admit_password_attempt(&state, &ip, &attempted).await?;
     let username = match auth::validate_username(&body.username) {
         Ok(name) => name,
-        Err(msg) => {
-            record_login_failure(&state, &ip, &attempted);
-            return Err(ApiError::new(StatusCode::BAD_REQUEST, msg));
-        }
+        Err(msg) => return Err(ApiError::new(StatusCode::BAD_REQUEST, msg)),
     };
     if body.password.len() < auth::PASSWORD_MIN {
-        record_login_failure(&state, &ip, &attempted);
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("密码至少{}位", auth::PASSWORD_MIN),
         ));
     }
     if body.password.len() > auth::PASSWORD_MAX {
-        record_login_failure(&state, &ip, &attempted);
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             format!("密码最长{}位", auth::PASSWORD_MAX),
         ));
     }
     if body.code.trim().is_empty() {
-        record_login_failure(&state, &ip, &attempted);
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "注册需要邀请码，请向管理员索取",
@@ -4807,11 +4798,11 @@ async fn register(
     let id = match state.db.register(&body.code, &username, &hash).await {
         Ok(id) => id,
         Err(RegisterError::Rejected(msg)) => {
-            record_login_failure(&state, &ip, &attempted);
             return Err(ApiError::new(StatusCode::BAD_REQUEST, msg));
         }
         Err(RegisterError::Db(err)) => return Err(db_err(err)),
     };
+    release_login_success(&state, &ip, &attempted);
     let user = state
         .db
         .user_by_id(id)
@@ -4834,25 +4825,20 @@ async fn wechat_login(
             "未配置微信小程序 app_id/app_secret",
         ));
     }
-    check_login_limit(&state, &ip, "")?;
+    reserve_login(&state, &ip, "")?;
     let openid = match wechat::exchange(&body.code, &app_id, &secret).await {
         Ok(openid) => openid,
-        Err(err) => {
-            record_login_failure(&state, &ip, "");
-            return Err(wechat_err(err));
-        }
+        Err(err) => return Err(wechat_err(err)),
     };
-    check_login_limit(&state, &ip, &openid)?;
+    reserve_login_account(&state, &ip, &openid)?;
     pace_login(&state, &openid).await;
+    recheck_login(&state, &ip, &openid)?;
     let id =
         match wechat::account(&state.db, state.allow_register, &openid, &body.invite_code).await {
             Ok(id) => id,
-            Err(err) => {
-                record_login_failure(&state, &ip, &openid);
-                return Err(wechat_err(err));
-            }
+            Err(err) => return Err(wechat_err(err)),
         };
-    clear_login_failures(&state, &ip, &openid);
+    release_login_success(&state, &ip, &openid);
     state.db.touch_login(id).await.map_err(db_err)?;
     let user = state
         .db
@@ -6327,10 +6313,123 @@ fn record_limited(limit: &mut LoginLimit, ip: &str, account: &str, now: u64) {
     }
 }
 
-fn clear_limited(limit: &mut LoginLimit, ip: &str, account: &str) {
-    for key in login_keys(ip, account).iter() {
+fn clear_pair_limited(limit: &mut LoginLimit, ip: &str, account: &str) {
+    if let Some(pair) = login_keys(ip, account).pair {
+        limit.hits.remove(&pair);
+    }
+}
+
+fn pop_login_hit(limit: &mut LoginLimit, key: &str) {
+    let Some(hits) = limit.hits.get_mut(key) else {
+        return;
+    };
+    hits.pop();
+    if hits.is_empty() {
         limit.hits.remove(key);
     }
+}
+
+fn release_successful_login(limit: &mut LoginLimit, ip: &str, account: &str) {
+    let keys = login_keys(ip, account);
+    clear_pair_limited(limit, ip, account);
+    pop_login_hit(limit, &keys.ip);
+    if let Some(account_key) = keys.account {
+        pop_login_hit(limit, &account_key);
+    }
+}
+
+fn reserve_limited(limit: &mut LoginLimit, ip: &str, account: &str, now: u64) -> bool {
+    maybe_prune_login_limit(limit, now);
+    if login_limited(limit, ip, account, now) {
+        return false;
+    }
+    record_limited(limit, ip, account, now);
+    true
+}
+
+fn reservation_held(limit: &LoginLimit, ip: &str, account: &str, now: u64) -> bool {
+    let keys = login_keys(ip, account);
+    let ip_hits = limit
+        .hits
+        .get(&keys.ip)
+        .map(|hits| login_hit_count(hits, now))
+        .unwrap_or(0);
+    let pair_hits = keys
+        .pair
+        .as_ref()
+        .and_then(|key| limit.hits.get(key))
+        .map(|hits| login_hit_count(hits, now))
+        .unwrap_or(0);
+    ip_hits <= LOGIN_MAX_FAILURES && pair_hits <= LOGIN_MAX_FAILURES
+}
+
+fn reserve_account_limited(limit: &mut LoginLimit, ip: &str, account: &str, now: u64) -> bool {
+    maybe_prune_login_limit(limit, now);
+    let keys = login_keys(ip, account);
+    let Some(pair) = keys.pair else {
+        return true;
+    };
+    let pair_hits = limit
+        .hits
+        .get(&pair)
+        .map(|hits| login_hit_count(hits, now))
+        .unwrap_or(0);
+    if pair_hits >= LOGIN_MAX_FAILURES {
+        return false;
+    }
+    let mut keys_to_count = vec![pair];
+    if let Some(account_key) = keys.account {
+        keys_to_count.push(account_key);
+    }
+    for key in keys_to_count {
+        let hits = limit.hits.entry(key).or_default();
+        hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
+        hits.push(now);
+    }
+    true
+}
+
+fn login_limited_error() -> ApiError {
+    ApiError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "尝试次数过多，请 5 分钟后再试",
+    )
+}
+
+fn reserve_login(state: &AppState, ip: &str, account: &str) -> Result<(), ApiError> {
+    let now = now_secs();
+    let mut limit = state.fails.lock().expect("login limit");
+    if reserve_limited(&mut limit, ip, account, now) {
+        Ok(())
+    } else {
+        Err(login_limited_error())
+    }
+}
+
+fn reserve_login_account(state: &AppState, ip: &str, account: &str) -> Result<(), ApiError> {
+    let now = now_secs();
+    let mut limit = state.fails.lock().expect("login limit");
+    if reserve_account_limited(&mut limit, ip, account, now) {
+        Ok(())
+    } else {
+        Err(login_limited_error())
+    }
+}
+
+fn recheck_login(state: &AppState, ip: &str, account: &str) -> Result<(), ApiError> {
+    let now = now_secs();
+    let mut limit = state.fails.lock().expect("login limit");
+    maybe_prune_login_limit(&mut limit, now);
+    if reservation_held(&limit, ip, account, now) {
+        Ok(())
+    } else {
+        Err(login_limited_error())
+    }
+}
+
+fn release_login_success(state: &AppState, ip: &str, account: &str) {
+    let mut limit = state.fails.lock().expect("login limit");
+    release_successful_login(&mut limit, ip, account);
 }
 
 async fn pace_login(state: &AppState, account: &str) {
@@ -6344,29 +6443,10 @@ async fn pace_login(state: &AppState, account: &str) {
     }
 }
 
-fn check_login_limit(state: &AppState, ip: &str, account: &str) -> Result<(), ApiError> {
-    let now = now_secs();
-    let mut limit = state.fails.lock().expect("login limit");
-    maybe_prune_login_limit(&mut limit, now);
-    if login_limited(&limit, ip, account, now) {
-        Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "尝试次数过多，请 5 分钟后再试",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn record_login_failure(state: &AppState, ip: &str, account: &str) {
-    let now = now_secs();
-    let mut limit = state.fails.lock().expect("login limit");
-    record_limited(&mut limit, ip, account, now);
-}
-
-fn clear_login_failures(state: &AppState, ip: &str, account: &str) {
-    let mut limit = state.fails.lock().expect("login limit");
-    clear_limited(&mut limit, ip, account);
+async fn admit_password_attempt(state: &AppState, ip: &str, account: &str) -> Result<(), ApiError> {
+    reserve_login(state, ip, account)?;
+    pace_login(state, account).await;
+    recheck_login(state, ip, account)
 }
 
 fn db_err(err: sqlx::Error) -> ApiError {
@@ -7633,7 +7713,15 @@ mod tests {
         assert!(!login_limited(&limit, "2.2.2.2", "bob", 1_000));
         assert_eq!(login_soft_delay_secs(&limit, "alice", 1_000), 0);
         assert!(limit.hits.keys().all(|key| !key.contains("alice")));
-        clear_limited(&mut limit, "1.1.1.1", "alice");
+        clear_pair_limited(&mut limit, "1.1.1.1", "alice");
+        assert!(login_limited(&limit, "1.1.1.1", "carol", 1_000));
+        assert!(limit.hits.contains_key("ip:1.1.1.1"));
+        assert!(!limit.hits.keys().any(|key| key.starts_with("pair:")));
+        release_successful_login(&mut limit, "1.1.1.1", "alice");
+        assert_eq!(
+            limit.hits.get("ip:1.1.1.1").map(Vec::len),
+            Some(LOGIN_MAX_FAILURES - 1)
+        );
         assert!(!login_limited(&limit, "1.1.1.1", "carol", 1_000));
         assert!(!login_limited(&limit, "8.8.8.8", "alice", 1_000));
 
@@ -7658,6 +7746,45 @@ mod tests {
         assert!(stale.hits.contains_key("ip:1.1.1.1"));
         prune_login_limit(&mut stale, 10 + LOGIN_WINDOW_SECS + 60 + LOGIN_WINDOW_SECS);
         assert!(stale.hits.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_wrong_passwords_admit_at_most_eight() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = std::env::temp_dir().join(format!(
+            "vpush-login-race-{}-{}.db",
+            std::process::id(),
+            now_secs()
+        ));
+        let state = AppState {
+            db: Db::open(&path).await.unwrap(),
+            secret: "login-race".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let admitted = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Barrier::new(40));
+        let mut tasks = Vec::new();
+        for _ in 0..40 {
+            let state = state.clone();
+            let admitted = admitted.clone();
+            let started = started.clone();
+            tasks.push(tokio::spawn(async move {
+                started.wait().await;
+                if admit_password_attempt(&state, "203.0.113.7", "admin")
+                    .await
+                    .is_ok()
+                {
+                    admitted.fetch_add(1, Ordering::SeqCst);
+                }
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        assert_eq!(admitted.load(Ordering::SeqCst), LOGIN_MAX_FAILURES);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

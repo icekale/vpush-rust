@@ -941,7 +941,7 @@ fn wecom_combination(note: &Note<'_>, detail: &Value) -> String {
         lines.push(format!("[查看原文]({})", note.url));
     }
     // ponytail: 4096 字节是企微上限，超长直接截断。
-    truncate_bytes(&lines.join("\n").trim_end(), 4000)
+    truncate_bytes(lines.join("\n").trim_end(), 4000)
 }
 
 fn truncate_bytes(text: &str, max: usize) -> String {
@@ -1494,12 +1494,21 @@ fn append_combination_rich(html: &mut String, post: &TelegramPost) {
             })
             .collect();
         if !labels.is_empty() {
-            add_html(html, &rich_line(&escape_html(&labels.join(" · "), 350, 600)));
+            add_html(
+                html,
+                &rich_line(&escape_html(&labels.join(" · "), 350, 600)),
+            );
         }
     }
     if let Some(actions) = post.detail["actions"].as_array() {
-        let actions: Vec<&Value> = actions.iter().filter(|action| action.is_object()).take(12).collect();
-        let has_prices = actions.iter().any(|action| !detail_text(&action["price"]).is_empty());
+        let actions: Vec<&Value> = actions
+            .iter()
+            .filter(|action| action.is_object())
+            .take(12)
+            .collect();
+        let has_prices = actions
+            .iter()
+            .any(|action| !detail_text(&action["price"]).is_empty());
         let rows: Vec<Vec<String>> = actions
             .iter()
             .map(|action| {
@@ -1535,7 +1544,9 @@ fn append_combination_rich(html: &mut String, post: &TelegramPost) {
         let rows: Vec<Vec<String>> = holdings
             .iter()
             .filter(|holding| {
-                holding["name"].as_str().is_some_and(|name| !name.trim().is_empty())
+                holding["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.trim().is_empty())
                     && !holding["weight"].is_null()
             })
             .take(15)
@@ -1571,7 +1582,10 @@ fn append_combination_rich(html: &mut String, post: &TelegramPost) {
     if !foot.is_empty() {
         add_html(
             html,
-            &format!("<footer>{}</footer>", escape_html(&foot.join(" · "), 160, 300)),
+            &format!(
+                "<footer>{}</footer>",
+                escape_html(&foot.join(" · "), 160, 300)
+            ),
         );
     }
 }

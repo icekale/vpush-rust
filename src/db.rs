@@ -7918,6 +7918,22 @@ async fn views_touching_users(
     Ok(selected)
 }
 
+async fn register_code_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'register_codes'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar("SELECT name FROM pragma_table_info('register_codes')")
+        .fetch_all(&mut **tx)
+        .await
+}
+
 async fn drop_named(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     kind: &str,
@@ -8013,14 +8029,23 @@ async fn rebuild_users_autoincrement(
     .fetch_all(&mut *tx)
     .await?;
     let views = views_touching_users(&mut tx).await?;
-    let outside_triggers: Vec<(String, String)> = sqlx::query_as(
-        "SELECT name, sql FROM sqlite_master
+    let view_names: Vec<String> = views.iter().map(|(name, _)| name.clone()).collect();
+    let trigger_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT name, tbl_name, sql FROM sqlite_master
          WHERE type = 'trigger' AND tbl_name != 'users' AND sql IS NOT NULL
-           AND instr(lower(sql), 'users') > 0
          ORDER BY name",
     )
     .fetch_all(&mut *tx)
     .await?;
+    // INSTEAD OF triggers are dropped with their view, so capture every trigger on a
+    // view we are about to remove, plus triggers whose body names users.
+    let outside_triggers: Vec<(String, String)> = trigger_rows
+        .into_iter()
+        .filter(|(_, tbl, sql)| {
+            view_names.iter().any(|view| view == tbl) || sql_mentions_name(sql, "users")
+        })
+        .map(|(name, _, sql)| (name, sql))
+        .collect();
     sqlx::query("DROP TABLE IF EXISTS users__autoinc")
         .execute(&mut *tx)
         .await?;
@@ -8028,11 +8053,11 @@ async fn rebuild_users_autoincrement(
     sqlx::query("INSERT INTO users__autoinc SELECT * FROM users")
         .execute(&mut *tx)
         .await?;
-    for (name, _) in views.iter().rev() {
-        drop_named(&mut tx, "VIEW", name).await?;
-    }
     for (name, _) in outside_triggers.iter().rev() {
         drop_named(&mut tx, "TRIGGER", name).await?;
+    }
+    for (name, _) in views.iter().rev() {
+        drop_named(&mut tx, "VIEW", name).await?;
     }
     sqlx::query("DROP TABLE users").execute(&mut *tx).await?;
     sqlx::query("ALTER TABLE users__autoinc RENAME TO users")
@@ -8044,20 +8069,14 @@ async fn rebuild_users_autoincrement(
     for trigger in &triggers {
         sqlx::query(trigger).execute(&mut *tx).await?;
     }
-    for (_, sql) in &outside_triggers {
-        sqlx::query(sql).execute(&mut *tx).await?;
-    }
     for (_, sql) in &views {
         sqlx::query(sql).execute(&mut *tx).await?;
     }
-    let tables = tables_with_column(&mut tx, "user_id").await?;
-    for table in &tables {
-        sqlx::query(&format!(
-            "DELETE FROM \"{table}\" WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)"
-        ))
-        .execute(&mut *tx)
-        .await?;
+    for (_, sql) in &outside_triggers {
+        sqlx::query(sql).execute(&mut *tx).await?;
     }
+    let tables = tables_with_column(&mut tx, "user_id").await?;
+    let code_cols = register_code_columns(&mut tx).await?;
     let mut seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM users")
         .fetch_one(&mut *tx)
         .await?;
@@ -8070,6 +8089,37 @@ async fn rebuild_users_autoincrement(
         if max_user > seq {
             seq = max_user;
         }
+    }
+    for column in ["used_by", "created_by"] {
+        if !code_cols.iter().any(|name| name == column) {
+            continue;
+        }
+        let max_id: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(MAX(\"{column}\"), 0) FROM register_codes"
+        ))
+        .fetch_one(&mut *tx)
+        .await?;
+        if max_id > seq {
+            seq = max_id;
+        }
+    }
+    for table in &tables {
+        sqlx::query(&format!(
+            "DELETE FROM \"{table}\" WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)"
+        ))
+        .execute(&mut *tx)
+        .await?;
+    }
+    for column in ["used_by", "created_by"] {
+        if !code_cols.iter().any(|name| name == column) {
+            continue;
+        }
+        sqlx::query(&format!(
+            "UPDATE register_codes SET \"{column}\" = NULL
+             WHERE \"{column}\" IS NOT NULL AND \"{column}\" NOT IN (SELECT id FROM users)"
+        ))
+        .execute(&mut *tx)
+        .await?;
     }
     sqlx::query("DELETE FROM sqlite_sequence WHERE name IN ('users', 'users__autoinc')")
         .execute(&mut *tx)
@@ -10649,6 +10699,32 @@ mod tests {
                 .await
                 .unwrap();
             sqlx::query(
+                "CREATE TRIGGER legacy_names_insert INSTEAD OF INSERT ON legacy_user_names
+                 BEGIN
+                   INSERT INTO users (username, password_hash) VALUES (NEW.username, 'from-view');
+                 END",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "CREATE TABLE register_codes (
+                    code TEXT PRIMARY KEY,
+                    used_by INTEGER,
+                    created_by INTEGER
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO register_codes (code, used_by, created_by) VALUES
+                 ('OLD', 99, 4), ('GHOST', 77, 88)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
                 "INSERT INTO users (id, username, password_hash) VALUES (4, 'kept', 'hash')",
             )
             .execute(&pool)
@@ -10687,6 +10763,43 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(trigger, 1);
+        let instead: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'legacy_names_insert'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(instead, 1);
+        sqlx::query("INSERT INTO legacy_user_names (username) VALUES ('via-view')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let via = db.user_by_username("via-view").await.unwrap().unwrap();
+        assert_eq!(via.password_hash, "from-view");
+        let old_used: Option<i64> =
+            sqlx::query_scalar("SELECT used_by FROM register_codes WHERE code = 'OLD'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let old_created: Option<i64> =
+            sqlx::query_scalar("SELECT created_by FROM register_codes WHERE code = 'OLD'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let ghost_used: Option<i64> =
+            sqlx::query_scalar("SELECT used_by FROM register_codes WHERE code = 'GHOST'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let ghost_created: Option<i64> =
+            sqlx::query_scalar("SELECT created_by FROM register_codes WHERE code = 'GHOST'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            (old_used, old_created, ghost_used, ghost_created),
+            (None, Some(4), None, None)
+        );
         let definition: String = sqlx::query_scalar(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'",
         )
@@ -10708,7 +10821,11 @@ mod tests {
             .await
             .unwrap();
         let fresh = db.user_by_username("fresh").await.unwrap().unwrap();
-        assert!(fresh.id > 4, "reused {}", fresh.id);
+        assert!(
+            fresh.id > 99,
+            "reused {} (sequence must keep the orphan id)",
+            fresh.id
+        );
         let token: String =
             sqlx::query_scalar("SELECT token FROM legacy_user_tokens WHERE user_id = 4")
                 .fetch_one(db.pool())

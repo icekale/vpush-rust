@@ -269,6 +269,16 @@ pub async fn save_token(db: &Db, token_body: &str) -> Result<(), Fail> {
     Ok(())
 }
 
+pub fn exchange_refresh(app_id: &str, secret: &str, refresh: &str) -> Result<String, Fail> {
+    let body = json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh,
+        "client_id": app_id,
+        "client_secret": secret,
+    });
+    post_token(&body)
+}
+
 pub fn exchange_code(
     app_id: &str,
     secret: &str,
@@ -284,6 +294,10 @@ pub fn exchange_code(
         "client_id": app_id,
         "client_secret": secret,
     });
+    post_token(&body)
+}
+
+fn post_token(body: &Value) -> Result<String, Fail> {
     let response = ureq::post(TOKEN_URL)
         .set("Content-Type", "application/json")
         .timeout(std::time::Duration::from_secs(20))
@@ -1313,22 +1327,51 @@ async fn secret(db: &Db) -> Result<String, Fail> {
     Ok(std::env::var("FEISHU_DOCS_APP_SECRET").unwrap_or_default())
 }
 
+fn credential_state(access_expires: i64, refresh_expires: i64, now: i64) -> &'static str {
+    if access_expires > now + 60 {
+        "access"
+    } else if refresh_expires == 0 || refresh_expires > now {
+        "refresh"
+    } else {
+        "reauth"
+    }
+}
+
 async fn access_token(db: &Db) -> Result<String, Fail> {
-    let row =
-        sqlx::query("SELECT access_token, expires_at FROM feishu_oauth_credentials WHERE id = 1")
-            .fetch_optional(db.pool())
-            .await
-            .map_err(|_| fail(400, "飞书授权失败"))?;
+    let row = sqlx::query(
+        "SELECT access_token, refresh_token, expires_at, refresh_expires_at FROM feishu_oauth_credentials WHERE id = 1",
+    )
+    .fetch_optional(db.pool())
+    .await
+    .map_err(|_| fail(400, "飞书授权失败"))?;
     let Some(row) = row else {
         return Err(fail(400, "请先授权飞书文档"));
     };
+    let key = credential_key().ok_or(fail(400, "未配置 FEISHU_CREDENTIAL_KEY"))?;
     let expires: i64 = row.get("expires_at");
-    if expires <= now() as i64 + 60 {
+    let refresh_expires: i64 = row.get("refresh_expires_at");
+    let current = now() as i64;
+    if credential_state(expires, refresh_expires, current) == "access" {
+        return open_app_secret(&key, &row.get::<String, _>("access_token"))
+            .map_err(|_| fail(400, "飞书授权无法解密"));
+    }
+    if credential_state(expires, refresh_expires, current) != "refresh" {
         return Err(fail(400, "飞书授权已过期，请重新授权"));
     }
-    let key = credential_key().ok_or(fail(400, "未配置 FEISHU_CREDENTIAL_KEY"))?;
-    open_app_secret(&key, &row.get::<String, _>("access_token"))
-        .map_err(|_| fail(400, "飞书授权无法解密"))
+    let refresh = open_app_secret(&key, &row.get::<String, _>("refresh_token"))
+        .map_err(|_| fail(400, "飞书授权无法解密"))?;
+    if refresh.is_empty() {
+        return Err(fail(400, "飞书授权已过期，请重新授权"));
+    }
+    let cfg = config(db).await?;
+    let app_secret = secret(db).await?;
+    let body = exchange_refresh(&cfg.app_id, &app_secret, &refresh)?;
+    let parsed = parse_token(&body)?;
+    if parsed.refresh.is_empty() {
+        return Err(fail(400, "飞书授权失败"));
+    }
+    save_token(db, &body).await?;
+    Ok(parsed.access)
 }
 
 async fn credential_live(db: &Db) -> Result<bool, Fail> {
@@ -1639,6 +1682,14 @@ mod tests {
         assert!(take_session(&db, "wrong-state", &hash).await.is_err());
         assert!(!credential_live(&db).await.unwrap());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn expired_access_refreshes_until_the_refresh_token_expires() {
+        assert_eq!(credential_state(200, 500, 100), "access");
+        assert_eq!(credential_state(150, 500, 100), "refresh");
+        assert_eq!(credential_state(100, 0, 100), "refresh");
+        assert_eq!(credential_state(100, 100, 100), "reauth");
     }
 
     #[test]

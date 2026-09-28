@@ -31,10 +31,14 @@ services:
       FEISHU_CREDENTIAL_KEY: ${FEISHU_CREDENTIAL_KEY:-}
       FEISHU_DOCS_APP_SECRET: ${FEISHU_DOCS_APP_SECRET:-}
       FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
+      CICC_LAB_LOG_DIR: ${CICC_LAB_LOG_DIR:-/app/cicc-lab-logs}
+      CICC_LAB_STALE_HOURS: ${CICC_LAB_STALE_HOURS:-36}
     volumes:
       - ./data:/app/data
       - ./avatars:/app/static/avatars:ro
       - ${IMA_ARCHIVE_HOST:-/srv/vpush-ima}:/app/ima-archive
+      # Host logs are mode 600 owned by ubuntu; the container user needs group or ACL read access.
+      - ${CICC_LAB_LOG_HOST:-/data/vpush-ima-cache/logs}:/app/cicc-lab-logs:ro
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/"]
       interval: 30s

@@ -341,7 +341,7 @@ fn post(url: &str, body: &str) -> Result<(), String> {
             (status, text)
         }
         Err(ureq::Error::Status(status, resp)) => (status, resp.into_string().unwrap_or_default()),
-        Err(err) => return Err(err.to_string()),
+        Err(_) => return Err("飞书请求失败".into()),
     };
     if status != 200 {
         return Err(format!("飞书 HTTP {status}: {text}"));
@@ -783,5 +783,17 @@ mod tests {
         assert!(body.contains("现金"));
         assert!(body.contains("现有持仓"));
         assert!(!body.contains("raw"));
+    }
+
+    #[test]
+    fn webhook_transport_error_omits_secret_url() {
+        let secret = "unit-test-feishu-hook";
+        let err = post(
+            &format!("http://127.0.0.1:1/open-apis/bot/v2/hook/{secret}"),
+            "{}",
+        )
+        .unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
     }
 }

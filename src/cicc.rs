@@ -32,6 +32,7 @@ pub enum CiccError {
     Invalid(String),
 }
 
+#[derive(Clone)]
 pub struct Control {
     ctrl: PathBuf,
     mounts: Option<String>,
@@ -158,6 +159,62 @@ impl Control {
             actor,
             Some(json!({"categories": categories, "keywords": keywords})),
         )
+    }
+
+    pub async fn status_async(&self) -> Value {
+        let ctl = self.clone();
+        tokio::task::spawn_blocking(move || ctl.status())
+            .await
+            .unwrap_or_else(|_| json!({"available": false, "stale": true, "reason": "isolated"}))
+    }
+
+    pub async fn trigger_async(
+        &self,
+        mode: String,
+        actor: String,
+        extra: Option<Value>,
+    ) -> Result<Value, CiccError> {
+        let ctl = self.clone();
+        tokio::task::spawn_blocking(move || ctl.trigger(&mode, &actor, extra))
+            .await
+            .map_err(|_| CiccError::Bad("命令写入失败"))?
+    }
+
+    pub async fn read_schedule_async(&self) -> Value {
+        let ctl = self.clone();
+        tokio::task::spawn_blocking(move || ctl.read_schedule())
+            .await
+            .unwrap_or_else(|_| json!({"time": "03:00", "schedule_enabled": false}))
+    }
+
+    pub async fn set_schedule_async(&self, enabled: bool) -> Result<Value, CiccError> {
+        let ctl = self.clone();
+        tokio::task::spawn_blocking(move || ctl.set_schedule(enabled))
+            .await
+            .map_err(|_| CiccError::Bad("开关写入失败"))?
+    }
+
+    pub async fn set_schedule_time_async(
+        &self,
+        time_of_day: String,
+        actor: String,
+    ) -> Result<Value, CiccError> {
+        let ctl = self.clone();
+        tokio::task::spawn_blocking(move || ctl.set_schedule_time(&time_of_day, &actor))
+            .await
+            .map_err(|_| CiccError::Bad("命令写入失败"))?
+    }
+
+    pub async fn set_settings_async(
+        &self,
+        categories: Vec<String>,
+        keywords: Vec<String>,
+        actor: String,
+    ) -> Result<Value, CiccError> {
+        let ctl = self.clone();
+        tokio::task::spawn_blocking(move || ctl.set_settings(&categories, &keywords, &actor))
+            .await
+            .map_err(|_| CiccError::Bad("命令写入失败"))?
     }
 
     fn schedule_enabled(&self) -> bool {

@@ -803,16 +803,37 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
             let mut request = Vec::new();
             let mut chunk = [0u8; 1024];
+            let mut header_end = None;
+            let mut body_len = 0usize;
             loop {
                 let length = stream.read(&mut chunk).unwrap();
                 if length == 0 {
                     break;
                 }
                 request.extend_from_slice(&chunk[..length]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
+                if header_end.is_none() {
+                    if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..pos]);
+                        body_len = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        header_end = Some(pos + 4);
+                    }
+                }
+                if let Some(end) = header_end {
+                    if request.len() >= end + body_len {
+                        break;
+                    }
                 }
             }
             let request = String::from_utf8_lossy(&request);
@@ -820,11 +841,12 @@ mod tests {
             let response = r#"{"ok":true,"result":[]}"#;
             write!(
                 stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{}",
                 response.len(),
                 response
             )
             .unwrap();
+            let _ = stream.flush();
         });
         let result = get_updates(&format!("http://{}", address), "123:secret", 0).unwrap();
         assert!(matches!(result, GetUpdates::Updates(updates) if updates.is_empty()));

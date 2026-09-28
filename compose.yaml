@@ -7,7 +7,10 @@ services:
     container_name: vpush-rust
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # Publish only on the host loopback. Host Caddy still arrives through the Docker
+      # bridge gateway (for example 172.17.0.1), not 127.0.0.1, so TRUSTED_PROXIES
+      # below includes 172.16.0.0/12. Override it if Caddy uses another network.
+      - "127.0.0.1:8000:8000"
     environment:
       HOST: 0.0.0.0
       PORT: 8000
@@ -33,6 +36,9 @@ services:
       FEISHU_WEBHOOK_URL: ${FEISHU_WEBHOOK_URL:-}
       CICC_LAB_LOG_DIR: ${CICC_LAB_LOG_DIR:-/app/cicc-lab-logs}
       CICC_LAB_STALE_HOURS: ${CICC_LAB_STALE_HOURS:-36}
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES:-127.0.0.0/8,::1/128,172.16.0.0/12}
+      TRUST_X_REAL_IP: ${TRUST_X_REAL_IP:-0}
+      SSRF_ALLOW_FAKE_IP: ${SSRF_ALLOW_FAKE_IP:-0}
     volumes:
       - ./data:/app/data
       - ./avatars:/app/static/avatars:ro

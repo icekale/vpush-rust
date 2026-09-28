@@ -941,7 +941,7 @@ fn wecom_combination(note: &Note<'_>, detail: &Value) -> String {
         lines.push(format!("[查看原文]({})", note.url));
     }
     // ponytail: 4096 字节是企微上限，超长直接截断。
-    truncate_bytes(&lines.join("\n").trim_end(), 4000)
+    truncate_bytes(lines.join("\n").trim_end(), 4000)
 }
 
 fn truncate_bytes(text: &str, max: usize) -> String {
@@ -1414,12 +1414,13 @@ fn fallback_tag(tag: &str) -> FallbackTag {
         .flat_map(char::to_lowercase)
         .collect();
     match name.as_str() {
-        "br" | "/p" | "/footer" | "/li" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4"
-        | "/h5" | "/h6" => FallbackTag::Break,
-        "p" | "footer" | "figure" | "/figure" | "tg-collage" | "/tg-collage" | "img"
-        | "table" | "/table" | "thead" | "/thead" | "tbody" | "/tbody" | "tr" | "th"
-        | "/th" | "td" | "/td" | "caption" | "/caption" | "details" | "/details"
-        | "summary" | "/summary" | "ol" | "/ol" | "ul" | "/ul" | "li" => FallbackTag::Drop,
+        "br" | "/p" | "/footer" | "/li" | "/tr" | "/h1" | "/h2" | "/h3" | "/h4" | "/h5" | "/h6" => {
+            FallbackTag::Break
+        }
+        "p" | "footer" | "figure" | "/figure" | "tg-collage" | "/tg-collage" | "img" | "table"
+        | "/table" | "thead" | "/thead" | "tbody" | "/tbody" | "tr" | "th" | "/th" | "td"
+        | "/td" | "caption" | "/caption" | "details" | "/details" | "summary" | "/summary"
+        | "ol" | "/ol" | "ul" | "/ul" | "li" => FallbackTag::Drop,
         _ => FallbackTag::Keep,
     }
 }
@@ -1493,12 +1494,21 @@ fn append_combination_rich(html: &mut String, post: &TelegramPost) {
             })
             .collect();
         if !labels.is_empty() {
-            add_html(html, &rich_line(&escape_html(&labels.join(" · "), 350, 600)));
+            add_html(
+                html,
+                &rich_line(&escape_html(&labels.join(" · "), 350, 600)),
+            );
         }
     }
     if let Some(actions) = post.detail["actions"].as_array() {
-        let actions: Vec<&Value> = actions.iter().filter(|action| action.is_object()).take(12).collect();
-        let has_prices = actions.iter().any(|action| !detail_text(&action["price"]).is_empty());
+        let actions: Vec<&Value> = actions
+            .iter()
+            .filter(|action| action.is_object())
+            .take(12)
+            .collect();
+        let has_prices = actions
+            .iter()
+            .any(|action| !detail_text(&action["price"]).is_empty());
         let rows: Vec<Vec<String>> = actions
             .iter()
             .map(|action| {
@@ -1534,7 +1544,9 @@ fn append_combination_rich(html: &mut String, post: &TelegramPost) {
         let rows: Vec<Vec<String>> = holdings
             .iter()
             .filter(|holding| {
-                holding["name"].as_str().is_some_and(|name| !name.trim().is_empty())
+                holding["name"]
+                    .as_str()
+                    .is_some_and(|name| !name.trim().is_empty())
                     && !holding["weight"].is_null()
             })
             .take(15)
@@ -1570,7 +1582,10 @@ fn append_combination_rich(html: &mut String, post: &TelegramPost) {
     if !foot.is_empty() {
         add_html(
             html,
-            &format!("<footer>{}</footer>", escape_html(&foot.join(" · "), 160, 300)),
+            &format!(
+                "<footer>{}</footer>",
+                escape_html(&foot.join(" · "), 160, 300)
+            ),
         );
     }
 }
@@ -1790,6 +1805,7 @@ fn telegram_request_error_kind(error: &TelegramRequestError) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn telegram_deliver_post_media_with<F>(
     chat_id: &str,
     html: &str,
@@ -1927,6 +1943,7 @@ where
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn telegram_deliver_post_media(
     token: &str,
     chat_id: &str,
@@ -2515,7 +2532,7 @@ fn post_json(url: &str, body: &str) -> Result<(), String> {
         Ok(resp) if (200..300).contains(&resp.status()) => Ok(()),
         Ok(resp) => Err(format!("推送 HTTP {}", resp.status())),
         Err(ureq::Error::Status(code, _)) => Err(format!("推送 HTTP {code}")),
-        Err(err) => Err(err.to_string()),
+        Err(_) => Err("推送请求失败".into()),
     }
 }
 
@@ -2581,7 +2598,11 @@ mod tests {
         )
         );
         let fallback = telegram_fallback_html(&html);
-        assert!(!fallback.contains("<p>") && !fallback.contains("<br>") && !fallback.contains("<footer>"));
+        assert!(
+            !fallback.contains("<p>")
+                && !fallback.contains("<br>")
+                && !fallback.contains("<footer>")
+        );
         assert!(fallback.contains("\n<blockquote>"));
         assert!(fallback.lines().any(|line| line.contains("翻译自英语")));
         assert!(fallback.lines().any(|line| line.contains("你好")));
@@ -4054,5 +4075,25 @@ mod tests {
             Some("0")
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn wecom_transport_error_omits_webhook_key() {
+        let secret = "unit-test-wecom-key";
+        let err = post_json(
+            &format!("http://127.0.0.1:1/cgi-bin/webhook/send?key={secret}"),
+            "{}",
+        )
+        .unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn bark_transport_error_omits_device_key() {
+        let secret = "unit-test-bark-key";
+        let err = post_json(&format!("http://127.0.0.1:1/{secret}/title/body"), "").unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
     }
 }

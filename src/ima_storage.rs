@@ -348,7 +348,7 @@ fn available_capacity(root: &Path) -> Option<u64> {
         return None;
     }
     let stats = unsafe { stats.assume_init() };
-    u64::from(stats.f_bavail).checked_mul(stats.f_frsize)
+    stats.f_bavail.checked_mul(stats.f_frsize)
 }
 
 #[cfg(not(unix))]

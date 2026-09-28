@@ -346,16 +346,22 @@ pub async fn sync_source(db: &Db, id: i64) -> Result<Value, Fail> {
         touch_sync(db, id, "succeeded", "").await?;
         return Ok(json!({"ok": true, "status": "unchanged"}));
     }
-    let document_id = meta["document_id"].as_str().unwrap_or("");
+    let document_id = meta["document_id"].as_str().unwrap_or("").to_string();
     let access = access_token(db).await?;
-    let blocks = match fetch_blocks(document_id, &access) {
+    let blocks = {
+        let access = access.clone();
+        tokio::task::spawn_blocking(move || fetch_blocks(&document_id, &access))
+            .await
+            .map_err(|_| fail(500, "飞书文档读取失败"))?
+    };
+    let blocks = match blocks {
         Ok(blocks) => blocks,
         Err(err) => {
             mark_failed(db, id, err.detail).await?;
             return Err(err);
         }
     };
-    let mut timeline = normalize_blocks(&blocks);
+    let timeline = normalize_blocks(&blocks);
     let display = row.get::<String, _>("display_name");
     let title = if display.trim().is_empty() {
         meta["title"].as_str().unwrap_or("飞书文档")
@@ -363,13 +369,24 @@ pub async fn sync_source(db: &Db, id: i64) -> Result<Value, Fail> {
         display.trim()
     };
     let title = clip(title, 200);
-    let (timeline_path, txt_path, asset_root) = match publish_files(
-        &archive_root()?,
-        &row.get::<String, _>("source_key_hash"),
-        &title,
-        &mut timeline,
-        &mut |token| download_media(token, &access),
-    ) {
+    let root = archive_root()?;
+    let key_hash: String = row.get("source_key_hash");
+    let title_for_files = title.clone();
+    let access_for_files = access.clone();
+    let published = tokio::task::spawn_blocking(move || {
+        let mut timeline = timeline;
+        publish_files(
+            &root,
+            &key_hash,
+            &title_for_files,
+            &mut timeline,
+            &mut |token| download_media(token, &access_for_files),
+        )
+        .map(|paths| (paths, timeline))
+    })
+    .await
+    .map_err(|_| fail(500, "飞书文档读取失败"))?;
+    let ((timeline_path, txt_path, asset_root), timeline) = match published {
         Ok(paths) => paths,
         Err(err) => {
             mark_failed(db, id, err.detail).await?;
@@ -594,13 +611,19 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     let document_id = if source_type == "docx" {
         url_or_token.to_string()
     } else {
-        let body = get_json(
-            &format!(
-                "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={}",
-                encode(url_or_token)
-            ),
-            &token,
-        )?;
+        let wiki = url_or_token.to_string();
+        let token = token.clone();
+        let body = tokio::task::spawn_blocking(move || {
+            get_json(
+                &format!(
+                    "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={}",
+                    encode(&wiki)
+                ),
+                &token,
+            )
+        })
+        .await
+        .map_err(|_| fail(500, "飞书文档读取失败"))??;
         let node = body.get("node").cloned().unwrap_or(body);
         if node["obj_type"].as_str() != Some("docx") {
             return Err(fail(400, "当前仅支持飞书新版文档"));
@@ -610,10 +633,16 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     if document_id.is_empty() {
         return Err(fail(400, "Wiki 节点没有对应文档"));
     }
-    let body = get_json(
-        &format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"),
-        &token,
-    )?;
+    let token = token.clone();
+    let document_id_for_fetch = document_id.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        get_json(
+            &format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id_for_fetch}"),
+            &token,
+        )
+    })
+    .await
+    .map_err(|_| fail(500, "飞书文档读取失败"))??;
     let document = body.get("document").cloned().unwrap_or(body);
     Ok(json!({
         "document_id": document_id,
@@ -1365,7 +1394,14 @@ async fn access_token(db: &Db) -> Result<String, Fail> {
     }
     let cfg = config(db).await?;
     let app_secret = secret(db).await?;
-    let body = exchange_refresh(&cfg.app_id, &app_secret, &refresh)?;
+    let app_id = cfg.app_id.clone();
+    let app_secret_owned = app_secret.clone();
+    let refresh_owned = refresh.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        exchange_refresh(&app_id, &app_secret_owned, &refresh_owned)
+    })
+    .await
+    .map_err(|_| fail(400, "飞书授权失败"))??;
     let parsed = parse_token(&body)?;
     if parsed.refresh.is_empty() {
         return Err(fail(400, "飞书授权失败"));

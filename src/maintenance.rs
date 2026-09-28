@@ -61,11 +61,20 @@ async fn cookie_keepalive(db: &Db, now: i64) -> Result<(), sqlx::Error> {
         let uid = uid.to_string();
         async move {
             match platform.as_str() {
-                "xueqiu" => match crate::xueqiu::probe_keepalive(&cookie, &uid) {
-                    crate::xueqiu::Keepalive::Alive => Keep::Alive,
-                    crate::xueqiu::Keepalive::Dead(msg) => Keep::Dead(msg),
-                    crate::xueqiu::Keepalive::Transient => Keep::Transient,
-                },
+                "xueqiu" => {
+                    let cookie = cookie.clone();
+                    let uid = uid.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::xueqiu::probe_keepalive(&cookie, &uid)
+                    })
+                    .await
+                    .unwrap_or(crate::xueqiu::Keepalive::Transient)
+                    {
+                        crate::xueqiu::Keepalive::Alive => Keep::Alive,
+                        crate::xueqiu::Keepalive::Dead(msg) => Keep::Dead(msg),
+                        crate::xueqiu::Keepalive::Transient => Keep::Transient,
+                    }
+                }
                 "weibo" => match crate::weibo::probe_keepalive(&probe_db, &cookie, &uid).await {
                     crate::weibo::Keepalive::Alive => Keep::Alive,
                     crate::weibo::Keepalive::Dead(msg) => Keep::Dead(msg),
@@ -393,7 +402,11 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
         let cookie = cookie.to_string();
         let uid = uid.to_string();
         async move {
-            match crate::xueqiu::probe_keepalive(&cookie, &uid) {
+            let probe =
+                tokio::task::spawn_blocking(move || crate::xueqiu::probe_keepalive(&cookie, &uid))
+                    .await
+                    .unwrap_or(crate::xueqiu::Keepalive::Transient);
+            match probe {
                 crate::xueqiu::Keepalive::Alive => crate::alerts::Probe::Alive,
                 crate::xueqiu::Keepalive::Dead(_) => crate::alerts::Probe::Dead,
                 crate::xueqiu::Keepalive::Transient => {
@@ -406,9 +419,10 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
     {
         tracing::warn!("雪球探测失败: {err}");
     }
-    let status = crate::cicc::from_env()
-        .map(|ctl| ctl.status())
-        .unwrap_or(serde_json::json!({}));
+    let status = match crate::cicc::from_env() {
+        Some(ctl) => ctl.status_async().await,
+        None => serde_json::json!({}),
+    };
     if let Err(err) = crate::alerts::check_cicc(db, now, &status, |message| async move {
         crate::alerts::notify_admins(db, &message).await
     })

@@ -2,6 +2,7 @@
 name = "vpush"
 version = "1.12.277"
 edition = "2021"
+rust-version = "1.95"
 
 [dependencies]
 axum = { version = "0.8", features = ["multipart"] }

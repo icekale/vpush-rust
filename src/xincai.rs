@@ -215,7 +215,11 @@ fn build_row(
                     .unwrap_or(""),
                 now,
             );
-            if fetched.is_empty() { now.to_string() } else { fetched }
+            if fetched.is_empty() {
+                now.to_string()
+            } else {
+                fetched
+            }
         },
         content_hash: clip(
             item.get("contentHash")

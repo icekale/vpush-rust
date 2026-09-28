@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Connection, Row, SqlitePool};
 
 #[derive(Debug)]
 pub struct KeywordDigest {
@@ -179,7 +179,7 @@ CREATE TABLE IF NOT EXISTS hosted_images (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY,
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
     username TEXT NOT NULL COLLATE NOCASE UNIQUE,
     password_hash TEXT NOT NULL DEFAULT '',
     is_admin INTEGER NOT NULL DEFAULT 0,
@@ -626,6 +626,7 @@ impl Db {
             .await?;
         sqlx::raw_sql(SCHEMA).execute(&pool).await?;
         ensure_user_columns(&pool).await?;
+        ensure_users_autoincrement(&pool).await?;
         ensure_kol_columns(&pool).await?;
         ensure_news_article_columns(&pool).await?;
         ensure_register_code_columns(&pool).await?;
@@ -1922,8 +1923,15 @@ impl Db {
                     .execute(&self.pool)
                     .await?;
             }
-            self.touch_xincai_source(id, row.get("kind"), row.get("group_name"), kind, group, platform)
-                .await?;
+            self.touch_xincai_source(
+                id,
+                row.get("kind"),
+                row.get("group_name"),
+                kind,
+                group,
+                platform,
+            )
+            .await?;
             return Ok(id);
         }
         let id = sqlx::query("INSERT INTO news_sources (slug, name, group_name, kind, internal, platform) VALUES (?, ?, ?, ?, 1, ?)")
@@ -1958,11 +1966,13 @@ impl Db {
             .execute(&self.pool)
             .await?;
         if !platform.is_empty() {
-            sqlx::query("UPDATE news_sources SET platform = ? WHERE id = ? AND COALESCE(platform, '') = ''")
-                .bind(platform)
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+            sqlx::query(
+                "UPDATE news_sources SET platform = ? WHERE id = ? AND COALESCE(platform, '') = ''",
+            )
+            .bind(platform)
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         }
         if kind == "magazine" && current_kind != "magazine" {
             sqlx::query("UPDATE news_sources SET kind = 'magazine' WHERE id = ?")
@@ -3839,30 +3849,13 @@ impl Db {
             return Err(CatalogError::Bad("不能删除管理员"));
         }
         let mut tx = self.pool.begin().await?;
-        sqlx::query("DELETE FROM subscriptions WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM kol_requests WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM kol_acl WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM user_news_sources WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM news_reads WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM news_seen WHERE user_id = ?")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+        let tables = tables_with_column(&mut tx, "user_id").await?;
+        for table in tables {
+            sqlx::query(&format!("DELETE FROM \"{table}\" WHERE user_id = ?"))
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
         sqlx::query("DELETE FROM users WHERE id = ?")
             .bind(id)
             .execute(&mut *tx)
@@ -7842,6 +7835,410 @@ fn news_feed_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     })
 }
 
+async fn tables_with_column(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    column: &str,
+) -> Result<Vec<String>, sqlx::Error> {
+    let names: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut matched = Vec::new();
+    for name in names {
+        if !sql_ident(&name) {
+            continue;
+        }
+        let cols: Vec<String> =
+            sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{name}')"))
+                .fetch_all(&mut **tx)
+                .await?;
+        if cols.iter().any(|col| col == column) {
+            matched.push(name);
+        }
+    }
+    Ok(matched)
+}
+
+fn sql_ident(name: &str) -> bool {
+    !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn sql_mentions_name(sql: &str, name: &str) -> bool {
+    let sql = sql.to_ascii_lowercase();
+    let name = name.to_ascii_lowercase();
+    let bytes = sql.as_bytes();
+    let needle = name.as_bytes();
+    if needle.is_empty() {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(rel) = sql[start..].find(&name) {
+        let at = start + rel;
+        let before_ok =
+            at == 0 || (!bytes[at - 1].is_ascii_alphanumeric() && bytes[at - 1] != b'_');
+        let after = at + needle.len();
+        let after_ok =
+            after >= bytes.len() || (!bytes[after].is_ascii_alphanumeric() && bytes[after] != b'_');
+        if before_ok && after_ok {
+            return true;
+        }
+        start = at + name.len().max(1);
+    }
+    false
+}
+
+async fn views_touching_users(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<(String, String)>, sqlx::Error> {
+    let mut pending: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'view' AND sql IS NOT NULL ORDER BY name",
+    )
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut selected: Vec<(String, String)> = Vec::new();
+    loop {
+        let mut next: Vec<(String, String)> = Vec::new();
+        let mut grew = false;
+        for (name, sql) in pending {
+            let hits_users = sql_mentions_name(&sql, "users");
+            let hits_selected = selected.iter().any(|(dep, _)| sql_mentions_name(&sql, dep));
+            if hits_users || hits_selected {
+                selected.push((name, sql));
+                grew = true;
+            } else {
+                next.push((name, sql));
+            }
+        }
+        pending = next;
+        if !grew {
+            break;
+        }
+    }
+    Ok(selected)
+}
+
+async fn register_code_columns(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+) -> Result<Vec<String>, sqlx::Error> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'register_codes'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    if exists == 0 {
+        return Ok(Vec::new());
+    }
+    sqlx::query_scalar("SELECT name FROM pragma_table_info('register_codes')")
+        .fetch_all(&mut **tx)
+        .await
+}
+
+async fn drop_named(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    kind: &str,
+    name: &str,
+) -> Result<(), sqlx::Error> {
+    if !sql_ident(name) {
+        return Err(users_migrate_err(format!(
+            "无法临时移除引用 users 的对象 {name}。请先备份数据库并人工处理"
+        )));
+    }
+    sqlx::query(&format!("DROP {kind} \"{name}\""))
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+async fn ensure_users_autoincrement(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let sql: Option<String> =
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'")
+            .fetch_optional(pool)
+            .await?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.to_ascii_uppercase().contains("AUTOINCREMENT") {
+        return Ok(());
+    }
+    let create_sql = match rewrite_users_ddl(&sql) {
+        Ok(sql) => sql,
+        Err(msg) => {
+            let mut conn = pool.acquire().await?;
+            let hint = users_dependent_hint(&mut conn).await.unwrap_or_default();
+            let detail = if hint.is_empty() {
+                msg
+            } else {
+                format!("{msg} 相关对象: {hint}")
+            };
+            return Err(users_migrate_err(detail));
+        }
+    };
+    let mut conn = pool.acquire().await?;
+    sqlx::query("PRAGMA foreign_keys = OFF")
+        .execute(&mut *conn)
+        .await?;
+    let fk_flag: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&mut *conn)
+        .await?;
+    if fk_flag != 0 {
+        return Err(users_migrate_err(
+            "无法在事务外关闭外键检查，users 迁移已中止。请先备份数据库并人工处理",
+        ));
+    }
+    let result = rebuild_users_autoincrement(&mut conn, &create_sql).await;
+    let _ = sqlx::query("PRAGMA foreign_keys = ON")
+        .execute(&mut *conn)
+        .await;
+    result
+}
+
+async fn users_dependent_hint(conn: &mut sqlx::SqliteConnection) -> Result<String, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT type, name FROM sqlite_master
+         WHERE name != 'users'
+           AND sql IS NOT NULL
+           AND (
+                (type IN ('view', 'trigger') AND instr(lower(sql), 'users') > 0)
+                OR (type = 'table' AND instr(lower(sql), 'references') > 0 AND instr(lower(sql), 'users') > 0)
+           )
+         ORDER BY type, name",
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(kind, name)| format!("{kind}:{name}"))
+        .collect::<Vec<_>>()
+        .join(", "))
+}
+
+async fn rebuild_users_autoincrement(
+    conn: &mut sqlx::SqliteConnection,
+    create_sql: &str,
+) -> Result<(), sqlx::Error> {
+    let mut tx = conn.begin().await?;
+    let indexes: Vec<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'index' AND tbl_name = 'users' AND sql IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let triggers: Vec<String> = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'users' AND sql IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let views = views_touching_users(&mut tx).await?;
+    let view_names: Vec<String> = views.iter().map(|(name, _)| name.clone()).collect();
+    let trigger_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT name, tbl_name, sql FROM sqlite_master
+         WHERE type = 'trigger' AND tbl_name != 'users' AND sql IS NOT NULL
+         ORDER BY name",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    // INSTEAD OF triggers are dropped with their view, so capture every trigger on a
+    // view we are about to remove, plus triggers whose body names users.
+    let outside_triggers: Vec<(String, String)> = trigger_rows
+        .into_iter()
+        .filter(|(_, tbl, sql)| {
+            view_names.iter().any(|view| view == tbl) || sql_mentions_name(sql, "users")
+        })
+        .map(|(name, _, sql)| (name, sql))
+        .collect();
+    sqlx::query("DROP TABLE IF EXISTS users__autoinc")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(create_sql).execute(&mut *tx).await?;
+    sqlx::query("INSERT INTO users__autoinc SELECT * FROM users")
+        .execute(&mut *tx)
+        .await?;
+    for (name, _) in outside_triggers.iter().rev() {
+        drop_named(&mut tx, "TRIGGER", name).await?;
+    }
+    for (name, _) in views.iter().rev() {
+        drop_named(&mut tx, "VIEW", name).await?;
+    }
+    sqlx::query("DROP TABLE users").execute(&mut *tx).await?;
+    sqlx::query("ALTER TABLE users__autoinc RENAME TO users")
+        .execute(&mut *tx)
+        .await?;
+    for index in indexes {
+        sqlx::query(&index).execute(&mut *tx).await?;
+    }
+    for trigger in &triggers {
+        sqlx::query(trigger).execute(&mut *tx).await?;
+    }
+    for (_, sql) in &views {
+        sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    for (_, sql) in &outside_triggers {
+        sqlx::query(sql).execute(&mut *tx).await?;
+    }
+    let tables = tables_with_column(&mut tx, "user_id").await?;
+    let code_cols = register_code_columns(&mut tx).await?;
+    let mut seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM users")
+        .fetch_one(&mut *tx)
+        .await?;
+    for table in &tables {
+        let max_user: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(MAX(user_id), 0) FROM \"{table}\""
+        ))
+        .fetch_one(&mut *tx)
+        .await?;
+        if max_user > seq {
+            seq = max_user;
+        }
+    }
+    for column in ["used_by", "created_by"] {
+        if !code_cols.iter().any(|name| name == column) {
+            continue;
+        }
+        let max_id: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(MAX(\"{column}\"), 0) FROM register_codes"
+        ))
+        .fetch_one(&mut *tx)
+        .await?;
+        if max_id > seq {
+            seq = max_id;
+        }
+    }
+    for table in &tables {
+        sqlx::query(&format!(
+            "DELETE FROM \"{table}\" WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)"
+        ))
+        .execute(&mut *tx)
+        .await?;
+    }
+    for column in ["used_by", "created_by"] {
+        if !code_cols.iter().any(|name| name == column) {
+            continue;
+        }
+        sqlx::query(&format!(
+            "UPDATE register_codes SET \"{column}\" = NULL
+             WHERE \"{column}\" IS NOT NULL AND \"{column}\" NOT IN (SELECT id FROM users)"
+        ))
+        .execute(&mut *tx)
+        .await?;
+    }
+    sqlx::query("DELETE FROM sqlite_sequence WHERE name IN ('users', 'users__autoinc')")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("INSERT INTO sqlite_sequence (name, seq) VALUES ('users', ?)")
+        .bind(seq)
+        .execute(&mut *tx)
+        .await?;
+    let violations = sqlx::query("PRAGMA foreign_key_check")
+        .fetch_all(&mut *tx)
+        .await?;
+    if !violations.is_empty() {
+        return Err(users_migrate_err(
+            "users 迁移后外键校验失败，已回滚。请先备份数据库并人工处理",
+        ));
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+fn rewrite_users_ddl(sql: &str) -> Result<String, String> {
+    let renamed = rename_created_table(sql, "users__autoinc")?;
+    add_autoincrement_pk(&renamed)
+}
+
+fn users_migrate_err(msg: impl Into<String>) -> sqlx::Error {
+    sqlx::Error::Configuration(std::io::Error::other(msg.into()).into())
+}
+
+fn rename_created_table(sql: &str, new_name: &str) -> Result<String, String> {
+    let upper = sql.to_ascii_uppercase();
+    let Some(start) = upper.find("CREATE TABLE") else {
+        return Err("users 建表语句无法识别。请先备份数据库并人工处理".into());
+    };
+    let mut i = start + "CREATE TABLE".len();
+    i = skip_sql_ws(sql, i);
+    if sql[i..].to_ascii_uppercase().starts_with("IF NOT EXISTS") {
+        i += "IF NOT EXISTS".len();
+        i = skip_sql_ws(sql, i);
+    }
+    let (name_end, name) = read_sql_name(sql, i)?;
+    if !name.eq_ignore_ascii_case("users") {
+        return Err("users 建表语句无法识别。请先备份数据库并人工处理".into());
+    }
+    let mut out = String::new();
+    out.push_str(&sql[..i]);
+    out.push_str(new_name);
+    out.push_str(&sql[name_end..]);
+    Ok(out)
+}
+
+fn add_autoincrement_pk(sql: &str) -> Result<String, String> {
+    let upper = sql.to_ascii_uppercase();
+    let mut search = 0;
+    while let Some(rel) = upper[search..].find("INTEGER") {
+        let at = search + rel;
+        let after_int = at + "INTEGER".len();
+        let Some(primary_at) = match_sql_keyword(&upper, after_int, "PRIMARY") else {
+            search = after_int;
+            continue;
+        };
+        let Some(key_at) = match_sql_keyword(&upper, primary_at + "PRIMARY".len(), "KEY") else {
+            search = after_int;
+            continue;
+        };
+        let after_key = key_at + "KEY".len();
+        let after_ws = skip_sql_ws(&upper, after_key);
+        if upper[after_ws..].starts_with("AUTOINCREMENT") {
+            return Ok(sql.to_string());
+        }
+        let mut out = String::new();
+        out.push_str(&sql[..after_key]);
+        out.push_str(" AUTOINCREMENT");
+        out.push_str(&sql[after_key..]);
+        return Ok(out);
+    }
+    Err(
+        "users 表没有 INTEGER PRIMARY KEY，无法自动改为 AUTOINCREMENT。请先备份数据库并人工处理"
+            .into(),
+    )
+}
+
+fn match_sql_keyword(sql: &str, start: usize, keyword: &str) -> Option<usize> {
+    let at = skip_sql_ws(sql, start);
+    sql[at..].starts_with(keyword).then_some(at)
+}
+
+fn skip_sql_ws(sql: &str, mut index: usize) -> usize {
+    while let Some(ch) = sql[index..].chars().next() {
+        if !ch.is_whitespace() {
+            break;
+        }
+        index += ch.len_utf8();
+    }
+    index
+}
+
+fn read_sql_name(sql: &str, index: usize) -> Result<(usize, String), String> {
+    let rest = &sql[index..];
+    let invalid = "users 建表语句无法识别。请先备份数据库并人工处理";
+    if let Some(quote) = rest.chars().next() {
+        if quote == '"' || quote == '`' || quote == '[' {
+            let end_ch = if quote == '[' { ']' } else { quote };
+            let close = rest[1..].find(end_ch).ok_or_else(|| invalid.to_string())?;
+            return Ok((
+                index + 1 + close + 1,
+                rest[1..1 + close].replace("\"\"", "\""),
+            ));
+        }
+    }
+    let end = rest
+        .find(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+        .unwrap_or(rest.len());
+    if end == 0 {
+        return Err(invalid.into());
+    }
+    Ok((index + end, rest[..end].to_string()))
+}
+
 async fn add_column(pool: &SqlitePool, sql: &str) -> Result<(), sqlx::Error> {
     if let Err(err) = sqlx::raw_sql(sql).execute(pool).await {
         if !err.to_string().contains("duplicate column name") {
@@ -10159,5 +10556,484 @@ mod tests {
             Err(CatalogError::Bad("请先选择大V"))
         ));
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn users_autoincrement_keeps_ids_and_does_not_reuse_them() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-autoinc-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL COLLATE NOCASE UNIQUE,
+                    password_hash TEXT NOT NULL DEFAULT '',
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    token_version INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    wechat_openid TEXT NOT NULL DEFAULT ''
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO users (id, username, password_hash) VALUES (4, 'gone', 'old'), (9, 'kept', 'hash')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let kept = db.user_by_username("kept").await.unwrap().unwrap();
+        assert_eq!(kept.id, 9);
+        assert_eq!(kept.password_hash, "hash");
+        let definition: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(definition.to_ascii_uppercase().contains("AUTOINCREMENT"));
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('fresh', 'p')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let fresh = db.user_by_username("fresh").await.unwrap().unwrap();
+        assert!(fresh.id > 9, "reused {}", fresh.id);
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        db.delete_user(admin.id, fresh.id).await.unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('next', 'p')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let next = db.user_by_username("next").await.unwrap().unwrap();
+        assert!(next.id > fresh.id, "{} reused {}", next.id, fresh.id);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rewrite_users_ddl_keeps_constraints() {
+        let sql = "CREATE TABLE \"users\" (
+            id INTEGER PRIMARY KEY,
+            username TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(username) > 0)
+        )";
+        let out = rewrite_users_ddl(sql).unwrap();
+        assert!(out.starts_with("CREATE TABLE users__autoinc"));
+        assert!(out.contains("INTEGER PRIMARY KEY AUTOINCREMENT"));
+        assert!(out.contains("COLLATE NOCASE"));
+        assert!(out.contains("CHECK(length(username) > 0)"));
+        assert!(rewrite_users_ddl("CREATE TABLE users (id INT PRIMARY KEY)").is_err());
+    }
+
+    #[tokio::test]
+    async fn users_autoincrement_keeps_cascade_children() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-autoinc-fk-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        {
+            let opts = sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true)
+                .foreign_keys(false);
+            let pool = sqlx::sqlite::SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TABLE users (
+                    id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL COLLATE NOCASE UNIQUE CHECK(length(username) > 0),
+                    password_hash TEXT NOT NULL DEFAULT '',
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    token_version INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    wechat_openid TEXT NOT NULL DEFAULT ''
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "CREATE TABLE legacy_user_tokens (
+                    id INTEGER PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    token TEXT NOT NULL
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "CREATE TRIGGER legacy_users_touch AFTER UPDATE ON users BEGIN SELECT 1; END",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("CREATE VIEW legacy_user_names AS SELECT id, username FROM users")
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query(
+                "CREATE TRIGGER legacy_names_insert INSTEAD OF INSERT ON legacy_user_names
+                 BEGIN
+                   INSERT INTO users (username, password_hash) VALUES (NEW.username, 'from-view');
+                 END",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "CREATE TABLE register_codes (
+                    code TEXT PRIMARY KEY,
+                    used_by INTEGER,
+                    created_by INTEGER
+                )",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO register_codes (code, used_by, created_by) VALUES
+                 ('OLD', 99, 4), ('GHOST', 77, 88)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO users (id, username, password_hash) VALUES (4, 'kept', 'hash')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO legacy_user_tokens (id, user_id, token) VALUES (1, 4, 'device'), (2, 99, 'orphan')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        let db = Db::open(&path).await.unwrap();
+        let kept: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM legacy_user_tokens WHERE user_id = 4")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let orphan: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM legacy_user_tokens WHERE user_id = 99")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((kept, orphan), (1, 0));
+        let via_view: i64 =
+            sqlx::query_scalar("SELECT id FROM legacy_user_names WHERE username = 'kept'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(via_view, 4);
+        let trigger: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'legacy_users_touch'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(trigger, 1);
+        let instead: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'legacy_names_insert'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(instead, 1);
+        sqlx::query("INSERT INTO legacy_user_names (username) VALUES ('via-view')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let via = db.user_by_username("via-view").await.unwrap().unwrap();
+        assert_eq!(via.password_hash, "from-view");
+        let old_used: Option<i64> =
+            sqlx::query_scalar("SELECT used_by FROM register_codes WHERE code = 'OLD'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let old_created: Option<i64> =
+            sqlx::query_scalar("SELECT created_by FROM register_codes WHERE code = 'OLD'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let ghost_used: Option<i64> =
+            sqlx::query_scalar("SELECT used_by FROM register_codes WHERE code = 'GHOST'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let ghost_created: Option<i64> =
+            sqlx::query_scalar("SELECT created_by FROM register_codes WHERE code = 'GHOST'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(
+            (old_used, old_created, ghost_used, ghost_created),
+            (None, Some(4), None, None)
+        );
+        let definition: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let upper = definition.to_ascii_uppercase();
+        assert!(upper.contains("AUTOINCREMENT"));
+        assert!(upper.contains("CHECK"));
+        assert!(upper.contains("COLLATE NOCASE"));
+        assert!(
+            sqlx::query("INSERT INTO users (username, password_hash) VALUES ('', 'x')")
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('fresh', 'p')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let fresh = db.user_by_username("fresh").await.unwrap().unwrap();
+        assert!(
+            fresh.id > 99,
+            "reused {} (sequence must keep the orphan id)",
+            fresh.id
+        );
+        let token: String =
+            sqlx::query_scalar("SELECT token FROM legacy_user_tokens WHERE user_id = 4")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(token, "device");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn delete_user_clears_every_user_id_table() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-delete-user-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES ('reader01', 'x')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let reader = db.user_by_username("reader01").await.unwrap().unwrap();
+        sqlx::query("INSERT INTO kols (platform, name, external_id) VALUES ('xueqiu', '甲', '1')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let kol: i64 = sqlx::query_scalar("SELECT id FROM kols")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        for (sql, id) in [
+            (
+                "INSERT INTO subscriptions (user_id, kol_id) VALUES (?, ?)",
+                reader.id,
+            ),
+            (
+                "INSERT INTO subscriptions (user_id, kol_id) VALUES (?, ?)",
+                admin.id,
+            ),
+        ] {
+            sqlx::query(sql)
+                .bind(id)
+                .bind(kol)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO kol_acl (kol_id, user_id) VALUES (?, ?)")
+            .bind(kol)
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO kol_requests (platform, external_id, user_id) VALUES ('weibo', '9', ?)",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO news_reads (user_id, article_id) VALUES (?, 1)")
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_seen (user_id, seen_at) VALUES (?, '2020-01-01')")
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO news_keyword_notified (user_id, article_id) VALUES (?, 1)")
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO knowledge_keyword_notified (user_id, group_id, media_id) VALUES (?, 'g', 'm')",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO bind_codes (code, user_id, expires_at) VALUES ('code', ?, 1)")
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO feishu_oauth_sessions (state_hash, user_id, code_verifier, expires_at) VALUES ('h', ?, 'v', 1)",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO push_logs (post_id, channel, status, user_id) VALUES (1, 'web', 'ok', ?)",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO push_retries (channel, user_id, platform, external_id, post_id, next_at) VALUES ('web', ?, 'xueqiu', 'e', 1, 1)",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO admin_logs (user_id, action) VALUES (?, 'touch')")
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO webpush_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, 'https://push.example/reader', 'p', 'a')",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO webpush_subscriptions (user_id, endpoint, p256dh, auth) VALUES (?, 'https://push.example/admin', 'p', 'a')",
+        )
+        .bind(admin.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO android_devices (installation_id, user_id, token, provider) VALUES ('dev', ?, 't', 'fcm')",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO ima_kb_acl (group_id, user_id) VALUES ('reports', ?)")
+            .bind(reader.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO ima_kb_subscriptions (user_id, group_id, created_at) VALUES (?, 'reports', 1)",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO feishu_personal_bots (user_id, app_id, app_secret_ciphertext, status) VALUES (?, 'cli_test', 'cipher', 'active')",
+        )
+        .bind(reader.id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(count_user_rows(&db, reader.id).await >= 14);
+        db.delete_user(admin.id, reader.id).await.unwrap();
+        assert!(db.user_by_id(reader.id).await.unwrap().is_none());
+        assert_eq!(count_user_rows(&db, reader.id).await, 0);
+        let admin_push: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM webpush_subscriptions WHERE user_id = ?")
+                .bind(admin.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        let admin_sub: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM subscriptions WHERE user_id = ?")
+                .bind(admin.id)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((admin_push, admin_sub), (1, 1));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    async fn count_user_rows(db: &Db, id: i64) -> i64 {
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let mut total = 0;
+        for name in names {
+            if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            let cols: Vec<String> =
+                sqlx::query_scalar(&format!("SELECT name FROM pragma_table_info('{name}')"))
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            if !cols.iter().any(|col| col == "user_id") {
+                continue;
+            }
+            let n: i64 = sqlx::query_scalar(&format!(
+                "SELECT COUNT(*) FROM \"{name}\" WHERE user_id = ?"
+            ))
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            total += n;
+        }
+        total
     }
 }

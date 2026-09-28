@@ -1047,7 +1047,7 @@ fn publish_files(
     timeline: &mut Value,
     fetch: &mut dyn FnMut(&str) -> Result<Option<MediaFile>, Fail>,
 ) -> Result<(String, String, String), Fail> {
-    if key_hash.len() != 20 || !key_hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+    if !valid_archive_key(key_hash) {
         return Err(fail(400, "飞书文档读取失败"));
     }
     let stored = store_assets(timeline, fetch)?;
@@ -1561,6 +1561,10 @@ fn trusted_host(host: &str) -> bool {
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
 
+fn valid_archive_key(value: &str) -> bool {
+    matches!(value.len(), 20 | 64) && value.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 fn valid_token(token: &str) -> bool {
     (8..=128).contains(&token.len())
         && token
@@ -1717,6 +1721,14 @@ mod tests {
         assert!(take_session(&db, "wrong-state", &hash).await.is_err());
         assert!(!credential_live(&db).await.unwrap());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrated_document_keys_can_be_published() {
+        assert!(valid_archive_key(&"a".repeat(20)));
+        assert!(valid_archive_key(&"ab".repeat(32)));
+        assert!(!valid_archive_key(&"g".repeat(64)));
+        assert!(!valid_archive_key(&"../".repeat(8)));
     }
 
     #[test]

@@ -419,9 +419,10 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
     {
         tracing::warn!("雪球探测失败: {err}");
     }
-    let status = crate::cicc::from_env()
-        .map(|ctl| ctl.status())
-        .unwrap_or(serde_json::json!({}));
+    let status = match crate::cicc::from_env() {
+        Some(ctl) => ctl.status_async().await,
+        None => serde_json::json!({}),
+    };
     if let Err(err) = crate::alerts::check_cicc(db, now, &status, |message| async move {
         crate::alerts::notify_admins(db, &message).await
     })

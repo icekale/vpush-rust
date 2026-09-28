@@ -208,12 +208,12 @@ pub async fn restore_webdav(db: &Db) -> Result<(), BackupError> {
         return Err(fail(400, "先保存 WebDAV 配置"));
     }
     let folder = join(&cfg.url, &cfg.path);
-    let listing = dav_text(&cfg, "PROPFIND", &folder, Some("1"))?;
+    let listing = dav_text_off(&cfg, "PROPFIND", &folder, Some("1")).await?;
     let name = backup_names(&listing)
         .into_iter()
         .next_back()
         .ok_or(fail(400, "网盘上还没有备份文件"))?;
-    let bytes = dav_bytes(&cfg, &join(&folder, &name))?;
+    let bytes = dav_bytes_off(&cfg, &join(&folder, &name)).await?;
     restore_bytes(db, &bytes).await
 }
 
@@ -299,6 +299,41 @@ async fn restore_into_off(live: &Path, source: &Path) -> bool {
     tokio::task::spawn_blocking(move || restore_into(&live, &source))
         .await
         .unwrap_or(false)
+}
+
+async fn dav_text_off(
+    cfg: &Cfg,
+    method: &'static str,
+    url: &str,
+    depth: Option<&'static str>,
+) -> Result<String, BackupError> {
+    let cfg = cfg.clone();
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || dav_text(&cfg, method, &url, depth))
+        .await
+        .map_err(|_| fail(500, "WebDAV 连不上，请检查地址和账号"))?
+}
+
+async fn dav_bytes_off(cfg: &Cfg, url: &str) -> Result<Vec<u8>, BackupError> {
+    let cfg = cfg.clone();
+    let url = url.to_string();
+    tokio::task::spawn_blocking(move || dav_bytes(&cfg, &url))
+        .await
+        .map_err(|_| fail(400, "WebDAV 连不上，请检查地址和账号"))?
+}
+
+async fn upload_pruned_off(
+    cfg: &Cfg,
+    folder: &str,
+    name: &str,
+    bytes: Vec<u8>,
+) -> Result<(), BackupError> {
+    let cfg = cfg.clone();
+    let folder = folder.to_string();
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || upload_pruned(&cfg, &folder, &name, &bytes))
+        .await
+        .map_err(|_| fail(500, "WebDAV 连不上，请检查地址和账号"))?
 }
 
 async fn dav_off(
@@ -626,15 +661,15 @@ pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
         .and_then(|name| name.to_str())
         .unwrap_or("dav-backup.db")
         .to_string();
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
+    let bytes = match tokio::task::spawn_blocking(move || std::fs::read(path)).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => {
             let _ = db.set_setting(LAST_ERR, "读取数据库失败").await;
             return Ok(false);
         }
     };
     let folder = join(&cfg.url, &cfg.path);
-    if let Err(err) = upload_pruned(&cfg, &folder, &name, &bytes) {
+    if let Err(err) = upload_pruned_off(&cfg, &folder, &name, bytes).await {
         let _ = db.set_setting(LAST_ERR, err.detail).await;
         return Ok(false);
     }

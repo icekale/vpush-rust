@@ -1,3 +1,4 @@
+use std::fmt;
 use std::net::IpAddr;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,10 +25,14 @@ impl Net {
     }
 }
 
+impl fmt::Display for Net {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.addr, self.prefix)
+    }
+}
+
 pub fn default_trusted() -> Vec<Net> {
-    parse_trusted(
-        "127.0.0.0/8, ::1/128, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, fc00::/7, fe80::/10",
-    )
+    parse_trusted("127.0.0.0/8, ::1/128")
 }
 
 pub fn parse_trusted(raw: &str) -> Vec<Net> {
@@ -38,8 +43,9 @@ pub fn parse_trusted(raw: &str) -> Vec<Net> {
 
 pub fn resolve_client_ip(
     peer: Option<IpAddr>,
-    forwarded_for: Option<&str>,
+    forwarded_for: &[&str],
     real_ip: Option<&str>,
+    trust_real_ip: bool,
     trusted: &[Net],
 ) -> String {
     let Some(peer) = peer else {
@@ -48,11 +54,16 @@ pub fn resolve_client_ip(
     if !trusted.iter().any(|net| net.contains(peer)) {
         return peer.to_string();
     }
-    if let Some(ip) = forwarded_for.and_then(rightmost_hop) {
-        return ip.to_string();
+    if let Some(header) = forwarded_for.last() {
+        let hops = header_hops(header);
+        if let Some(ip) = client_from_hops(&hops, trusted) {
+            return ip.to_string();
+        }
     }
-    if let Some(ip) = real_ip.and_then(parse_ip_token) {
-        return ip.to_string();
+    if trust_real_ip {
+        if let Some(ip) = real_ip.and_then(parse_ip_token) {
+            return ip.to_string();
+        }
     }
     peer.to_string()
 }
@@ -76,12 +87,19 @@ fn parse_net(raw: &str) -> Option<Net> {
     Some(Net { addr, prefix })
 }
 
-fn rightmost_hop(header: &str) -> Option<IpAddr> {
-    let hop = header
-        .split(',')
-        .map(str::trim)
-        .rfind(|part| !part.is_empty())?;
-    parse_ip_token(hop)
+fn header_hops(header: &str) -> Vec<IpAddr> {
+    header.split(',').filter_map(parse_ip_token).collect()
+}
+
+fn client_from_hops(hops: &[IpAddr], trusted: &[Net]) -> Option<IpAddr> {
+    let mut chosen = None;
+    for hop in hops.iter().rev() {
+        chosen = Some(*hop);
+        if !trusted.iter().any(|net| net.contains(*hop)) {
+            break;
+        }
+    }
+    chosen
 }
 
 fn parse_ip_token(raw: &str) -> Option<IpAddr> {
@@ -134,58 +152,76 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_trusted_covers_loopback_private_and_docker() {
+    fn default_trusted_is_loopback_only() {
         let nets = default_trusted();
-        for ip in ["127.0.0.1", "10.1.2.3", "172.17.0.2", "192.168.1.10", "::1"] {
+        for ip in ["127.0.0.1", "::1", "::ffff:127.0.0.2"] {
             assert!(
                 nets.iter().any(|net| net.contains(ip.parse().unwrap())),
                 "{ip}"
             );
         }
-        assert!(nets
+        for ip in [
+            "10.1.2.3",
+            "172.17.0.2",
+            "192.168.1.10",
+            "fd00::1",
+            "8.8.8.8",
+        ] {
+            assert!(
+                !nets.iter().any(|net| net.contains(ip.parse().unwrap())),
+                "{ip}"
+            );
+        }
+        let docker = parse_trusted("172.16.0.0/12");
+        assert!(docker
             .iter()
-            .any(|net| net.contains("fd00::1".parse().unwrap())));
-        assert!(!nets
-            .iter()
-            .any(|net| net.contains("8.8.8.8".parse().unwrap())));
+            .any(|net| net.contains("172.17.0.2".parse().unwrap())));
     }
 
     #[test]
-    fn forwarded_for_is_used_only_behind_a_trusted_peer() {
+    fn forwarded_for_walks_the_last_header_from_the_right() {
         let trusted = parse_trusted("127.0.0.0/8, 10.0.0.0/8");
         let proxy = "127.0.0.1".parse().unwrap();
+        let chain = ["9.9.9.9, 8.8.4.4", "1.2.3.4, 10.1.1.1"];
         assert_eq!(
-            resolve_client_ip(Some(proxy), Some("1.2.3.4, 5.6.7.8"), None, &trusted),
-            "5.6.7.8"
+            resolve_client_ip(Some(proxy), &chain, None, false, &trusted),
+            "1.2.3.4"
+        );
+        let untrusted_right = ["203.0.113.9, 198.51.100.8"];
+        assert_eq!(
+            resolve_client_ip(Some(proxy), &untrusted_right, None, false, &trusted),
+            "198.51.100.8"
+        );
+        let all_trusted = ["10.2.2.2, 10.1.1.1"];
+        assert_eq!(
+            resolve_client_ip(Some(proxy), &all_trusted, None, false, &trusted),
+            "10.2.2.2"
         );
         assert_eq!(
-            resolve_client_ip(Some(proxy), Some("not-an-ip, 203.0.113.9"), None, &trusted),
-            "203.0.113.9"
+            resolve_client_ip(Some(proxy), &["garbage"], Some("9.9.9.9"), false, &trusted),
+            "127.0.0.1"
         );
         assert_eq!(
-            resolve_client_ip(Some(proxy), None, Some("9.9.9.9"), &trusted),
+            resolve_client_ip(Some(proxy), &["garbage"], Some("9.9.9.9"), true, &trusted),
             "9.9.9.9"
         );
         assert_eq!(
-            resolve_client_ip(Some(proxy), Some("garbage"), Some("9.9.9.9"), &trusted),
-            "9.9.9.9"
-        );
-        assert_eq!(
-            resolve_client_ip(Some(proxy), None, None, &trusted),
+            resolve_client_ip(Some(proxy), &[] as &[&str], None, false, &trusted),
             "127.0.0.1"
         );
         let client = "8.8.8.8".parse().unwrap();
         assert_eq!(
-            resolve_client_ip(
-                Some(client),
-                Some("1.2.3.4, 5.6.7.8"),
-                Some("9.9.9.9"),
-                &trusted
-            ),
+            resolve_client_ip(Some(client), &chain, Some("9.9.9.9"), true, &trusted),
             "8.8.8.8"
         );
+        let loopback_only = default_trusted();
+        let docker = "172.17.0.2".parse().unwrap();
         assert_eq!(
-            resolve_client_ip(None, Some("1.2.3.4"), None, &trusted),
+            resolve_client_ip(Some(docker), &chain, Some("9.9.9.9"), true, &loopback_only),
+            "172.17.0.2"
+        );
+        assert_eq!(
+            resolve_client_ip(None, &["1.2.3.4"], None, false, &trusted),
             "local"
         );
     }

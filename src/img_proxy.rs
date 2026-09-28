@@ -122,6 +122,7 @@ pub fn take_quota(video: bool, ip: &str, now: u64) -> Result<(), ImgError> {
     let window = now / WINDOW * WINDOW;
     let mut guard = QUOTA.lock().expect("img quota");
     let map = guard.get_or_insert_with(HashMap::new);
+    map.retain(|_, (seen, _)| *seen >= window);
     let entry = map.entry(key).or_insert((window, 0));
     if entry.0 != window {
         *entry = (window, 0);
@@ -434,7 +435,20 @@ mod tests {
         );
         assert_eq!(bounded_range(None), format!("bytes=0-{}", VIDEO_PROBE - 1));
         reset_quota();
-        for _ in 0..IMAGE_QUOTA {
+        QUOTA
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .insert("image:expired".into(), (0, 1));
+        take_quota(false, "1.2.3.4", 100).unwrap();
+        assert!(!QUOTA
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key("image:expired"));
+        for _ in 1..IMAGE_QUOTA {
             take_quota(false, "1.2.3.4", 100).unwrap();
         }
         let err = take_quota(false, "1.2.3.4", 100).unwrap_err();

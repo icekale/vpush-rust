@@ -611,13 +611,19 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     let document_id = if source_type == "docx" {
         url_or_token.to_string()
     } else {
-        let body = get_json(
-            &format!(
-                "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={}",
-                encode(url_or_token)
-            ),
-            &token,
-        )?;
+        let wiki = url_or_token.to_string();
+        let token = token.clone();
+        let body = tokio::task::spawn_blocking(move || {
+            get_json(
+                &format!(
+                    "https://open.feishu.cn/open-apis/wiki/v2/spaces/get_node?token={}",
+                    encode(&wiki)
+                ),
+                &token,
+            )
+        })
+        .await
+        .map_err(|_| fail(500, "飞书文档读取失败"))??;
         let node = body.get("node").cloned().unwrap_or(body);
         if node["obj_type"].as_str() != Some("docx") {
             return Err(fail(400, "当前仅支持飞书新版文档"));
@@ -627,10 +633,16 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     if document_id.is_empty() {
         return Err(fail(400, "Wiki 节点没有对应文档"));
     }
-    let body = get_json(
-        &format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id}"),
-        &token,
-    )?;
+    let token = token.clone();
+    let document_id_for_fetch = document_id.clone();
+    let body = tokio::task::spawn_blocking(move || {
+        get_json(
+            &format!("https://open.feishu.cn/open-apis/docx/v1/documents/{document_id_for_fetch}"),
+            &token,
+        )
+    })
+    .await
+    .map_err(|_| fail(500, "飞书文档读取失败"))??;
     let document = body.get("document").cloned().unwrap_or(body);
     Ok(json!({
         "document_id": document_id,

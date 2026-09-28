@@ -68,6 +68,8 @@ use crate::db::{CatalogError, Db, FeedFilter, KolPatch, RegisterError, User};
 
 const APP_VERSION: &str = "1.12.277";
 const LOGIN_MAX_FAILURES: usize = 8;
+const LOGIN_ACCOUNT_SOFT: usize = 64;
+const LOGIN_ACCOUNT_DELAY_MAX: u64 = 15;
 const LOGIN_WINDOW_SECS: u64 = 300;
 const SPA: &[&str] = &[
     "timeline",
@@ -294,6 +296,20 @@ async fn main() {
     let app = router(state);
     let addr: SocketAddr = format!("{host}:{port}").parse().expect("bind address");
     let listener = tokio::net::TcpListener::bind(addr).await.expect("bind");
+    let proxies = trusted_proxy_nets();
+    let proxy_list = if proxies.is_empty() {
+        "（无）".to_string()
+    } else {
+        proxies
+            .iter()
+            .map(|net| net.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    tracing::info!(
+        "trusted proxies: {proxy_list}; trust X-Real-IP: {}",
+        trust_real_ip()
+    );
     tracing::info!("listening on http://{addr}");
     axum::serve(
         listener,
@@ -3353,7 +3369,7 @@ async fn cicc_status(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(cicc_control()?.status()))
+    Ok(Json(cicc_control()?.status_async().await))
 }
 
 async fn cicc_trigger(
@@ -3363,7 +3379,8 @@ async fn cicc_trigger(
 ) -> Result<Json<Value>, ApiError> {
     let admin = require_admin(&state, &headers).await?;
     cicc_control()?
-        .trigger(&body.mode, &admin.username, None)
+        .trigger_async(body.mode, admin.username, None)
+        .await
         .map(Json)
         .map_err(cicc_err)
 }
@@ -3373,7 +3390,7 @@ async fn cicc_schedule(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    Ok(Json(cicc_control()?.read_schedule()))
+    Ok(Json(cicc_control()?.read_schedule_async().await))
 }
 
 async fn cicc_save_schedule(
@@ -3393,10 +3410,14 @@ async fn cicc_save_schedule(
         ));
     }
     let ctl = cicc_control()?;
-    let mut result = ctl.set_schedule(body.enabled).map_err(cicc_err)?;
-    if let Some(time) = body.time.as_deref() {
+    let mut result = ctl
+        .set_schedule_async(body.enabled)
+        .await
+        .map_err(cicc_err)?;
+    if let Some(time) = body.time {
         let queued = ctl
-            .set_schedule_time(time, &admin.username)
+            .set_schedule_time_async(time, admin.username)
+            .await
             .map_err(cicc_err)?;
         if let (Some(result), Some(queued)) = (result.as_object_mut(), queued.as_object()) {
             for (key, value) in queued {
@@ -3412,7 +3433,7 @@ async fn cicc_categories(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    let status = cicc_control()?.status();
+    let status = cicc_control()?.status_async().await;
     let categories = if status["cicc_settings"]["categories"].is_array() {
         status["cicc_settings"]["categories"].clone()
     } else {
@@ -3449,7 +3470,8 @@ async fn cicc_save_categories(
     let (categories, keywords) =
         cicc::clean_lists(&body.categories, &body.keywords).map_err(cicc_err)?;
     cicc_control()?
-        .set_settings(&categories, &keywords, &admin.username)
+        .set_settings_async(categories.clone(), keywords.clone(), admin.username)
+        .await
         .map_err(cicc_err)?;
     state
         .db
@@ -4704,6 +4726,7 @@ async fn login(
 ) -> Result<Json<Value>, ApiError> {
     let username = body.username.trim().to_string();
     check_login_limit(&state, &ip, &username)?;
+    pace_login(&state, &username).await;
     require_turnstile(&state, &body.turnstile, "login", &ip).await?;
     let user = state.db.user_by_username(&username).await.map_err(db_err)?;
     let password = body.password.clone();
@@ -4750,6 +4773,7 @@ async fn register(
     }
     let attempted = body.username.trim().to_string();
     check_login_limit(&state, &ip, &attempted)?;
+    pace_login(&state, &attempted).await;
     require_turnstile(&state, &body.turnstile, "register", &ip).await?;
     let username = match auth::validate_username(&body.username) {
         Ok(name) => name,
@@ -4819,6 +4843,7 @@ async fn wechat_login(
         }
     };
     check_login_limit(&state, &ip, &openid)?;
+    pace_login(&state, &openid).await;
     let id =
         match wechat::account(&state.db, state.allow_register, &openid, &body.invite_code).await {
             Ok(id) => id,
@@ -6131,15 +6156,25 @@ async fn attach_ip(mut req: Request<Body>, next: Next) -> Response {
             .extensions()
             .get::<ConnectInfo<SocketAddr>>()
             .map(|ConnectInfo(addr)| addr.ip());
-        let forwarded = req
+        let forwarded_owned: Vec<String> = req
             .headers()
-            .get("x-forwarded-for")
-            .and_then(|value| value.to_str().ok());
+            .get_all("x-forwarded-for")
+            .iter()
+            .filter_map(|value| value.to_str().ok())
+            .map(str::to_string)
+            .collect();
+        let forwarded: Vec<&str> = forwarded_owned.iter().map(String::as_str).collect();
         let real_ip = req
             .headers()
             .get("x-real-ip")
             .and_then(|value| value.to_str().ok());
-        client_ip::resolve_client_ip(peer, forwarded, real_ip, trusted_proxy_nets())
+        client_ip::resolve_client_ip(
+            peer,
+            &forwarded,
+            real_ip,
+            trust_real_ip(),
+            trusted_proxy_nets(),
+        )
     };
     req.extensions_mut().insert(ClientIp(ip));
     next.run(req).await
@@ -6161,6 +6196,23 @@ fn trusted_proxy_nets() -> &'static [client_ip::Net] {
     .as_slice()
 }
 
+fn trust_real_ip() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| env_flag("TRUST_X_REAL_IP"))
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name)
+            .ok()
+            .as_deref()
+            .map(str::trim)
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
+}
+
 fn dummy_password_hash() -> &'static str {
     static DUMMY: OnceLock<String> = OnceLock::new();
     DUMMY.get_or_init(|| {
@@ -6180,13 +6232,39 @@ async fn verify_password_off(password: String, hash: String) -> bool {
         .unwrap_or(false)
 }
 
-fn login_keys(ip: &str, account: &str) -> Vec<String> {
-    let mut keys = vec![format!("ip:{ip}")];
-    let account = account.trim().to_lowercase();
-    if !account.is_empty() {
-        keys.push(format!("acct:{account}"));
+struct LoginKeys {
+    ip: String,
+    pair: Option<String>,
+    account: Option<String>,
+}
+
+impl LoginKeys {
+    fn iter(&self) -> impl Iterator<Item = &str> {
+        self.pair
+            .as_deref()
+            .into_iter()
+            .chain(self.account.as_deref())
+            .chain(std::iter::once(self.ip.as_str()))
     }
-    keys
+}
+
+fn account_token(account: &str) -> Option<String> {
+    let account = account.trim();
+    if account.is_empty() || account.chars().count() > auth::USERNAME_MAX {
+        return None;
+    }
+    Some(hex::encode(Sha256::digest(
+        account.to_lowercase().as_bytes(),
+    )))
+}
+
+fn login_keys(ip: &str, account: &str) -> LoginKeys {
+    let token = account_token(account);
+    LoginKeys {
+        ip: format!("ip:{ip}"),
+        pair: token.as_ref().map(|token| format!("pair:{ip}:{token}")),
+        account: token.map(|token| format!("acct:{token}")),
+    }
 }
 
 fn login_hit_count(hits: &[u64], now: u64) -> usize {
@@ -6210,26 +6288,59 @@ fn maybe_prune_login_limit(limit: &mut LoginLimit, now: u64) {
 }
 
 fn login_limited(limit: &LoginLimit, ip: &str, account: &str, now: u64) -> bool {
-    login_keys(ip, account).into_iter().any(|key| {
-        limit
-            .hits
-            .get(&key)
-            .is_some_and(|hits| login_hit_count(hits, now) >= LOGIN_MAX_FAILURES)
-    })
+    let keys = login_keys(ip, account);
+    let ip_hits = limit
+        .hits
+        .get(&keys.ip)
+        .map(|hits| login_hit_count(hits, now))
+        .unwrap_or(0);
+    let pair_hits = keys
+        .pair
+        .as_ref()
+        .and_then(|key| limit.hits.get(key))
+        .map(|hits| login_hit_count(hits, now))
+        .unwrap_or(0);
+    ip_hits >= LOGIN_MAX_FAILURES || pair_hits >= LOGIN_MAX_FAILURES
+}
+
+fn login_soft_delay_secs(limit: &LoginLimit, account: &str, now: u64) -> u64 {
+    let Some(key) = login_keys("", account).account else {
+        return 0;
+    };
+    let count = limit
+        .hits
+        .get(&key)
+        .map(|hits| login_hit_count(hits, now))
+        .unwrap_or(0);
+    if count < LOGIN_ACCOUNT_SOFT {
+        return 0;
+    }
+    ((count - LOGIN_ACCOUNT_SOFT + 1) as u64).min(LOGIN_ACCOUNT_DELAY_MAX)
 }
 
 fn record_limited(limit: &mut LoginLimit, ip: &str, account: &str, now: u64) {
     maybe_prune_login_limit(limit, now);
-    for key in login_keys(ip, account) {
-        let hits = limit.hits.entry(key).or_default();
+    for key in login_keys(ip, account).iter() {
+        let hits = limit.hits.entry(key.to_string()).or_default();
         hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
         hits.push(now);
     }
 }
 
 fn clear_limited(limit: &mut LoginLimit, ip: &str, account: &str) {
-    for key in login_keys(ip, account) {
-        limit.hits.remove(&key);
+    for key in login_keys(ip, account).iter() {
+        limit.hits.remove(key);
+    }
+}
+
+async fn pace_login(state: &AppState, account: &str) {
+    let secs = {
+        let now = now_secs();
+        let limit = state.fails.lock().expect("login limit");
+        login_soft_delay_secs(&limit, account, now)
+    };
+    if secs > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
     }
 }
 
@@ -7517,11 +7628,26 @@ mod tests {
             record_limited(&mut limit, "1.1.1.1", "Alice", 1_000);
         }
         assert!(login_limited(&limit, "1.1.1.1", "bob", 1_000));
-        assert!(login_limited(&limit, "2.2.2.2", "alice", 1_000));
+        assert!(login_limited(&limit, "1.1.1.1", "alice", 1_000));
+        assert!(!login_limited(&limit, "2.2.2.2", "alice", 1_000));
         assert!(!login_limited(&limit, "2.2.2.2", "bob", 1_000));
+        assert_eq!(login_soft_delay_secs(&limit, "alice", 1_000), 0);
+        assert!(limit.hits.keys().all(|key| !key.contains("alice")));
         clear_limited(&mut limit, "1.1.1.1", "alice");
         assert!(!login_limited(&limit, "1.1.1.1", "carol", 1_000));
         assert!(!login_limited(&limit, "8.8.8.8", "alice", 1_000));
+
+        let mut spread = LoginLimit::default();
+        for _ in 0..LOGIN_ACCOUNT_SOFT {
+            record_limited(&mut spread, "198.51.100.1", "admin", 2_000);
+        }
+        assert!(!login_limited(&spread, "203.0.113.8", "admin", 2_000));
+        assert_eq!(login_soft_delay_secs(&spread, "admin", 2_000), 1);
+        assert_eq!(login_soft_delay_secs(&spread, "other", 2_000), 0);
+        let huge = "n".repeat(auth::USERNAME_MAX + 1);
+        record_limited(&mut spread, "203.0.113.9", &huge, 2_000);
+        assert!(spread.hits.keys().all(|key| !key.contains(&huge)));
+        assert_eq!(login_soft_delay_secs(&spread, &huge, 2_000), 0);
 
         let mut stale = LoginLimit {
             hits: HashMap::from([("ip:9.9.9.9".into(), vec![10])]),

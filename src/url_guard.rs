@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::OnceLock;
 
 pub fn validate_url(raw: &str, scheme: &str) -> Result<(), String> {
     let prefix = format!("{scheme}://");
@@ -79,13 +80,32 @@ fn nat64_embedded(ip: &std::net::Ipv6Addr) -> Option<std::net::Ipv4Addr> {
 }
 
 pub fn ip_blocked(ip: IpAddr) -> bool {
+    ip_blocked_in(ip, fake_ip_allowed())
+}
+
+pub fn ip_blocked_in(ip: IpAddr, allow_fake_ip: bool) -> bool {
     match ip {
-        IpAddr::V4(ip) => ipv4_blocked(ip),
-        IpAddr::V6(ip) => ipv6_blocked(ip),
+        IpAddr::V4(ip) => ipv4_blocked(ip, allow_fake_ip),
+        IpAddr::V6(ip) => ipv6_blocked(ip, allow_fake_ip),
     }
 }
 
-fn ipv4_blocked(ip: std::net::Ipv4Addr) -> bool {
+fn fake_ip_allowed() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("SSRF_ALLOW_FAKE_IP")
+                .ok()
+                .as_deref()
+                .map(str::trim)
+                .map(|value| value.to_ascii_lowercase())
+                .as_deref(),
+            Some("1" | "true" | "yes" | "on")
+        )
+    })
+}
+
+fn ipv4_blocked(ip: std::net::Ipv4Addr, allow_fake_ip: bool) -> bool {
     let [a, b, c, _] = ip.octets();
     ip.is_loopback()
         || ip.is_private()
@@ -97,11 +117,11 @@ fn ipv4_blocked(ip: std::net::Ipv4Addr) -> bool {
         || a == 0
         || (a == 100 && (64..128).contains(&b))
         || (a == 192 && b == 0 && c == 0)
-        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && (b == 18 || b == 19) && !allow_fake_ip)
         || a >= 224
 }
 
-fn ipv6_blocked(ip: std::net::Ipv6Addr) -> bool {
+fn ipv6_blocked(ip: std::net::Ipv6Addr, allow_fake_ip: bool) -> bool {
     if ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_unique_local()
@@ -120,7 +140,9 @@ fn ipv6_blocked(ip: std::net::Ipv6Addr) -> bool {
     {
         return true;
     }
-    ip.to_ipv4().is_some_and(ipv4_blocked) || nat64_embedded(&ip).is_some_and(ipv4_blocked)
+    ip.to_ipv4()
+        .is_some_and(|ip| ipv4_blocked(ip, allow_fake_ip))
+        || nat64_embedded(&ip).is_some_and(|ip| ipv4_blocked(ip, allow_fake_ip))
 }
 
 #[cfg(test)]
@@ -163,6 +185,10 @@ mod tests {
         assert!(validate_url("https://8.8.8.8/", "https").is_ok());
         assert!(validate_url("https://[64:ff9b::808:808]/", "https").is_ok());
         assert!(validate_url("https://[2606:4700:4700::1111]/", "https").is_ok());
+        let fake = "198.18.0.1".parse().unwrap();
+        assert!(ip_blocked_in(fake, false));
+        assert!(!ip_blocked_in(fake, true));
+        assert!(ip_blocked_in("10.1.1.1".parse().unwrap(), true));
     }
 
     #[test]

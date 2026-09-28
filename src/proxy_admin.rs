@@ -454,8 +454,16 @@ pub fn live_get(url: &str) -> Result<String, String> {
         .redirects(0)
         .build()
         .get(url)
-        .call()
-        .map_err(|err| err.to_string())?;
+        .call();
+    map_extract_response(response)
+}
+
+fn map_extract_response(response: Result<ureq::Response, ureq::Error>) -> Result<String, String> {
+    let response = match response {
+        Ok(response) => response,
+        Err(ureq::Error::Status(code, _)) => return Err(format!("提取 HTTP {code}")),
+        Err(_) => return Err("提取请求失败".into()),
+    };
     if !(200..300).contains(&response.status()) {
         return Err(format!("提取 HTTP {}", response.status()));
     }
@@ -464,7 +472,7 @@ pub fn live_get(url: &str) -> Result<String, String> {
         .into_reader()
         .take(1_048_576)
         .read_to_end(&mut buf)
-        .map_err(|err| err.to_string())?;
+        .map_err(|_| "提取结果读取失败".to_string())?;
     String::from_utf8(buf).map_err(|_| "提取结果不是文本".to_string())
 }
 
@@ -1074,5 +1082,60 @@ mod tests {
         note(&db, Some(chosen.id), false, "超时").await;
         assert_eq!(acquire(&db, "xueqiu").await.unwrap_err(), "代理池为空");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn extract_transport_error_omits_token() {
+        let secret = "unit-test-extract-token";
+        let err = live_get(&format!("http://127.0.0.1:1/extract?token={secret}")).unwrap_err();
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("http"), "{err}");
+        assert!(!err.contains("token"), "{err}");
+        assert_eq!(err, "提取请求失败");
+    }
+
+    #[test]
+    fn extract_http_status_omits_token() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let thread = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let length = stream.read(&mut chunk).unwrap_or(0);
+                if length == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..length]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let _ = write!(
+                stream,
+                "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.flush();
+        });
+        let secret = "unit-test-extract-token";
+        let url = format!("http://{address}/extract?token={secret}");
+        let response = ureq::AgentBuilder::new()
+            .timeout_connect(std::time::Duration::from_secs(5))
+            .timeout_read(std::time::Duration::from_secs(5))
+            .redirects(0)
+            .build()
+            .get(&url)
+            .call();
+        let err = map_extract_response(response).unwrap_err();
+        assert_eq!(err, "提取 HTTP 403");
+        assert!(!err.contains(secret), "{err}");
+        assert!(!err.contains("token"), "{err}");
+        thread.join().unwrap();
     }
 }

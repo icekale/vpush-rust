@@ -7,7 +7,10 @@ services:
     container_name: vpush-rust
     restart: unless-stopped
     ports:
-      - "8000:8000"
+      # Publish only on the host loopback so Caddy on the same machine is the public entry.
+      # If Caddy runs in another container, publish on the Docker network instead and set
+      # TRUSTED_PROXIES to that network, for example 172.16.0.0/12.
+      - "127.0.0.1:8000:8000"
     environment:
       HOST: 0.0.0.0
       PORT: 8000

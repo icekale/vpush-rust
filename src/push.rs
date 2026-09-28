@@ -879,29 +879,45 @@ fn telegram_video_url(raw: &str) -> bool {
     path.ends_with(".mp4") || path.ends_with(".webm")
 }
 
-fn telegram_post_media(post: &TelegramPost) -> (Vec<String>, Vec<String>) {
-    let urls: Vec<String> = post
+struct TelegramMedia {
+    rich_images: Vec<String>,
+    fallback_images: Vec<String>,
+    videos: Vec<String>,
+}
+
+fn telegram_post_media(post: &TelegramPost) -> TelegramMedia {
+    let rich_images = post
         .images
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|url| telegram_media_url(url))
+        .filter(|url| telegram_media_url(url) && !telegram_video_url(url))
+        .take(9)
         .map(str::to_owned)
         .collect();
-    let images = urls
-        .iter()
-        .filter(|url| !telegram_video_url(url))
-        .take(9)
-        .cloned()
-        .collect();
-    let videos = urls
-        .iter()
-        .filter(|url| telegram_video_url(url))
+    let first_four = post
+        .images
+        .as_array()
+        .into_iter()
+        .flatten()
         .take(4)
-        .cloned()
+        .filter_map(Value::as_str)
+        .filter(|url| telegram_media_url(url));
+    let fallback_images = first_four
+        .clone()
+        .filter(|url| !telegram_video_url(url))
+        .map(str::to_owned)
         .collect();
-    (images, videos)
+    let videos = first_four
+        .filter(|url| telegram_video_url(url))
+        .map(str::to_owned)
+        .collect();
+    TelegramMedia {
+        rich_images,
+        fallback_images,
+        videos,
+    }
 }
 
 fn telegram_rich_media_body(
@@ -1224,7 +1240,7 @@ async fn send_telegram_post(
         .await
         .map_err(|err| err.to_string())?;
     let (html, markup) = render_telegram_post(post, favorite, keyword);
-    let (images, videos) = telegram_post_media(post);
+    let media = telegram_post_media(post);
     validate_telegram_send(token, chat_id)?;
     let token = token.to_string();
     let chat_id = chat_id.to_string();
@@ -1235,8 +1251,9 @@ async fn send_telegram_post(
             &html,
             markup,
             rich_messages,
-            &images,
-            &videos,
+            &media.rich_images,
+            &media.fallback_images,
+            &media.videos,
         )
     })
     .await
@@ -1274,7 +1291,8 @@ fn telegram_deliver_post_media_with<F>(
     html: &str,
     reply_markup: Option<Value>,
     rich_messages: bool,
-    images: &[String],
+    rich_images: &[String],
+    fallback_images: &[String],
     videos: &[String],
     mut request: F,
 ) -> Result<(), TelegramRequestError>
@@ -1283,7 +1301,7 @@ where
 {
     let mut rich_sent = false;
     if rich_messages {
-        let body = telegram_rich_media_body(chat_id, html, images, reply_markup.as_ref());
+        let body = telegram_rich_media_body(chat_id, html, rich_images, reply_markup.as_ref());
         match request("sendRichMessage", &body) {
             Ok(()) => rich_sent = true,
             Err(TelegramRequestError::Api(_) | TelegramRequestError::RateLimited) => {}
@@ -1293,7 +1311,7 @@ where
     if !rich_sent {
         let fallback = telegram_message_body(chat_id, html, Some("HTML"), reply_markup);
         request("sendMessage", &fallback)?;
-        telegram_send_media_best_effort(chat_id, images, videos, &mut request);
+        telegram_send_media_best_effort(chat_id, fallback_images, videos, &mut request);
     } else {
         for video in videos.iter().take(4) {
             let body = json!({
@@ -1392,6 +1410,7 @@ where
         rich_messages,
         &[],
         &[],
+        &[],
         request,
     )
 }
@@ -1402,7 +1421,8 @@ fn telegram_deliver_post_media(
     html: &str,
     reply_markup: Option<Value>,
     rich_messages: bool,
-    images: &[String],
+    rich_images: &[String],
+    fallback_images: &[String],
     videos: &[String],
 ) -> Result<(), TelegramRequestError> {
     telegram_deliver_post_media_with(
@@ -1410,7 +1430,8 @@ fn telegram_deliver_post_media(
         html,
         reply_markup,
         rich_messages,
-        images,
+        rich_images,
+        fallback_images,
         videos,
         |method, body| telegram_post(token, method, body),
     )
@@ -2223,21 +2244,95 @@ mod tests {
             "https://cdn.example/clip.webm#part",
             "https://user:pass@cdn.example/secret.jpg",
         ]);
-        let (images, videos) = telegram_post_media(&post);
+        let media = telegram_post_media(&post);
         assert_eq!(
-            images,
+            media.rich_images,
             [
                 "https://cdn.example/image.jpg",
                 "http://cdn.example/image-2.png"
             ]
         );
         assert_eq!(
-            videos,
+            media.fallback_images,
             [
-                "https://cdn.example/clip.mp4?token=1",
-                "https://cdn.example/clip.webm#part"
+                "https://cdn.example/image.jpg",
+                "http://cdn.example/image-2.png"
             ]
         );
+        assert_eq!(media.videos, ["https://cdn.example/clip.mp4?token=1"]);
+    }
+
+    #[test]
+    fn telegram_media_sends_follow_original_first_four_window() {
+        let mut post = telegram_fixture("x");
+        post.images = json!([
+            "https://cdn.example/photo-0.jpg",
+            "https://cdn.example/photo-1.jpg",
+            "https://cdn.example/photo-2.jpg",
+            "https://cdn.example/photo-3.jpg",
+            "https://cdn.example/photo-4.jpg",
+            "https://cdn.example/late.mp4",
+        ]);
+        let media = telegram_post_media(&post);
+        assert_eq!(media.rich_images.len(), 5);
+        assert_eq!(media.fallback_images.len(), 4);
+        assert!(media.videos.is_empty());
+        let mut methods = Vec::new();
+        telegram_deliver_post_media_with(
+            "-123",
+            "html",
+            None,
+            true,
+            &media.rich_images,
+            &media.fallback_images,
+            &media.videos,
+            |method, _| {
+                methods.push(method.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(methods, ["sendRichMessage"]);
+
+        post.images = json!([
+            "https://cdn.example/photo-0.jpg",
+            "https://cdn.example/interleaved.mp4",
+            "https://cdn.example/photo-1.jpg",
+            "https://cdn.example/photo-2.jpg",
+            "https://cdn.example/photo-3.jpg",
+            "https://cdn.example/photo-4.jpg",
+        ]);
+        let media = telegram_post_media(&post);
+        assert_eq!(media.rich_images.len(), 5);
+        assert_eq!(media.fallback_images.len(), 3);
+        assert_eq!(media.videos, ["https://cdn.example/interleaved.mp4"]);
+        let mut calls = Vec::new();
+        telegram_deliver_post_media_with(
+            "-123",
+            "html",
+            None,
+            false,
+            &media.rich_images,
+            &media.fallback_images,
+            &media.videos,
+            |method, body| {
+                calls.push((
+                    method.to_string(),
+                    serde_json::from_str::<Value>(body).unwrap(),
+                ));
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            calls
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<Vec<_>>(),
+            ["sendMessage", "sendMediaGroup", "sendVideo"]
+        );
+        assert_eq!(calls[1].1["media"].as_array().unwrap().len(), 3);
+        assert_eq!(calls[2].1["video"], "https://cdn.example/interleaved.mp4");
     }
 
     #[test]
@@ -2276,6 +2371,7 @@ mod tests {
             None,
             true,
             &images,
+            &images,
             &videos,
             |method, _| {
                 methods.push(method.to_string());
@@ -2300,14 +2396,23 @@ mod tests {
             "https://cdn.example/two.jpg".to_string(),
         ];
         let mut methods = Vec::new();
-        telegram_deliver_post_media_with("-123", "html", None, false, &images, &[], |method, _| {
-            methods.push(method.to_string());
-            if method == "sendMediaGroup" {
-                Err(TelegramRequestError::Api("album rejected".into()))
-            } else {
-                Ok(())
-            }
-        })
+        telegram_deliver_post_media_with(
+            "-123",
+            "html",
+            None,
+            false,
+            &images,
+            &images,
+            &[],
+            |method, _| {
+                methods.push(method.to_string());
+                if method == "sendMediaGroup" {
+                    Err(TelegramRequestError::Api("album rejected".into()))
+                } else {
+                    Ok(())
+                }
+            },
+        )
         .unwrap();
         assert_eq!(
             methods,
@@ -2324,6 +2429,7 @@ mod tests {
             "html",
             None,
             false,
+            &images,
             &images,
             &[],
             |method, _| {

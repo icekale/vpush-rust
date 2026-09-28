@@ -162,17 +162,29 @@ where
     if !session.expected_open_id.is_empty() && sender_open_id != session.expected_open_id {
         return Ok(false);
     }
-    db.clear_feishu_bind_code(session_id, "testing").await?;
-    drop_code(session_id);
+    let claimed = sqlx::query(
+        "UPDATE feishu_registration_sessions SET status = 'testing', last_error = ''
+         WHERE session_id = ? AND status = 'awaiting_bind'",
+    )
+    .bind(session_id)
+    .execute(db.pool())
+    .await?;
+    if claimed.rows_affected() == 0 {
+        return Ok(false);
+    }
     let Some(key) = credential_key() else {
-        db.set_feishu_status(session_id, "degraded", "服务端未配置 FEISHU_CREDENTIAL_KEY")
-            .await?;
+        db.set_feishu_status(
+            session_id,
+            "awaiting_bind",
+            "服务端未配置 FEISHU_CREDENTIAL_KEY",
+        )
+        .await?;
         return Err(PersonalError::Disabled);
     };
     let secret = match open_secret(&key, &session.candidate_app_secret_ciphertext) {
         Ok(secret) => secret,
         Err(_) => {
-            db.set_feishu_status(session_id, "degraded", "候选凭据解密失败")
+            db.set_feishu_status(session_id, "awaiting_bind", "候选凭据解密失败")
                 .await?;
             return Ok(false);
         }
@@ -183,7 +195,7 @@ where
         "open.feishu.cn"
     };
     if let Err(err) = send_test(&session.candidate_app_id, &secret, chat_id, host) {
-        db.set_feishu_status(session_id, "degraded", &clip(&err))
+        db.set_feishu_status(session_id, "awaiting_bind", &clip(&err))
             .await?;
         return Ok(false);
     }
@@ -199,11 +211,12 @@ where
         .await
     {
         let message = err.to_string();
-        db.set_feishu_status(session_id, "degraded", &clip(&message))
+        db.set_feishu_status(session_id, "awaiting_bind", &clip(&message))
             .await?;
         return Ok(false);
     }
-    db.set_feishu_status(session_id, "active", "").await?;
+    db.clear_feishu_bind_code(session_id, "active").await?;
+    drop_code(session_id);
     Ok(true)
 }
 
@@ -781,6 +794,20 @@ mod tests {
         )
         .await
         .unwrap());
+        assert!(!accept_bind(
+            &db,
+            session_id,
+            code,
+            "ou_1",
+            "oc_1",
+            1_100,
+            |_, _, _, _| Err("测试发送失败".into())
+        )
+        .await
+        .unwrap());
+        let retryable = db.feishu_session(session_id).await.unwrap().unwrap();
+        assert_eq!(retryable.status, "awaiting_bind");
+        assert!(!retryable.bind_code_hash.is_empty());
         let content = serde_json::json!({"text": format!("@_user_1 /bind {code}")}).to_string();
         let payload = serde_json::json!({
             "header": {"event_type": "im.message.receive_v1"},

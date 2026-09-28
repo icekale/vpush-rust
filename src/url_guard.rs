@@ -64,6 +64,21 @@ fn authority_host(authority: &str) -> Result<String, String> {
     Ok(host.trim_matches(['[', ']']).to_ascii_lowercase())
 }
 
+fn nat64_private(ip: &std::net::Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    // ponytail: only the well-known 64:ff9b::/96 prefix; other NAT64 prefixes need an explicit allowlist.
+    if seg[0] != 0x0064 || seg[1] != 0xff9b || seg[2..6].iter().any(|part| *part != 0) {
+        return false;
+    }
+    let embedded = std::net::Ipv4Addr::new(
+        (seg[6] >> 8) as u8,
+        seg[6] as u8,
+        (seg[7] >> 8) as u8,
+        seg[7] as u8,
+    );
+    is_private(&IpAddr::V4(embedded))
+}
+
 fn is_private(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(ip) => {
@@ -82,6 +97,7 @@ fn is_private(ip: &IpAddr) -> bool {
                 || ip
                     .to_ipv4_mapped()
                     .is_some_and(|ip| is_private(&IpAddr::V4(ip)))
+                || nat64_private(ip)
         }
     }
 }
@@ -100,6 +116,9 @@ mod tests {
             "[FD00::1]",
             "[FE80::1]",
             "[::ffff:127.0.0.1]",
+            "[64:ff9b::a00:1]",
+            "[64:ff9b::7f00:1]",
+            "[64:ff9b::a9fe:a9fe]",
         ] {
             assert!(
                 validate_url(&format!("https://{host}/"), "https").is_err(),
@@ -107,12 +126,14 @@ mod tests {
             );
         }
         assert!(validate_url("https://example.com/", "https").is_ok());
+        assert!(validate_url("https://[64:ff9b::808:808]/", "https").is_ok());
     }
 
     #[test]
     fn rejects_private_resolver_results() {
         assert!(public_resolver("127.0.0.1:443").is_err());
         assert!(public_resolver("[::1]:443").is_err());
+        assert!(public_resolver("[64:ff9b::a00:1]:443").is_err());
     }
 
     #[test]

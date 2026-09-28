@@ -125,7 +125,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             .duration_since(UNIX_EPOCH)
             .map(|item| item.as_secs() as i64)
             .unwrap_or(0);
-        if channels.wecom {
+        if channels.wecom && wecom_bound(&target.wecom_webhook) {
             if let Err(err) = wecom(&target.wecom_webhook, note).await {
                 tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
                 note_push_failure(db, &format!("企业微信：{err}")).await;
@@ -139,9 +139,18 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     unix,
                 )
                 .await;
+            } else {
+                remember_success(
+                    db,
+                    kol_id,
+                    (note.platform, note.external_id),
+                    "wecom",
+                    target.user_id,
+                )
+                .await;
             }
         }
-        if channels.bark {
+        if channels.bark && valid_bark_key(&target.bark_key) {
             if let Err(err) = bark(&target.bark_key, note).await {
                 tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
                 note_push_failure(db, &format!("Bark：{err}")).await;
@@ -153,6 +162,15 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     target.user_id,
                     &err,
                     unix,
+                )
+                .await;
+            } else {
+                remember_success(
+                    db,
+                    kol_id,
+                    (note.platform, note.external_id),
+                    "bark",
+                    target.user_id,
                 )
                 .await;
             }
@@ -187,6 +205,15 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                             target.user_id,
                             &err,
                             unix,
+                        )
+                        .await;
+                    } else {
+                        remember_success(
+                            db,
+                            kol_id,
+                            (note.platform, note.external_id),
+                            "telegram",
+                            target.user_id,
                         )
                         .await;
                     }
@@ -226,6 +253,15 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     unix,
                 )
                 .await;
+            } else {
+                remember_success(
+                    db,
+                    kol_id,
+                    (note.platform, note.external_id),
+                    "webpush",
+                    target.user_id,
+                )
+                .await;
             }
         }
     }
@@ -263,6 +299,8 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             unix,
         )
         .await;
+    } else {
+        remember_success(db, kol_id, (note.platform, note.external_id), "feishu", 0).await;
     }
 }
 
@@ -293,6 +331,38 @@ async fn remember_failure_logged(
 ) {
     if let Err(err) = remember_failure(db, kol_id, identity, channel, user_id, error, now).await {
         tracing::warn!(kol = kol_id, channel, "记录推送失败以便重试失败: {err}");
+    }
+}
+
+async fn remember_success(
+    db: &Db,
+    kol_id: i64,
+    identity: (&str, &str),
+    channel: &str,
+    user_id: i64,
+) {
+    let row =
+        sqlx::query("SELECT id FROM posts WHERE platform = ? AND external_id = ? AND kol_id = ?")
+            .bind(identity.0)
+            .bind(identity.1)
+            .bind(kol_id)
+            .fetch_optional(db.pool())
+            .await;
+    let row = match row {
+        Ok(row) => row,
+        Err(err) => {
+            tracing::warn!(kol = kol_id, channel, "记录推送成功失败: {err}");
+            return;
+        }
+    };
+    let Some(row) = row else {
+        return;
+    };
+    if let Err(err) = db
+        .add_push_log(row.get("id"), channel, "success", "", Some(user_id))
+        .await
+    {
+        tracing::warn!(kol = kol_id, channel, "记录推送成功失败: {err}");
     }
 }
 
@@ -433,19 +503,21 @@ where
         }
         match send(post_id, channel.clone(), user_id).await {
             Ok(()) => {
+                let mut tx = db.pool().begin().await?;
                 sqlx::query("DELETE FROM push_retries WHERE channel = ? AND user_id = ? AND platform = ? AND external_id = ?")
                     .bind(&channel)
                     .bind(user_id)
                     .bind(&platform)
                     .bind(&external_id)
-                    .execute(db.pool())
+                    .execute(&mut *tx)
                     .await?;
                 sqlx::query("UPDATE push_logs SET status = 'success', error = '' WHERE id = (SELECT id FROM push_logs WHERE post_id = ? AND channel = ? AND user_id = ? AND status = 'failed' ORDER BY id DESC LIMIT 1)")
                     .bind(post_id)
                     .bind(&channel)
                     .bind(user_id)
-                    .execute(db.pool())
+                    .execute(&mut *tx)
                     .await?;
+                tx.commit().await?;
                 done += 1;
             }
             Err(_) => {
@@ -616,7 +688,7 @@ async fn wecom(url: &str, note: &Note<'_>) -> Result<(), String> {
 
 async fn send_wecom_text(url: &str, text: &str) -> Result<(), String> {
     if !wecom_bound(url) {
-        return Ok(());
+        return Err("企业微信未绑定".into());
     }
     let body = serde_json::json!({"msgtype": "text", "text": {"content": text}}).to_string();
     let url = url.to_string();
@@ -636,7 +708,7 @@ async fn bark(key: &str, note: &Note<'_>) -> Result<(), String> {
 
 async fn send_bark_text(key: &str, title: &str, body: &str) -> Result<(), String> {
     if !valid_bark_key(key) {
-        return Ok(());
+        return Err("Bark 未绑定".into());
     }
     let url = format!(
         "https://api.day.app/{}/{}/{}",
@@ -681,7 +753,7 @@ pub fn telegram_token_ok(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-fn chat_id_ok(chat_id: &str) -> bool {
+pub(crate) fn chat_id_ok(chat_id: &str) -> bool {
     let digits = chat_id.strip_prefix('-').unwrap_or(chat_id);
     (1..=20).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
 }
@@ -1359,21 +1431,24 @@ fn telegram_send_media_best_effort<F>(
             .map(|url| json!({"type": "photo", "media": url}))
             .collect::<Vec<_>>();
         let album = json!({"chat_id": chat_id, "media": media}).to_string();
-        if let Err(error) = request("sendMediaGroup", &album) {
-            tracing::warn!(
-                error = telegram_request_error_kind(&error),
-                "Telegram additional media send failed"
-            );
-            for image in images {
-                let body = json!({"chat_id": chat_id, "photo": image}).to_string();
-                match request("sendPhoto", &body) {
-                    Ok(()) => {}
-                    Err(error) => tracing::warn!(
-                        error = telegram_request_error_kind(&error),
-                        "Telegram additional media send failed"
-                    ),
+        match request("sendMediaGroup", &album) {
+            Ok(()) => {}
+            Err(TelegramRequestError::Api(_)) => {
+                for image in images {
+                    let body = json!({"chat_id": chat_id, "photo": image}).to_string();
+                    match request("sendPhoto", &body) {
+                        Ok(()) => {}
+                        Err(error) => tracing::warn!(
+                            error = telegram_request_error_kind(&error),
+                            "Telegram additional media send failed"
+                        ),
+                    }
                 }
             }
+            Err(error) => tracing::warn!(
+                error = telegram_request_error_kind(&error),
+                "Telegram additional media send failed"
+            ),
         }
     }
     for video in videos.iter().take(4) {
@@ -1462,6 +1537,7 @@ fn telegram_message_body(
 enum TelegramResponseError {
     RateLimited(u64),
     Api(String),
+    Uncertain(String),
 }
 
 fn telegram_response(status: u16, body: &str) -> Result<(), TelegramResponseError> {
@@ -1478,9 +1554,11 @@ fn telegram_response(status: u16, body: &str) -> Result<(), TelegramResponseErro
         return Err(TelegramResponseError::RateLimited(seconds));
     }
     if !(200..300).contains(&status) {
-        return Err(TelegramResponseError::Api(format!(
-            "Telegram HTTP {status}"
-        )));
+        let message = format!("Telegram HTTP {status}");
+        if (500..600).contains(&status) {
+            return Err(TelegramResponseError::Uncertain(message));
+        }
+        return Err(TelegramResponseError::Api(message));
     }
     match response.get("ok").and_then(Value::as_bool) {
         Some(true) => Ok(()),
@@ -1498,7 +1576,7 @@ pub(crate) fn parse_telegram_response(status: u16, body: &str) -> Result<(), Str
         TelegramResponseError::RateLimited(seconds) => {
             format!("Telegram HTTP 429 rate limited; retry_after={seconds}s")
         }
-        TelegramResponseError::Api(message) => message,
+        TelegramResponseError::Api(message) | TelegramResponseError::Uncertain(message) => message,
     })
 }
 
@@ -1519,6 +1597,9 @@ where
             }
             Err(TelegramResponseError::Api(message)) => {
                 return Err(TelegramRequestError::Api(message));
+            }
+            Err(TelegramResponseError::Uncertain(_)) => {
+                return Err(TelegramRequestError::Transport);
             }
         }
     }
@@ -2701,6 +2782,56 @@ mod tests {
         assert_eq!(
             methods,
             ["sendMessage", "sendMediaGroup", "sendPhoto", "sendPhoto"]
+        );
+    }
+
+    #[test]
+    fn telegram_album_transport_failure_does_not_resend_photos() {
+        let images = vec![
+            "https://cdn.example/one.jpg".to_string(),
+            "https://cdn.example/two.jpg".to_string(),
+        ];
+        let mut methods = Vec::new();
+        telegram_deliver_post_media_with(
+            "-123",
+            "html",
+            None,
+            false,
+            &images,
+            &images,
+            &[],
+            |method, _| {
+                methods.push(method.to_string());
+                if method == "sendMediaGroup" {
+                    Err(TelegramRequestError::Transport)
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap();
+        assert_eq!(methods, ["sendMessage", "sendMediaGroup"]);
+    }
+
+    #[test]
+    fn telegram_http_5xx_does_not_become_api_rejection() {
+        let err =
+            telegram_request_with(|| Ok((500, r#"{"ok":false}"#.into())), |_| {}).unwrap_err();
+        assert_eq!(err, TelegramRequestError::Transport);
+        let err =
+            telegram_request_with(|| Ok((400, r#"{"ok":false}"#.into())), |_| {}).unwrap_err();
+        assert!(matches!(err, TelegramRequestError::Api(_)));
+    }
+
+    #[tokio::test]
+    async fn unbound_wecom_and_bark_are_errors() {
+        assert_eq!(
+            send_wecom_text("", "hi").await.unwrap_err(),
+            "企业微信未绑定"
+        );
+        assert_eq!(
+            send_bark_text("", "t", "b").await.unwrap_err(),
+            "Bark 未绑定"
         );
     }
 

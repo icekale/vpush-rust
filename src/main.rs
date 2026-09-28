@@ -2824,7 +2824,6 @@ fn download_token(headers: &HeaderMap, query_token: Option<&str>) -> String {
         .to_string()
 }
 
-
 async fn feishu_asset(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -5165,7 +5164,127 @@ async fn update_me(
     Ok(Json(enrich_user(&state.db, &fresh).await.map_err(db_err)?))
 }
 
+fn validate_profile_fields(body: &MeUpdate) -> Result<(), ApiError> {
+    if let Some(value) = &body.wecom_webhook {
+        let value = value.trim();
+        if !masked_secret(value)
+            && !value.is_empty()
+            && !value.starts_with("https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=")
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "企业微信 webhook 地址无效，应为 https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=... 格式",
+            ));
+        }
+    }
+    if let Some(value) = &body.bark_key {
+        let value = value.trim();
+        if !masked_secret(value) && !value.is_empty() && !valid_bark_key(value) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Bark key 无效：应为手机 Bark App 里的推送 key（形如 AaBbCcDdEeFf...）",
+            ));
+        }
+    }
+    if let Some(value) = &body.push_channels {
+        let invalid: Vec<&str> = value
+            .split(',')
+            .map(str::trim)
+            .filter(|item| !item.is_empty())
+            .filter(|item| !matches!(*item, "telegram" | "feishu" | "wecom" | "bark" | "webpush"))
+            .collect();
+        if !invalid.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("无效的推送渠道: {}", invalid.join(", ")),
+            ));
+        }
+    }
+    for (value, label) in [(&body.dnd_start, "开始"), (&body.dnd_end, "结束")] {
+        if let Some(value) = value {
+            let value = value.trim();
+            if !value.is_empty() && !valid_clock(value) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("免打扰{label}时间需为 HH:MM 格式（00:00-23:59）"),
+                ));
+            }
+        }
+    }
+    if let Some(keywords) = &body.keywords {
+        let keywords: Vec<&str> = keywords
+            .iter()
+            .map(|item| item.trim())
+            .filter(|item| !item.is_empty())
+            .collect();
+        if keywords.len() > 20 {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "关键词最多 20 个"));
+        }
+        if let Some(too_long) = keywords.iter().find(|item| item.chars().count() > 50) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("单个关键词最长 50 字：{too_long}"),
+            ));
+        }
+    }
+    if let Some(size) = &body.news_font_size {
+        if !matches!(size.as_str(), "" | "small" | "large") {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "字号只支持空(标准)/small/large",
+            ));
+        }
+    }
+    if let Some(value) = &body.llm_api_base {
+        let value = value.trim();
+        if !(value.is_empty() || value.starts_with("https://") || value.starts_with("http://")) {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "LLM 地址须为 http(s) URL",
+            ));
+        }
+    }
+    let replacing_token = body
+        .telegram_bot_token
+        .as_ref()
+        .is_some_and(|value| !masked_secret(value.trim()));
+    if !replacing_token {
+        if let Some(value) = &body.telegram_chat_id {
+            let value = value.trim();
+            if !value.is_empty() && !crate::push::chat_id_ok(value) {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "Telegram chat id 无效",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result<(), ApiError> {
+    validate_profile_fields(body)?;
+    let replacing_token = body
+        .telegram_bot_token
+        .as_ref()
+        .is_some_and(|value| !masked_secret(value.trim()));
+    if !replacing_token {
+        if let Some(value) = &body.telegram_chat_id {
+            let value = value.trim();
+            if !value.is_empty()
+                && state
+                    .db
+                    .other_user_has("telegram_chat_id", value, user.id)
+                    .await
+                    .map_err(|err| ApiError::new(StatusCode::BAD_REQUEST, err))?
+            {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "该 Telegram 已绑定其他账号",
+                ));
+            }
+        }
+    }
     if let Some(value) = &body.telegram_bot_token {
         let value = value.trim();
         if !masked_secret(value) {
@@ -6624,12 +6743,12 @@ mod tests {
             .await
             .unwrap_or_else(|err| panic!("{}", err.detail));
         let logs = db.list_admin_logs(20).await.unwrap();
-        assert!(logs.iter().any(|log| {
-            log["user_id"] == admin.id && log["action"] == "approve_kol_request"
-        }));
-        assert!(logs.iter().any(|log| {
-            log["user_id"] == admin.id && log["action"] == "reject_kol_request"
-        }));
+        assert!(logs
+            .iter()
+            .any(|log| { log["user_id"] == admin.id && log["action"] == "approve_kol_request" }));
+        assert!(logs
+            .iter()
+            .any(|log| { log["user_id"] == admin.id && log["action"] == "reject_kol_request" }));
     }
 
     #[test]

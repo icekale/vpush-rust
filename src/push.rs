@@ -251,6 +251,7 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
                     )
                     .await;
                 }
+                Err(err) if err == "飞书未绑定" => {}
                 Err(err) => {
                     tracing::warn!(kol = kol_id, user = target.user_id, "飞书推送失败: {err}");
                     note_push_failure(db, &format!("飞书：{err}")).await;

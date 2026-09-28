@@ -2,6 +2,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde_json::{json, Value};
 use sqlx::Row;
 
 use crate::db::{Db, PushTarget};
@@ -108,6 +109,13 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
         }
     };
     let now = beijing_minutes();
+    let telegram_post = match load_telegram_latest(db, kol_id, note.url).await {
+        Ok(post) => post,
+        Err(err) => {
+            tracing::warn!(kol = kol_id, "读取 Telegram 帖子失败: {err}");
+            None
+        }
+    };
     let mut want_feishu = false;
     for target in &targets {
         if !target.notify_enabled || dnd_blocks(target, now) {
@@ -138,8 +146,15 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
             let key = crate::feishu_personal::credential_key().unwrap_or_default();
             match telegram_secret(&target.telegram_bot_token, &key) {
                 Ok(token) => {
-                    if let Err(err) =
-                        send_telegram(&token, &target.telegram_chat_id, &plain(note)).await
+                    if let Err(err) = send_telegram_post(
+                        &token,
+                        &target.telegram_chat_id,
+                        telegram_post.as_ref(),
+                        target.user_id,
+                        db,
+                        Some(note),
+                    )
+                    .await
                     {
                         tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
                         note_push_failure(db, &format!("Telegram：{err}")).await;
@@ -445,7 +460,9 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
                 let row = sqlx::query("SELECT telegram_bot_token, telegram_chat_id FROM users WHERE id = ?").bind(user_id).fetch_one(db.pool()).await.map_err(|err| err.to_string())?;
                 let key = crate::feishu_personal::credential_key().unwrap_or_default();
                 let token = telegram_secret(&row.get::<String, _>("telegram_bot_token"), &key)?;
-                send_telegram(&token, &row.get::<String, _>("telegram_chat_id"), &text).await
+                let post = load_telegram_post(db, post_id).await.map_err(|err| err.to_string())?
+                    .ok_or_else(|| "帖子不存在".to_string())?;
+                send_telegram_post(&token, &row.get::<String, _>("telegram_chat_id"), Some(&post), user_id, db, None).await
             }
             "webpush" => crate::webpush::send_text(db, user_id, &text).await,
             "feishu" => crate::feishu::send_text(db, &text).await,
@@ -652,14 +669,389 @@ fn validate_telegram_send(token: &str, chat_id: &str) -> Result<(), String> {
     }
 }
 
-fn telegram_message_body(chat_id: &str, text: &str, parse_mode: Option<&str>) -> String {
-    let mut body = serde_json::json!({
+#[derive(Debug)]
+struct TelegramPost {
+    #[allow(dead_code)]
+    id: i64,
+    platform: String,
+    kol_id: i64,
+    kol_name: String,
+    category: String,
+    title: String,
+    content: String,
+    post_type: String,
+    #[allow(dead_code)]
+    images: Value,
+    tags: Value,
+    detail: Value,
+    title_src: String,
+    content_src: String,
+    url: String,
+    published_at: String,
+}
+
+impl TelegramPost {
+    fn from_row(row: sqlx::sqlite::SqliteRow) -> Self {
+        fn parsed(raw: String) -> Value {
+            serde_json::from_str(&raw).unwrap_or(Value::Null)
+        }
+        Self {
+            id: row.get("id"),
+            platform: row.get("platform"),
+            kol_id: row.get("kol_id"),
+            kol_name: row.get("kol_name"),
+            category: row.get("category"),
+            title: row.get("title"),
+            content: row.get("content"),
+            post_type: row.get("post_type"),
+            images: parsed(row.get("images")),
+            tags: parsed(row.get("tags")),
+            detail: parsed(row.get("detail")),
+            title_src: row.get("title_src"),
+            content_src: row.get("content_src"),
+            url: row.get("url"),
+            published_at: row.get("published_at"),
+        }
+    }
+}
+
+const TELEGRAM_POST_SELECT: &str =
+    "SELECT p.id, p.platform, p.kol_id, p.title, p.content, p.post_type,
+    p.images, p.tags, p.detail, p.title_src, p.content_src, p.url, p.published_at,
+    COALESCE(k.name, '') AS kol_name, COALESCE(c.name, '') AS category
+    FROM posts p LEFT JOIN kols k ON k.id = p.kol_id
+    LEFT JOIN categories c ON c.id = k.category_id";
+
+async fn load_telegram_post(db: &Db, post_id: i64) -> Result<Option<TelegramPost>, sqlx::Error> {
+    let row = sqlx::query(&format!("{TELEGRAM_POST_SELECT} WHERE p.id = ?"))
+        .bind(post_id)
+        .fetch_optional(db.pool())
+        .await?;
+    Ok(row.map(TelegramPost::from_row))
+}
+
+async fn load_telegram_latest(
+    db: &Db,
+    kol_id: i64,
+    url: &str,
+) -> Result<Option<TelegramPost>, sqlx::Error> {
+    let row = sqlx::query(&format!(
+        "{TELEGRAM_POST_SELECT} WHERE p.kol_id = ? ORDER BY p.id DESC LIMIT 1"
+    ))
+    .bind(kol_id)
+    .fetch_optional(db.pool())
+    .await?;
+    Ok(row
+        .map(TelegramPost::from_row)
+        .filter(|post| url.is_empty() || post.url == url))
+}
+
+fn telegram_url(raw: &str) -> bool {
+    url::Url::parse(raw).ok().is_some_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some()
+            && url.username().is_empty()
+            && url.password().is_none()
+            && !raw.chars().any(|ch| ch.is_control() || ch.is_whitespace())
+    })
+}
+
+fn escape_html(raw: &str, max_chars: usize, max_html: usize) -> String {
+    let mut out = String::new();
+    for ch in raw.chars().take(max_chars) {
+        let escaped = match ch {
+            '&' => "&amp;",
+            '<' => "&lt;",
+            '>' => "&gt;",
+            '"' => "&quot;",
+            '\'' => "&#39;",
+            _ => {
+                if out.encode_utf16().count() + ch.len_utf16() > max_html {
+                    break;
+                }
+                out.push(ch);
+                continue;
+            }
+        };
+        if out.encode_utf16().count() + escaped.len() > max_html {
+            break;
+        }
+        out.push_str(escaped);
+    }
+    out
+}
+
+fn add_html(out: &mut String, fragment: &str) {
+    if out.encode_utf16().count() + fragment.encode_utf16().count() <= 4096 {
+        out.push_str(fragment);
+    }
+}
+
+fn detail_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        other => other.to_string(),
+    }
+}
+
+fn render_telegram_post(
+    post: &TelegramPost,
+    favorite: bool,
+    keyword: bool,
+) -> (String, Option<Value>) {
+    let mut html = String::new();
+    let kind = if post.platform == "combination" && post.detail.is_object() {
+        " · 调仓"
+    } else if post.post_type == "reply" {
+        " · 回复"
+    } else {
+        ""
+    };
+    let heading = format!(
+        "📌 {} · {}{kind}",
+        post.kol_name,
+        platform_label(&post.platform)
+    );
+    add_html(
+        &mut html,
+        &format!("<b>{}</b>", escape_html(&heading, 180, 900)),
+    );
+    if favorite || keyword {
+        let reason = match (favorite, keyword) {
+            (true, true) => "⭐ 特别关注 · 🔎 关键词命中",
+            (true, false) => "⭐ 特别关注",
+            _ => "🔎 关键词命中",
+        };
+        add_html(&mut html, &format!("\n<i>{reason}</i>"));
+    }
+    if post.platform != "combination"
+        && ((!post.content_src.is_empty() && post.content_src != post.content)
+            || (!post.title_src.is_empty() && post.title_src != post.title))
+    {
+        add_html(&mut html, "\n<i>翻译自英语</i>");
+    }
+    if post.platform != "combination" || !post.detail.is_object() {
+        let body = if !post.content.is_empty() {
+            &post.content
+        } else if !post.title.is_empty() {
+            &post.title
+        } else {
+            "（无正文）"
+        };
+        let body = escape_html(body, 2000, 2600);
+        if post.post_type == "reply" {
+            add_html(&mut html, &format!("\n\n<blockquote>{body}</blockquote>"));
+        } else {
+            add_html(&mut html, &format!("\n\n{body}"));
+        }
+    }
+    if post.platform == "combination" && post.detail.is_object() {
+        if let Some(stats) = post.detail["stats"].as_array() {
+            let labels: Vec<String> = stats
+                .iter()
+                .filter_map(|pair| {
+                    let pair = pair.as_array()?;
+                    Some(format!(
+                        "{} {}",
+                        detail_text(pair.first()?),
+                        detail_text(pair.get(1)?)
+                    ))
+                })
+                .collect();
+            if !labels.is_empty() {
+                add_html(
+                    &mut html,
+                    &format!("\n{}", escape_html(&labels.join(" · "), 350, 600)),
+                );
+            }
+        }
+        if let Some(actions) = post.detail["actions"].as_array() {
+            for action in actions.iter().take(12) {
+                if !action.is_object() {
+                    continue;
+                }
+                let kind = action["type"].as_str().unwrap_or("调整");
+                let mark = match kind {
+                    "清仓" => "🗑",
+                    "新建" => "🆕",
+                    "增持" => "➕",
+                    "减持" => "➖",
+                    _ => "•",
+                };
+                let stock = action["stock"].as_str().unwrap_or("");
+                let symbol = action["symbol"].as_str().unwrap_or("");
+                let name = if symbol.is_empty() {
+                    stock.to_string()
+                } else {
+                    format!("{stock}（{symbol}）")
+                };
+                let prev = action["prev"].as_str().unwrap_or("0.0%");
+                let target = action["target"].as_str().unwrap_or("0.0%");
+                let line = format!("\n{mark} {kind}　{name}\n{prev} → {target}");
+                add_html(&mut html, &escape_html(&line, 300, 500));
+                if !action["price"].is_null() {
+                    add_html(
+                        &mut html,
+                        &format!(
+                            "\n成交价 {}",
+                            escape_html(&detail_text(&action["price"]), 40, 120)
+                        ),
+                    );
+                }
+            }
+        }
+        if let Some(holdings) = post.detail["holdings"].as_array() {
+            let mut printed = false;
+            for holding in holdings.iter().take(15) {
+                let Some(name) = holding["name"].as_str().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                if holding["weight"].is_null() {
+                    continue;
+                }
+                if !printed {
+                    add_html(&mut html, "\n现有持仓");
+                    printed = true;
+                }
+                let symbol = holding["symbol"].as_str().unwrap_or("");
+                let line = format!("\n{name}（{symbol}） {}%", detail_text(&holding["weight"]));
+                add_html(&mut html, &escape_html(&line, 200, 350));
+            }
+        }
+        let cash = detail_text(&post.detail["cash"]);
+        if !cash.is_empty() {
+            add_html(
+                &mut html,
+                &format!("\n💵 现金 {}", escape_html(&cash, 40, 100)),
+            );
+        }
+    } else {
+        let mut meta = Vec::new();
+        if !post.category.is_empty() {
+            meta.push(format!("🗂 {}", post.category));
+        }
+        if let Some(tags) = post.tags.as_array() {
+            meta.extend(
+                tags.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .take(12)
+                    .map(str::to_string),
+            );
+        }
+        if !meta.is_empty() {
+            add_html(
+                &mut html,
+                &format!("\n{}", escape_html(&meta.join(" · "), 350, 650)),
+            );
+        }
+    }
+    if !post.published_at.is_empty() {
+        add_html(
+            &mut html,
+            &format!("\n🕐 {}", escape_html(&post.published_at, 80, 150)),
+        );
+    }
+    if let Some(files) = post.detail["files"].as_array() {
+        let mut linked = false;
+        for file in files.iter().take(10) {
+            let Some(url) = file["url"]
+                .as_str()
+                .filter(|url| url.chars().count() <= 1000 && telegram_url(url))
+            else {
+                continue;
+            };
+            let name = file["name"]
+                .as_str()
+                .filter(|name| !name.is_empty())
+                .unwrap_or("附件");
+            let escaped_url = escape_html(url, 1000, usize::MAX);
+            if escaped_url.encode_utf16().count() > 1500 {
+                continue;
+            }
+            let fragment = format!(
+                "\n📎 <a href=\"{}\">{}</a>",
+                escaped_url,
+                escape_html(name, 100, 200)
+            );
+            if html.encode_utf16().count() + fragment.encode_utf16().count() <= 4096 {
+                add_html(&mut html, &fragment);
+                linked = true;
+            }
+        }
+        if linked {
+            add_html(&mut html, "\n附件链接可能过期");
+        }
+    }
+    let keyboard = telegram_url(&post.url)
+        .then(|| json!({"inline_keyboard": [[{"text": "🔗 查看原文", "url": post.url}]]}));
+    (html, keyboard)
+}
+
+async fn telegram_reasons(
+    db: &Db,
+    post: &TelegramPost,
+    user_id: i64,
+) -> Result<(bool, bool), sqlx::Error> {
+    let row = sqlx::query("SELECT COALESCE(s.favorite, 0) AS favorite, COALESCE(u.keywords, '[]') AS keywords FROM users u LEFT JOIN subscriptions s ON s.user_id = u.id AND s.kol_id = ? WHERE u.id = ?")
+        .bind(post.kol_id).bind(user_id).fetch_optional(db.pool()).await?;
+    let favorite = row
+        .as_ref()
+        .is_some_and(|row| row.get::<i64, _>("favorite") != 0);
+    let keywords: Vec<String> = row
+        .as_ref()
+        .and_then(|row| serde_json::from_str(&row.get::<String, _>("keywords")).ok())
+        .unwrap_or_default();
+    let searchable = format!("{} {}", post.title, post.content).to_lowercase();
+    let keyword = keywords
+        .iter()
+        .any(|word| !word.trim().is_empty() && searchable.contains(&word.trim().to_lowercase()));
+    Ok((favorite, keyword))
+}
+
+async fn send_telegram_post(
+    token: &str,
+    chat_id: &str,
+    post: Option<&TelegramPost>,
+    user_id: i64,
+    db: &Db,
+    fallback: Option<&Note<'_>>,
+) -> Result<(), String> {
+    let Some(post) = post else {
+        return match fallback {
+            Some(note) => send_telegram(token, chat_id, &plain(note)).await,
+            None => Err("帖子不存在".into()),
+        };
+    };
+    let (favorite, keyword) = telegram_reasons(db, post, user_id)
+        .await
+        .map_err(|err| err.to_string())?;
+    let (html, markup) = render_telegram_post(post, favorite, keyword);
+    validate_telegram_send(token, chat_id)?;
+    let body = telegram_message_body(chat_id, &html, Some("HTML"), markup);
+    let token = token.to_string();
+    tokio::task::spawn_blocking(move || telegram_post(&token, &body))
+        .await
+        .map_err(|_| "Telegram network error".to_string())?
+}
+
+fn telegram_message_body(
+    chat_id: &str,
+    text: &str,
+    parse_mode: Option<&str>,
+    reply_markup: Option<Value>,
+) -> String {
+    let mut body = json!({
         "chat_id": chat_id,
-        "text": truncate(text, 4000),
+        "text": if parse_mode == Some("HTML") { text.to_string() } else { truncate(text, 4000) },
         "disable_web_page_preview": true,
     });
     if parse_mode == Some("HTML") {
-        body["parse_mode"] = serde_json::json!("HTML");
+        body["parse_mode"] = json!("HTML");
+    }
+    if let Some(markup) = reply_markup {
+        body["reply_markup"] = markup;
     }
     body.to_string()
 }
@@ -715,7 +1107,7 @@ fn telegram_post(token: &str, body: &str) -> Result<(), String> {
 
 async fn send_telegram(token: &str, chat_id: &str, text: &str) -> Result<(), String> {
     validate_telegram_send(token, chat_id)?;
-    let body = telegram_message_body(chat_id, text, None);
+    let body = telegram_message_body(chat_id, text, None, None);
     let token = token.to_string();
     tokio::task::spawn_blocking(move || telegram_post(&token, &body))
         .await
@@ -855,6 +1247,145 @@ mod tests {
         }
     }
 
+    fn telegram_fixture(platform: &str) -> TelegramPost {
+        TelegramPost {
+            id: 1,
+            kol_id: 2,
+            platform: platform.into(),
+            kol_name: "甲<&".into(),
+            category: "投资<观察>".into(),
+            title: "原标题".into(),
+            content: "你好<&> \"世界\"".into(),
+            post_type: "reply".into(),
+            images: json!(["https://example.test/image.jpg"]),
+            tags: json!(["A&B", "中文"]),
+            detail: json!({"files": [{"name": "财报<&>", "url": "https://example.test/a?x=1&y=2"}]}),
+            title_src: "Original".into(),
+            content_src: "Hello".into(),
+            url: "https://example.test/post".into(),
+            published_at: "2026-09-28 12:00".into(),
+        }
+    }
+
+    #[test]
+    fn telegram_reply_golden_html_and_keyboard() {
+        let (html, keyboard) = render_telegram_post(&telegram_fixture("xueqiu"), true, true);
+        assert_eq!(
+            html,
+            concat!(
+            "<b>📌 甲&lt;&amp; · 雪球 · 回复</b>\n<i>⭐ 特别关注 · 🔎 关键词命中</i>",
+            "\n<i>翻译自英语</i>\n\n<blockquote>你好&lt;&amp;&gt; &quot;世界&quot;</blockquote>",
+            "\n🗂 投资&lt;观察&gt; · A&amp;B · 中文\n🕐 2026-09-28 12:00",
+            "\n📎 <a href=\"https://example.test/a?x=1&amp;y=2\">财报&lt;&amp;&gt;</a>",
+            "\n附件链接可能过期"
+        )
+        );
+        assert_eq!(
+            keyboard,
+            Some(
+                json!({"inline_keyboard": [[{"text": "🔗 查看原文", "url": "https://example.test/post"}]]})
+            )
+        );
+        let payload: Value =
+            serde_json::from_str(&telegram_message_body("-12", &html, Some("HTML"), keyboard))
+                .unwrap();
+        assert_eq!(payload["parse_mode"], "HTML");
+        assert_eq!(payload["text"], html);
+        assert_eq!(
+            payload["reply_markup"]["inline_keyboard"][0][0]["url"],
+            "https://example.test/post"
+        );
+    }
+
+    #[test]
+    fn telegram_combination_golden_html() {
+        let mut post = telegram_fixture("combination");
+        post.post_type = "post".into();
+        post.detail = json!({
+            "stats": [["今日", "+1.2%"], ["净值", "1.031"]],
+            "actions": [{"type": "增持", "stock": "甲<&", "symbol": "SH1", "prev": "1%", "target": "2%", "price": "10<&"}],
+            "holdings": [{"name": "乙", "symbol": "SZ2", "weight": 12.5}], "cash": "20%"
+        });
+        let (html, _) = render_telegram_post(&post, false, false);
+        assert_eq!(
+            html,
+            concat!(
+                "<b>📌 甲&lt;&amp; · 雪球组合 · 调仓</b>",
+                "\n今日 +1.2% · 净值 1.031\n➕ 增持　甲&lt;&amp;（SH1）\n1% → 2%",
+                "\n成交价 10&lt;&amp;\n现有持仓\n乙（SZ2） 12.5%",
+                "\n💵 现金 20%\n🕐 2026-09-28 12:00"
+            )
+        );
+    }
+
+    #[test]
+    fn telegram_invalid_urls_and_long_html_are_safe() {
+        let mut post = telegram_fixture("twitter");
+        post.url = "https://valid.test@evil.test/post".into();
+        post.detail = json!({"files": [{"name": "unsafe", "url": "javascript:alert(1)"}]});
+        post.content = "<&".repeat(5000);
+        let (html, keyboard) = render_telegram_post(&post, false, false);
+        assert!(keyboard.is_none());
+        assert!(!html.contains("unsafe"));
+        assert!(html.chars().count() <= 4096);
+        assert!(html.encode_utf16().count() <= 4096);
+        assert!(!html.contains("<&"));
+        assert!(!html.ends_with("&am"));
+        assert!(html.contains("🕐 2026-09-28"));
+    }
+
+    #[tokio::test]
+    async fn telegram_initial_and_retry_load_the_same_persisted_post() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-tg-render-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let kol = db
+            .add_kol("xueqiu", "甲<&", "fixture", None, false, false, false)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO users (username, password_hash, keywords) VALUES ('reader', 'x', '[\"你好\"]')").execute(db.pool()).await.unwrap();
+        let user: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = 'reader'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO subscriptions (user_id, kol_id, favorite) VALUES (?, ?, 1)")
+            .bind(user)
+            .bind(kol)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, title, content, post_type, images, tags, detail, title_src, content_src, url, published_at) VALUES ('xueqiu', ?, 'fixture', '原标题', '你好<&>', 'reply', '[\"https://example.test/a.jpg\"]', '[\"中文\"]', '{\"files\":[]}', 'Original', 'Hello', 'https://example.test/post', '2026-09-28')")
+            .bind(kol).execute(db.pool()).await.unwrap();
+        let initial = load_telegram_latest(&db, kol, "https://example.test/post")
+            .await
+            .unwrap()
+            .unwrap();
+        let retry = load_telegram_post(&db, initial.id).await.unwrap().unwrap();
+        let reasons = telegram_reasons(&db, &initial, user).await.unwrap();
+        assert_eq!(reasons, (true, true));
+        assert_eq!(
+            render_telegram_post(&initial, reasons.0, reasons.1),
+            render_telegram_post(&retry, reasons.0, reasons.1)
+        );
+        assert!(load_telegram_latest(&db, kol, "https://example.test/wrong")
+            .await
+            .unwrap()
+            .is_none());
+        sqlx::query("DELETE FROM posts WHERE id = ?")
+            .bind(initial.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(load_telegram_post(&db, initial.id).await.unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn telegram_secret_requires_migration_for_legacy_ciphertext() {
         let key = base64::engine::general_purpose::URL_SAFE.encode([3u8; 32]);
@@ -934,15 +1465,24 @@ mod tests {
 
     #[test]
     fn telegram_message_payload_is_plain_by_default_and_truncated_safely() {
-        let body: serde_json::Value =
-            serde_json::from_str(&telegram_message_body("-123", &"字".repeat(5000), None)).unwrap();
+        let body: serde_json::Value = serde_json::from_str(&telegram_message_body(
+            "-123",
+            &"字".repeat(5000),
+            None,
+            None,
+        ))
+        .unwrap();
         assert_eq!(body["chat_id"], "-123");
         assert!(body.get("parse_mode").is_none());
         assert!(body["text"].as_str().unwrap().chars().count() <= 4000);
 
-        let html: serde_json::Value =
-            serde_json::from_str(&telegram_message_body("-123", "<b>text</b>", Some("HTML")))
-                .unwrap();
+        let html: serde_json::Value = serde_json::from_str(&telegram_message_body(
+            "-123",
+            "<b>text</b>",
+            Some("HTML"),
+            None,
+        ))
+        .unwrap();
         assert_eq!(html["parse_mode"], "HTML");
     }
 

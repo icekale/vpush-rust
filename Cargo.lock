@@ -2589,6 +2589,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "ureq",
+ "url",
  "wreq",
  "wreq-util",
 ]

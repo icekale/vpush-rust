@@ -156,18 +156,22 @@ export function createNewsView(dependencies) {
 
   function newsListItemHtml(item) {
     const unread = !item.is_read;
+    // 先不放可见占位：灰底空框会在图片还没回来、或只是一张透明占位图时一直留着。
     const thumbnail = item.has_image
-      ? `<img class="news-list-thumb" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 3 2'%3E%3C/svg%3E" data-news-thumbnail="${item.id}" alt="" width="112" height="75" loading="lazy" onerror="this.closest('.news-list-thumb-link').style.display='none'">`
+      ? `<img class="news-list-thumb is-pending" data-news-thumbnail="${item.id}" alt="" width="112" height="75" decoding="async">`
       : "";
     const activeTopic = state.newsTopic || "";
     const topicNames = (Array.isArray(item.topics) ? item.topics : []).filter((topic) => topic && topic !== item.source_name);
     const topics = topicNames.length
       ? `<span class="news-item-topics">${topicNames.map((topic) => NEWS_TOPICS.includes(topic) ? `<button type="button" class="news-item-topic${topic === activeTopic ? " is-on" : ""}" aria-pressed="${topic === activeTopic ? "true" : "false"}" onclick="selectNewsTopic('${topic}')">${escapeHtml(topic)}</button>` : `<i>${escapeHtml(topic)}</i>`).join("")}</span>`
       : "";
+    const dot = unread
+      ? '<i class="news-item-unread-dot" aria-label="未读"></i>'
+      : '<i class="news-item-unread-dot is-off" aria-hidden="true"></i>';
     return `<article class="news-list-item ${unread ? "is-unread" : "is-read"}" data-news-id="${item.id}">
     <div class="news-list-copy">
       <a class="news-item-open" href="/news/${item.id}">
-        <div class="news-item-title-row">${unread ? '<i class="news-item-unread-dot" aria-label="未读"></i>' : ""}<h3>${escapeHtml(item.title)}</h3></div>
+        <div class="news-item-title-row">${dot}<h3>${escapeHtml(item.title)}</h3></div>
         <p>${escapeHtml(item.summary || "暂无摘要")}</p>
       </a>
       <div class="news-list-meta"><span class="news-item-source">${newsPlatformMark(item.source_platform)}<span class="news-item-source-name">${escapeHtml(channelName(item.source_name))}</span></span><time datetime="${escapeHtml(item.published_at || "")}">${escapeHtml(fmtPublished(item.published_at, true))}</time>${topics}${unread ? `<button type="button" class="news-mark-read" onclick="markNewsItemRead(${item.id})" aria-label="标为已读">${CHECK_ICON}</button>` : ""}</div>
@@ -292,7 +296,9 @@ export function createNewsView(dependencies) {
 
   function newsFilterSummaryHtml() {
     const parts = newsActiveFilterParts();
-    const body = parts.length ? `<span>${parts.map((part) => escapeHtml(part)).join(" · ")}</span><button type="button" class="btn-ghost" onclick="clearNewsFilters()">清除</button>` : "";
+    const body = parts.length
+      ? `<span class="news-filter-chips">${parts.map((part) => `<b>${escapeHtml(part)}</b>`).join("")}</span><button type="button" class="btn-ghost news-filter-clear" onclick="clearNewsFilters()">清除</button>`
+      : "";
     return `<div id="news-filter-summary" class="news-filter-summary"${parts.length ? "" : " hidden"}>${body}</div>`;
   }
 
@@ -367,7 +373,9 @@ export function createNewsView(dependencies) {
   function attachListImages(seq) {
     for (const item of state.newsItems) {
       const image = document.querySelector(`[data-news-thumbnail="${item.id}"]`);
-      if (image) loadNewsImageBlob(item.id, 0, image, seq);
+      if (!image || image.dataset.newsThumbState) continue;
+      image.dataset.newsThumbState = "loading";
+      loadNewsListThumb(item.id, image, seq);
     }
   }
 
@@ -498,6 +506,75 @@ export function createNewsView(dependencies) {
       }
       list.innerHTML = emptyState("加载失败: " + err.message, `<div><button type="button" class="btn-ghost" onclick="loadFinancialNews(${reset})">重试</button></div>`);
     }
+  }
+
+  // 列表缩略图不走正文那条直接铺图的路径：第一张经常是追踪像素或加载失败，
+  // 铺上去就是一块灰框。太小、解码失败、接口报错或超时都丢掉，再试后面几张。
+  const NEWS_THUMB_MIN_PX = 48;
+  const NEWS_THUMB_ATTEMPTS = 3;
+
+  function dropNewsThumb(image) {
+    const link = image.closest(".news-list-thumb-link");
+    if (link) link.remove();
+    else image.remove();
+  }
+
+  function newsThumbBlob(articleId, index) {
+    const request = apiBlob(`/api/news/${articleId}/images/${index}`);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("图片加载超时")), 8000);
+      request.then((blob) => {
+        clearTimeout(timer);
+        resolve(blob);
+      }, (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+    });
+  }
+
+  async function loadNewsListThumb(articleId, image, seq = currentRouteSeq()) {
+    for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
+      if (!routeStillActive(seq) || !image.isConnected) return;
+      const key = newsImageUrlKey(articleId, index);
+      let url = state.newsImageUrls.get(key) || "";
+      let created = false;
+      if (!url) {
+        let blob;
+        try {
+          blob = await newsThumbBlob(articleId, index);
+        } catch (err) {
+          if (!routeStillActive(seq) || !image.isConnected) return;
+          // 超时不再连打。某一格不存在（空字符串或越界）仍试后面几张。
+          if (/超时/.test(String(err && err.message || ""))) break;
+          continue;
+        }
+        if (!routeStillActive(seq) || !image.isConnected) return;
+        url = URL.createObjectURL(blob);
+        created = true;
+      }
+      image.src = url;
+      let usable = false;
+      try {
+        if (typeof image.decode === "function") await image.decode();
+        usable = image.naturalWidth >= NEWS_THUMB_MIN_PX && image.naturalHeight >= NEWS_THUMB_MIN_PX;
+      } catch {
+        usable = false;
+      }
+      if (!routeStillActive(seq) || !image.isConnected) {
+        if (created) URL.revokeObjectURL(url);
+        return;
+      }
+      if (usable) {
+        state.newsImageUrls.set(key, url);
+        image.classList.remove("is-pending");
+        image.dataset.newsThumbState = "ready";
+        return;
+      }
+      image.removeAttribute("src");
+      if (created) URL.revokeObjectURL(url);
+    }
+    if (routeStillActive(seq) && image.isConnected) dropNewsThumb(image);
   }
 
   async function loadNewsImageBlob(articleId, index, image, seq = currentRouteSeq()) {
@@ -639,7 +716,12 @@ export function createNewsView(dependencies) {
     }
     card.classList.remove("is-unread");
     card.classList.add("is-read");
-    card.querySelector(".news-item-unread-dot")?.remove();
+    const dot = card.querySelector(".news-item-unread-dot");
+    if (dot) {
+      dot.classList.add("is-off");
+      dot.removeAttribute("aria-label");
+      dot.setAttribute("aria-hidden", "true");
+    }
     card.querySelector(".news-mark-read")?.remove();
     return true;
   }

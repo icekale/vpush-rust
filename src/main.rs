@@ -224,7 +224,7 @@ async fn main() {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "vpush=info".into()),
+                .unwrap_or_else(|_| "vpush=info,sqlx::query=warn".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .with(syslogs::layer())

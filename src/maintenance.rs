@@ -1,16 +1,54 @@
-//! 不访问外网就能完成的维护：新资讯源回填、未激活清理、过期数据、到点备份。
+//! 后台维护，分四条互不等待的循环，每轮结束后歇 60 秒：
+//! 告警与重试、LLM 批处理、清理与备份、日报与提醒。
+//! 每步单独计时、单独记错，一步失败不影响同轮后面的步骤。
+
+use std::future::Future;
+use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use crate::db::Db;
 
+const ROUND_GAP: Duration = Duration::from_secs(60);
+const SLOW_STEP: Duration = Duration::from_secs(1);
+/// 单个 LLM 批处理步骤的时间预算。到点后不再开始新条目，剩下的留给下一轮。
+const LLM_STEP_BUDGET: Duration = Duration::from_secs(600);
+
+type Round = for<'a> fn(&'a Db) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
 pub fn spawn(db: Db) {
+    every_round(db.clone(), |db| Box::pin(alerts_and_retries(db)));
+    every_round(db.clone(), |db| Box::pin(llm_batches(db)));
+    every_round(db.clone(), |db| Box::pin(cleanup_and_backup(db)));
+    every_round(db, |db| Box::pin(daily_reports(db)));
+}
+
+fn every_round(db: Db, round: Round) {
     tokio::spawn(async move {
         loop {
-            if let Err(err) = run(&db).await {
-                tracing::warn!("维护任务失败: {err}");
-            }
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            round(&db).await;
+            tokio::time::sleep(ROUND_GAP).await;
         }
     });
+}
+
+async fn timed<T>(group: &str, step: &str, work: impl Future<Output = T>) -> T {
+    let started = Instant::now();
+    let out = work.await;
+    let elapsed = started.elapsed();
+    let ms = elapsed.as_millis() as u64;
+    if elapsed >= SLOW_STEP {
+        tracing::info!(ms, "维护步骤耗时 {group}/{step}");
+    } else {
+        tracing::debug!(ms, "维护步骤耗时 {group}/{step}");
+    }
+    out
+}
+
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 async fn with_model(db: &Db, mut cfg: crate::llm::Config, key: &str) -> crate::llm::Config {
@@ -220,140 +258,128 @@ async fn stock_alias_if_due(db: &Db) {
     let _ = db.set_setting("stock_alias_last_date", &today).await;
 }
 
-pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
-    let added = db.backfill_new_news_sources().await?;
-    if added > 0 {
-        tracing::info!(added, "已为全部用户勾选新资讯源");
-    }
-    let removed = db.purge_inactive_if_due().await?;
-    if removed > 0 {
-        tracing::info!(removed, "清理未激活用户");
-    }
-    let (posts, news, logs, admin) = db.prune_retention_if_due().await?;
-    if posts + news + logs + admin > 0 {
-        tracing::info!(posts, news, logs, admin, "清理过期数据");
-    }
-    match db.health_alerts().await {
-        Ok(alerts) => {
-            for message in alerts {
-                tracing::warn!("{message}");
-            }
-        }
-        Err(err) => tracing::warn!("健康检查失败: {err}"),
-    }
-    match db.take_daily_reports().await {
-        Ok(reports) => {
-            for (user_id, text) in reports {
-                if let Err(err) = crate::push::send_user_text(db, user_id, &text).await {
-                    tracing::warn!(user_id, "每日精选发送失败: {err}");
+async fn alerts_and_retries(db: &Db) {
+    const GROUP: &str = "告警与重试";
+    timed(GROUP, "健康检查", async {
+        match db.health_alerts().await {
+            Ok(alerts) => {
+                for message in alerts {
+                    tracing::warn!("{message}");
                 }
             }
+            Err(err) => tracing::warn!("健康检查失败: {err}"),
         }
-        Err(err) => tracing::warn!("每日精选失败: {err}"),
-    }
-    match db.pending_keyword_digests().await {
-        Ok(digests) => {
-            for digest in digests {
-                match crate::push::send_user_text(db, digest.user_id, &digest.text).await {
-                    Ok(()) => {
-                        if let Err(err) = db.mark_keyword_digest(&digest).await {
-                            tracing::warn!(
-                                user_id = digest.user_id,
-                                "关键词提醒已发出但未能标记: {err}"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        tracing::warn!(user_id = digest.user_id, "关键词提醒发送失败: {err}")
-                    }
-                }
-            }
+    })
+    .await;
+    timed(GROUP, "cookie 保活", async {
+        if let Err(err) = cookie_keepalive(db, unix_now()).await {
+            tracing::warn!("cookie 保活失败: {err}");
         }
-        Err(err) => tracing::warn!("关键词提醒失败: {err}"),
-    }
-    stock_alias_if_due(db).await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if let Err(err) = cookie_keepalive(db, now).await {
-        tracing::warn!("cookie 保活失败: {err}");
-    }
-    if let Some(cfg) = crate::imgbed::runtime(db).await {
-        match crate::imgbed::process_due(
-            db,
-            cfg.retention_days,
-            crate::imgbed::live_download,
-            |url, bytes, kind| crate::imgbed::live_upload(&cfg, url, bytes, kind),
-            |url| crate::imgbed::live_delete(&cfg, url),
-        )
-        .await
-        {
-            Ok(done) if done > 0 => tracing::info!(done, "图床镜像"),
-            Err(err) => tracing::warn!("图床镜像失败: {err}"),
-            _ => {}
-        }
-    }
-    if db
-        .setting("config_translate_twitter_content")
-        .await
-        .ok()
-        .flatten()
-        .as_deref()
-        == Some("1")
-    {
-        let exit = crate::proxy_admin::acquire(db, "twitter")
-            .await
-            .ok()
-            .flatten();
-        let proxy = exit.as_ref().map(|item| item.url.clone());
-        for platform in ["truth", "twitter"] {
-            // ponytail: 20/min while the one-day backlog drains; 3 was the steady Python pace
-            match crate::truth::backfill(db, platform, 20, |text| {
-                let db = db.clone();
-                let proxy = proxy.clone();
-                async move { crate::translate::text(&db, &text, None, proxy.as_deref()).await }
-            })
-            .await
-            {
-                Ok(done) if done > 0 => tracing::info!(done, platform, "翻译回填"),
-                Err(err) => tracing::warn!(platform, "翻译回填失败: {err}"),
-                _ => {}
-            }
-        }
-    }
-    simplify_due(db).await;
-    if let Some(cfg) = admin_llm(db).await {
-        let extract_cfg = with_model(db, cfg.clone(), "report_extract_model").await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        match crate::reports::extract_due(db, now, crate::reports::read_text, |title, text| {
-            let cfg = extract_cfg.clone();
+    })
+    .await;
+    let now = unix_now();
+    timed(GROUP, "雪球探测", async {
+        if let Err(err) = crate::alerts::probe_xueqiu(db, now, |cookie, uid| {
+            let cookie = cookie.to_string();
+            let uid = uid.to_string();
             async move {
-                crate::llm::complete(
-                    &cfg,
-                    &format!(
-                        "{}\n标题：{title}\n正文：{text}",
-                        crate::reports::EXTRACT_PROMPT
-                    ),
-                )
+                let probe = tokio::task::spawn_blocking(move || {
+                    crate::xueqiu::probe_keepalive(&cookie, &uid)
+                })
                 .await
+                .unwrap_or(crate::xueqiu::Keepalive::Transient);
+                match probe {
+                    crate::xueqiu::Keepalive::Alive => crate::alerts::Probe::Alive,
+                    crate::xueqiu::Keepalive::Dead(_) => crate::alerts::Probe::Dead,
+                    crate::xueqiu::Keepalive::Transient => {
+                        crate::alerts::Probe::Error("探测失败".into())
+                    }
+                }
             }
         })
+        .await
+        {
+            tracing::warn!("雪球探测失败: {err}");
+        }
+    })
+    .await;
+    timed(GROUP, "中金检查", async {
+        let status = match crate::cicc::from_env() {
+            Some(ctl) => ctl.status_async().await,
+            None => serde_json::json!({}),
+        };
+        if let Err(err) = crate::alerts::check_cicc(db, now, &status, |message| async move {
+            crate::alerts::notify_admins(db, &message).await
+        })
+        .await
+        {
+            tracing::warn!("中金告警失败: {err}");
+        }
+    })
+    .await;
+    timed(GROUP, "数据源健康", async {
+        if let Err(err) = crate::alerts::source_health(db, now, |message| async move {
+            crate::alerts::notify_admins(db, &message).await
+        })
+        .await
+        {
+            tracing::warn!("数据源健康告警失败: {err}");
+        }
+    })
+    .await;
+    timed(GROUP, "推送重试", async {
+        if let Err(err) = crate::push::retry_due_live(db, now).await {
+            tracing::warn!("推送重试失败: {err}");
+        }
+    })
+    .await;
+}
+
+async fn llm_batches(db: &Db) {
+    const GROUP: &str = "LLM";
+    timed(GROUP, "股票别名", stock_alias_if_due(db)).await;
+    timed(GROUP, "翻译回填", translate_backfill(db)).await;
+    timed(GROUP, "繁简转换", simplify_due(db)).await;
+    let Some(cfg) = admin_llm(db).await else {
+        return;
+    };
+    let extract_cfg = with_model(db, cfg.clone(), "report_extract_model").await;
+    timed(GROUP, "研报抽取", async {
+        let deadline = Instant::now() + LLM_STEP_BUDGET;
+        match crate::reports::extract_due(
+            db,
+            unix_now(),
+            deadline,
+            crate::reports::read_text,
+            |title, text| {
+                let cfg = extract_cfg.clone();
+                async move {
+                    crate::llm::complete(
+                        &cfg,
+                        &format!(
+                            "{}\n标题：{title}\n正文：{text}",
+                            crate::reports::EXTRACT_PROMPT
+                        ),
+                    )
+                    .await
+                }
+            },
+        )
         .await
         {
             Ok(done) if done > 0 => tracing::info!(done, "研报抽取"),
             Err(err) => tracing::warn!("研报抽取失败: {err}"),
             _ => {}
         }
-        let digest_cfg = with_model(db, cfg, "ima_digest_model").await;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        match crate::reports::digest_due(db, now, |prompt| {
+        if Instant::now() >= deadline {
+            tracing::info!("研报抽取达到时间预算，剩余留到下一轮");
+        }
+    })
+    .await;
+    let digest_cfg = with_model(db, cfg, "ima_digest_model").await;
+    timed(GROUP, "个股综述", async {
+        let deadline = Instant::now() + LLM_STEP_BUDGET;
+        match crate::reports::digest_due(db, unix_now(), deadline, |prompt| {
             let cfg = digest_cfg.clone();
             async move { crate::llm::complete(&cfg, &prompt).await }
         })
@@ -363,14 +389,147 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
             Err(err) => tracing::warn!("个股综述失败: {err}"),
             _ => {}
         }
+        if Instant::now() >= deadline {
+            tracing::info!("个股综述达到时间预算，剩余留到下一轮");
+        }
+    })
+    .await;
+}
+
+async fn translate_backfill(db: &Db) {
+    if db
+        .setting("config_translate_twitter_content")
+        .await
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("1")
+    {
+        return;
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0);
-    if let Err(err) = crate::proxy_admin::refresh_due(db, now, crate::proxy_admin::live_get).await {
-        tracing::warn!("代理池刷新失败: {err}");
+    let exit = crate::proxy_admin::acquire(db, "twitter")
+        .await
+        .ok()
+        .flatten();
+    let proxy = exit.as_ref().map(|item| item.url.clone());
+    for platform in ["truth", "twitter"] {
+        let deadline = Instant::now() + LLM_STEP_BUDGET;
+        // ponytail: 20/min while the one-day backlog drains; 3 was the steady Python pace
+        match crate::truth::backfill(db, platform, 20, deadline, |text| {
+            let db = db.clone();
+            let proxy = proxy.clone();
+            async move { crate::translate::text(&db, &text, None, proxy.as_deref()).await }
+        })
+        .await
+        {
+            Ok(done) if done > 0 => tracing::info!(done, platform, "翻译回填"),
+            Err(err) => tracing::warn!(platform, "翻译回填失败: {err}"),
+            _ => {}
+        }
+        if Instant::now() >= deadline {
+            tracing::info!(platform, "翻译回填达到时间预算，剩余留到下一轮");
+        }
     }
+}
+
+async fn cleanup_and_backup(db: &Db) {
+    const GROUP: &str = "清理与备份";
+    timed(GROUP, "新资讯源回填", async {
+        match db.backfill_new_news_sources().await {
+            Ok(added) if added > 0 => tracing::info!(added, "已为全部用户勾选新资讯源"),
+            Err(err) => tracing::warn!("新资讯源回填失败: {err}"),
+            _ => {}
+        }
+    })
+    .await;
+    timed(GROUP, "未激活清理", async {
+        match db.purge_inactive_if_due().await {
+            Ok(removed) if removed > 0 => tracing::info!(removed, "清理未激活用户"),
+            Err(err) => tracing::warn!("清理未激活用户失败: {err}"),
+            _ => {}
+        }
+    })
+    .await;
+    timed(GROUP, "过期数据清理", async {
+        match db.prune_retention_if_due().await {
+            Ok((posts, news, logs, admin)) if posts + news + logs + admin > 0 => {
+                tracing::info!(posts, news, logs, admin, "清理过期数据")
+            }
+            Err(err) => tracing::warn!("清理过期数据失败: {err}"),
+            _ => {}
+        }
+    })
+    .await;
+    timed(GROUP, "图床镜像", async {
+        if let Some(cfg) = crate::imgbed::runtime(db).await {
+            match crate::imgbed::process_due(
+                db,
+                cfg.retention_days,
+                crate::imgbed::live_download,
+                |url, bytes, kind| crate::imgbed::live_upload(&cfg, url, bytes, kind),
+                |url| crate::imgbed::live_delete(&cfg, url),
+            )
+            .await
+            {
+                Ok(done) if done > 0 => tracing::info!(done, "图床镜像"),
+                Err(err) => tracing::warn!("图床镜像失败: {err}"),
+                _ => {}
+            }
+        }
+    })
+    .await;
+    timed(GROUP, "代理池刷新", async {
+        if let Err(err) =
+            crate::proxy_admin::refresh_due(db, unix_now(), crate::proxy_admin::live_get).await
+        {
+            tracing::warn!("代理池刷新失败: {err}");
+        }
+    })
+    .await;
+    timed(GROUP, "定时备份", scheduled_backup(db)).await;
+}
+
+async fn daily_reports(db: &Db) {
+    const GROUP: &str = "日报与提醒";
+    timed(GROUP, "每日精选", async {
+        match db.take_daily_reports().await {
+            Ok(reports) => {
+                for (user_id, text) in reports {
+                    if let Err(err) = crate::push::send_user_text(db, user_id, &text).await {
+                        tracing::warn!(user_id, "每日精选发送失败: {err}");
+                    }
+                }
+            }
+            Err(err) => tracing::warn!("每日精选失败: {err}"),
+        }
+    })
+    .await;
+    timed(GROUP, "关键词提醒", async {
+        match db.pending_keyword_digests().await {
+            Ok(digests) => {
+                for digest in digests {
+                    match crate::push::send_user_text(db, digest.user_id, &digest.text).await {
+                        Ok(()) => {
+                            if let Err(err) = db.mark_keyword_digest(&digest).await {
+                                tracing::warn!(
+                                    user_id = digest.user_id,
+                                    "关键词提醒已发出但未能标记: {err}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            tracing::warn!(user_id = digest.user_id, "关键词提醒发送失败: {err}")
+                        }
+                    }
+                }
+            }
+            Err(err) => tracing::warn!("关键词提醒失败: {err}"),
+        }
+    })
+    .await;
+}
+
+async fn scheduled_backup(db: &Db) {
     let backup = crate::backup::run_scheduled(db).await;
     if let Ok(false) | Err(_) = &backup {
         let detail = match &backup {
@@ -394,53 +553,6 @@ pub async fn run(db: &Db) -> Result<(), sqlx::Error> {
     if let Err(err) = &backup {
         tracing::warn!("定时备份异常: {}", err.detail);
     }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|item| item.as_secs() as i64)
-        .unwrap_or(0);
-    if let Err(err) = crate::alerts::probe_xueqiu(db, now, |cookie, uid| {
-        let cookie = cookie.to_string();
-        let uid = uid.to_string();
-        async move {
-            let probe =
-                tokio::task::spawn_blocking(move || crate::xueqiu::probe_keepalive(&cookie, &uid))
-                    .await
-                    .unwrap_or(crate::xueqiu::Keepalive::Transient);
-            match probe {
-                crate::xueqiu::Keepalive::Alive => crate::alerts::Probe::Alive,
-                crate::xueqiu::Keepalive::Dead(_) => crate::alerts::Probe::Dead,
-                crate::xueqiu::Keepalive::Transient => {
-                    crate::alerts::Probe::Error("探测失败".into())
-                }
-            }
-        }
-    })
-    .await
-    {
-        tracing::warn!("雪球探测失败: {err}");
-    }
-    let status = match crate::cicc::from_env() {
-        Some(ctl) => ctl.status_async().await,
-        None => serde_json::json!({}),
-    };
-    if let Err(err) = crate::alerts::check_cicc(db, now, &status, |message| async move {
-        crate::alerts::notify_admins(db, &message).await
-    })
-    .await
-    {
-        tracing::warn!("中金告警失败: {err}");
-    }
-    if let Err(err) = crate::alerts::source_health(db, now, |message| async move {
-        crate::alerts::notify_admins(db, &message).await
-    })
-    .await
-    {
-        tracing::warn!("数据源健康告警失败: {err}");
-    }
-    if let Err(err) = crate::push::retry_due_live(db, now).await {
-        tracing::warn!("推送重试失败: {err}");
-    }
-    Ok(())
 }
 
 async fn simplify_due(db: &Db) {
@@ -557,7 +669,7 @@ mod tests {
             .execute(db.pool())
             .await
             .unwrap();
-        run(&db).await.unwrap();
+        cleanup_and_backup(&db).await;
         let grants: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_news_sources")
             .fetch_one(db.pool())
             .await
@@ -573,13 +685,45 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(posts, 1);
-        run(&db).await.unwrap();
+        cleanup_and_backup(&db).await;
         let still: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM users")
             .fetch_one(db.pool())
             .await
             .unwrap();
         assert_eq!(still, 2);
         assert!(crate::backup::run_scheduled(&db).await.unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn failed_cleanup_step_does_not_skip_the_rest_of_the_round() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-maint-isolated-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("stats_posts_retention_days", "1")
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO posts (platform, kol_id, external_id, fetched_at) VALUES ('xueqiu', 1, 'old', datetime('now', '-3 days')), ('xueqiu', 1, 'new', datetime('now'))")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE user_news_sources")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(db.backfill_new_news_sources().await.is_err());
+        cleanup_and_backup(&db).await;
+        let posts: Vec<String> = sqlx::query_scalar("SELECT external_id FROM posts")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(posts, vec!["new".to_string()]);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -757,7 +901,7 @@ mod tests {
         )
         .await
         .unwrap();
-        run(&db).await.unwrap();
+        llm_batches(&db).await;
         let raw = db.setting("stock_aliases").await.unwrap().unwrap();
         assert!(raw.contains("酱香茅台"));
         assert!(!raw.contains("宁王"));
@@ -765,7 +909,7 @@ mod tests {
         db.set_setting("stock_aliases", r#"[{"alias":"宁王","stock":"宁德时代"}]"#)
             .await
             .unwrap();
-        run(&db).await.unwrap();
+        llm_batches(&db).await;
         assert_eq!(
             db.setting("stock_alias_last_date").await.unwrap().unwrap(),
             marked

@@ -367,6 +367,7 @@ pub async fn backfill<F, Fut>(
     db: &Db,
     platform: &str,
     limit: i64,
+    deadline: std::time::Instant,
     mut translate: F,
 ) -> Result<i64, sqlx::Error>
 where
@@ -386,7 +387,7 @@ where
     .await?;
     let mut done = 0;
     for row in rows {
-        if done >= limit {
+        if done >= limit || std::time::Instant::now() >= deadline {
             break;
         }
         let id: i64 = row.get("id");
@@ -537,7 +538,8 @@ mod tests {
         .await
         .unwrap();
         let mut calls = 0;
-        let done = backfill(&db, "truth", 2, |text| {
+        let later = std::time::Instant::now() + std::time::Duration::from_secs(3600);
+        let done = backfill(&db, "truth", 2, later, |text| {
             calls += 1;
             async move {
                 Ok(format!(
@@ -569,7 +571,7 @@ mod tests {
                 .await
                 .unwrap();
         assert!(old.is_empty());
-        let again = backfill(&db, "truth", 3, |text| async move {
+        let again = backfill(&db, "truth", 3, later, |text| async move {
             if text.contains("three") {
                 Ok(text)
             } else {
@@ -585,6 +587,49 @@ mod tests {
                 .await
                 .unwrap();
         assert!(same.starts_with("This is"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn backfill_stops_at_deadline_and_leaves_the_rest_pending() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-truth-budget-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        sqlx::query(
+            "INSERT INTO posts (platform, kol_id, external_id, title, content, published_at) VALUES
+             ('truth', 1, 'a', 'Title a', 'This is a long enough English post number one for the budget test.', datetime('now')),
+             ('truth', 1, 'b', 'Title b', 'This is a long enough English post number two for the budget test.', datetime('now')),
+             ('truth', 1, 'c', 'Title c', 'This is a long enough English post number three for the budget test.', datetime('now'))",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(30);
+        let mut calls = 0;
+        let done = backfill(&db, "truth", 3, deadline, |_| {
+            calls += 1;
+            async {
+                tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+                Ok("中文译文内容".into())
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(done, 1);
+        assert_eq!(calls, 1);
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM posts WHERE platform = 'truth' AND content_src = ''",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(pending, 2);
         let _ = std::fs::remove_file(&path);
     }
 }

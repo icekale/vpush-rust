@@ -4981,7 +4981,10 @@ details.bind-steps[open] > summary .ui-icon { transform: rotate(90deg); }
   .news-list .admin-sk-card { min-height: 84px; padding: 12px; }
   .news-list-copy { overflow: hidden; }
   .news-list-meta { overflow: hidden; }
-  .news-item-source { max-width: 8em; min-width: 1.75em; }
+  /* 来源至少放下图标加两个字；多出来的宽度给标签，标签在自己的滚动口里横滑。 */
+  .news-item-source { max-width: 8em; min-width: 4.5em; flex: 0 1 auto; }
+  .news-item-source-name { min-width: 2em; }
+  .news-item-topics { flex: 1 1 2.5em; min-width: 2.5em; }
   .news-item-topics i,
   .news-item-topics button { display: inline-flex; align-items: center; min-height: 32px; padding: 0 8px; }
   .news-mark-read { position: relative; width: 32px; min-width: 32px; height: 32px; min-height: 32px; margin: 0 0 0 auto; }

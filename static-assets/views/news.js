@@ -513,14 +513,17 @@ export function createNewsView(dependencies) {
   }
 
   // 列表缩略图不走正文那条直接铺图的路径：第一张经常是追踪像素或加载失败，
-  // 铺上去就是一块灰框。太小、解码失败或接口报错记入本会话负缓存；超时会取消
-  // 这一张并继续试后面的下标。成功的 blob URL 仍放在 state.newsImageUrls。
+  // 铺上去就是一块灰框。太小、解码失败或接口报错记到离开资讯页为止。
+  // 单张超时也记入负缓存，但只保留一分钟，慢网不会被整段会话跳过。
+  // 路由取消（AbortError）不记。失败记录不再按条数淘汰，否则同一列表回到
+  // 顶部时会把刚被挤掉的下标再请求一遍。成功的 blob URL 仍放在 state.newsImageUrls。
   const NEWS_THUMB_MIN_PX = 48;
   const NEWS_THUMB_ATTEMPTS = 3;
   const NEWS_THUMB_TIMEOUT_MS = 8000;
+  const NEWS_THUMB_TIMEOUT_MISS_MS = 60_000;
   const NEWS_THUMB_CONCURRENCY = 4;
-  const NEWS_THUMB_MISS_LIMIT = 240;
-  const newsThumbMisses = new Set();
+  // key -> 过期时间戳；0 表示留到离开资讯页。
+  const newsThumbMisses = new Map();
   const newsThumbJobs = new Set();
   let newsThumbActive = 0;
   const newsThumbWait = [];
@@ -536,13 +539,22 @@ export function createNewsView(dependencies) {
     }
   }
 
-  function rememberNewsThumbMiss(key) {
-    newsThumbMisses.delete(key);
-    newsThumbMisses.add(key);
-    while (newsThumbMisses.size > NEWS_THUMB_MISS_LIMIT) {
-      const oldest = newsThumbMisses.values().next().value;
-      newsThumbMisses.delete(oldest);
+  function newsThumbMissed(key) {
+    const expiresAt = newsThumbMisses.get(key);
+    if (expiresAt == null) return false;
+    if (expiresAt !== 0 && expiresAt <= Date.now()) {
+      newsThumbMisses.delete(key);
+      return false;
     }
+    return true;
+  }
+
+  function rememberNewsThumbMiss(key, ttlMs = 0) {
+    const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : 0;
+    const prev = newsThumbMisses.get(key);
+    if (prev === 0) return;
+    if (prev != null && expiresAt !== 0 && expiresAt <= prev) return;
+    newsThumbMisses.set(key, expiresAt);
   }
 
   function abortNewsThumbJobs() {
@@ -650,13 +662,17 @@ export function createNewsView(dependencies) {
       for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
         if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
         const key = thumbKey(index);
-        if (state.newsImageUrls.has(key) || newsThumbMisses.has(key)) continue;
+        if (state.newsImageUrls.has(key) || newsThumbMissed(key)) continue;
         let blob;
         try {
           blob = await newsThumbBlob(articleId, index, controller.signal);
         } catch (err) {
           if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
-          if (err && (err.name === "TimeoutError" || err.name === "AbortError")) continue;
+          if (err && err.name === "AbortError") continue;
+          if (err && err.name === "TimeoutError") {
+            rememberNewsThumbMiss(key, NEWS_THUMB_TIMEOUT_MISS_MS);
+            continue;
+          }
           rememberNewsThumbMiss(key);
           continue;
         }

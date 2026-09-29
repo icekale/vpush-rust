@@ -1935,7 +1935,6 @@ body.lightbox-open { overflow: hidden; }
   width: 20px;
   height: 20px;
   border-radius: 50%;
-  background: var(--color-bg-muted);
   flex-shrink: 0;
 }
 :is(.post-item, .kol-card) .p-name-line .p-platform .pt-icon { width: 13px; height: 13px; }

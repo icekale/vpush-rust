@@ -13,6 +13,7 @@ pub async fn read_text(path: String) -> Option<String> {
 pub async fn extract_due<R, RF, A, AF>(
     db: &Db,
     now: i64,
+    deadline: std::time::Instant,
     mut read: R,
     mut ask: A,
 ) -> Result<usize, sqlx::Error>
@@ -107,6 +108,9 @@ where
     let mut completed = 0;
     let mut unresolved = 0;
     for doc in &docs {
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
         let group_id = doc.get::<String, _>("group_id");
         let media_id = doc.get::<String, _>("media_id");
         let txt_path = doc.get::<String, _>("txt_path");
@@ -238,7 +242,12 @@ where
     Ok(completed)
 }
 
-pub async fn digest_due<A, AF>(db: &Db, now: i64, mut ask: A) -> Result<usize, sqlx::Error>
+pub async fn digest_due<A, AF>(
+    db: &Db,
+    now: i64,
+    deadline: std::time::Instant,
+    mut ask: A,
+) -> Result<usize, sqlx::Error>
 where
     A: FnMut(String) -> AF,
     AF: std::future::Future<Output = Result<String, String>>,
@@ -285,7 +294,7 @@ where
     let model = db.setting("ima_digest_model").await?.unwrap_or_default();
     let mut done = 0;
     for row in rows {
-        if done == batch {
+        if done == batch || std::time::Instant::now() >= deadline {
             break;
         }
         let count = row.get::<i64, _>("report_count");
@@ -783,6 +792,10 @@ mod tests {
         ))
     }
 
+    fn later() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
     async fn doc(db: &Db, group: &str, media: &str, day: &str, name: &str, txt: &str) {
         sqlx::query("INSERT INTO ima_document_index (group_id, media_id, sort_date, name, txt_path) VALUES (?, ?, ?, ?, ?)")
             .bind(group)
@@ -813,7 +826,7 @@ mod tests {
         doc(&db, "feishu-1", "skip", "2026-08-02", "飞书", "f.txt").await;
         sqlx::query("INSERT INTO report_extractions (group_id, media_id, status) VALUES ('a', 'gone', 'failed')").execute(db.pool()).await.unwrap();
         let mut asked = Vec::new();
-        let done = extract_due(&db, 10, |path| async move { Some(format!("正文 {path} {}", "甲".repeat(180))) }, |title, _| {
+        let done = extract_due(&db, 10, later(), |path| async move { Some(format!("正文 {path} {}", "甲".repeat(180))) }, |title, _| {
             asked.push(title);
             async { Ok(r#"{"rating":"Buy","target_price":"10","thesis":"逻辑","report_kind":"公司","tickers":[{"code":"SH600519","name":"别名","stance":"推荐"},{"code":"???","name":"","stance":""}]}"#.into()) }
         })
@@ -845,6 +858,7 @@ mod tests {
         let again = extract_due(
             &db,
             10,
+            later(),
             |_| async { Some("x".into()) },
             |_, _| async { Ok("{}".into()) },
         )
@@ -868,6 +882,7 @@ mod tests {
         let skipped = extract_due(
             &db,
             20,
+            later(),
             |_| async { None },
             |_, _| async { Ok("{}".into()) },
         )
@@ -884,6 +899,7 @@ mod tests {
         let failed = extract_due(
             &db,
             22,
+            later(),
             |_| async { Some("甲".repeat(220)) },
             |_, _| async { Err("超时".into()) },
         )
@@ -900,6 +916,7 @@ mod tests {
         extract_due(
             &db,
             24,
+            later(),
             |_| async { Some("甲".repeat(220)) },
             |_, _| {
                 calls += 1;
@@ -931,7 +948,7 @@ mod tests {
         db.set_setting("ima_digest_interval_seconds", "0")
             .await
             .unwrap();
-        let done = digest_due(&db, 10, |prompt| {
+        let done = digest_due(&db, 10, later(), |prompt| {
             calls += 1;
             assert!(prompt.contains("600519"));
             assert!(prompt.contains("继续看好"));
@@ -948,10 +965,62 @@ mod tests {
                 .await
                 .unwrap();
         assert!(raw.contains("一致看好"));
-        let again = digest_due(&db, 10, |_| async { Err("不应再问".into()) })
+        let again = digest_due(&db, 10, later(), |_| async { Err("不应再问".into()) })
             .await
             .unwrap();
         assert_eq!(again, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn spent_budget_leaves_documents_and_tickers_for_later() {
+        let path = temp_db();
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("report_extract_interval_seconds", "1")
+            .await
+            .unwrap();
+        db.set_setting("report_extract_backfill_days", "0")
+            .await
+            .unwrap();
+        db.set_setting("ima_digest_interval_seconds", "0")
+            .await
+            .unwrap();
+        doc(&db, "a", "m1", "2026-08-02", "茅台点评", "m1.txt").await;
+        doc(&db, "a", "m2", "2026-08-03", "茅台跟踪", "m2.txt").await;
+        doc(&db, "a", "m3", "2026-08-04", "茅台更新", "m3.txt").await;
+        for media in ["m1", "m2", "m3"] {
+            sqlx::query("INSERT INTO report_extraction_tickers (group_id, media_id, code, name) VALUES ('a', ?, '600519', '贵州茅台')").bind(media).execute(db.pool()).await.unwrap();
+        }
+        let spent = std::time::Instant::now();
+        let mut calls = 0;
+        let extracted = extract_due(
+            &db,
+            10,
+            spent,
+            |_| async { Some("甲".repeat(220)) },
+            |_, _| {
+                calls += 1;
+                async { Err("不应调用".into()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(extracted, 0);
+        let digested = digest_due(&db, 10, spent, |_| {
+            calls += 1;
+            async { Err("不应调用".into()) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(digested, 0);
+        assert_eq!(calls, 0);
+        let marked: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM report_extractions) + (SELECT COUNT(*) FROM ima_ticker_digests)",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(marked, 0);
         let _ = std::fs::remove_file(&path);
     }
 }

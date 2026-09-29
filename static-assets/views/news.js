@@ -50,8 +50,10 @@ export function createNewsView(dependencies) {
   }
 
   function clearNewsImageUrls() {
+    abortNewsThumbJobs();
     for (const url of state.newsImageUrls.values()) URL.revokeObjectURL(url);
     state.newsImageUrls.clear();
+    newsThumbMisses.clear();
   }
 
   function stopNewsAutoLoad() {
@@ -103,6 +105,7 @@ export function createNewsView(dependencies) {
   function renderNewsCenter(seq, articleId = "") {
     stopNewsAutoLoad();
     stopReadProgress();
+    abortStaleNewsThumbs();
     if (!routeStillActive(seq)) return;
     if (articleId) return renderFinancialNewsArticle(Number(articleId), seq);
     return renderFinancialNewsList(seq);
@@ -371,11 +374,12 @@ export function createNewsView(dependencies) {
   }
 
   function attachListImages(seq) {
+    abortStaleNewsThumbs();
     for (const item of state.newsItems) {
       const image = document.querySelector(`[data-news-thumbnail="${item.id}"]`);
       if (!image || image.dataset.newsThumbState) continue;
       image.dataset.newsThumbState = "loading";
-      loadNewsListThumb(item.id, image, seq);
+      scheduleNewsThumb(() => loadNewsListThumb(item.id, image, seq));
     }
   }
 
@@ -509,9 +513,62 @@ export function createNewsView(dependencies) {
   }
 
   // 列表缩略图不走正文那条直接铺图的路径：第一张经常是追踪像素或加载失败，
-  // 铺上去就是一块灰框。太小、解码失败、接口报错或超时都丢掉，再试后面几张。
+  // 铺上去就是一块灰框。太小、解码失败或接口报错记入本会话负缓存；超时会取消
+  // 这一张并继续试后面的下标。成功的 blob URL 仍放在 state.newsImageUrls。
   const NEWS_THUMB_MIN_PX = 48;
   const NEWS_THUMB_ATTEMPTS = 3;
+  const NEWS_THUMB_TIMEOUT_MS = 8000;
+  const NEWS_THUMB_CONCURRENCY = 4;
+  const NEWS_THUMB_MISS_LIMIT = 240;
+  const newsThumbMisses = new Set();
+  const newsThumbJobs = new Set();
+  let newsThumbActive = 0;
+  const newsThumbWait = [];
+  let newsThumbWatch = null;
+
+  function syncNewsThumbWatch() {
+    if (newsThumbJobs.size && !newsThumbWatch) {
+      newsThumbWatch = new MutationObserver(() => abortStaleNewsThumbs());
+      newsThumbWatch.observe(document.documentElement, { childList: true, subtree: true });
+    } else if (!newsThumbJobs.size && newsThumbWatch) {
+      newsThumbWatch.disconnect();
+      newsThumbWatch = null;
+    }
+  }
+
+  function rememberNewsThumbMiss(key) {
+    newsThumbMisses.delete(key);
+    newsThumbMisses.add(key);
+    while (newsThumbMisses.size > NEWS_THUMB_MISS_LIMIT) {
+      const oldest = newsThumbMisses.values().next().value;
+      newsThumbMisses.delete(oldest);
+    }
+  }
+
+  function abortNewsThumbJobs() {
+    for (const job of newsThumbJobs) job.controller.abort();
+  }
+
+  function abortStaleNewsThumbs() {
+    for (const job of newsThumbJobs) {
+      if (!job.image.isConnected || !routeStillActive(job.seq)) job.controller.abort();
+    }
+  }
+
+  function scheduleNewsThumb(task) {
+    const run = () => {
+      newsThumbActive += 1;
+      Promise.resolve()
+        .then(task)
+        .finally(() => {
+          newsThumbActive -= 1;
+          const next = newsThumbWait.shift();
+          if (next) next();
+        });
+    };
+    if (newsThumbActive < NEWS_THUMB_CONCURRENCY) run();
+    else newsThumbWait.push(run);
+  }
 
   function dropNewsThumb(image) {
     const link = image.closest(".news-list-thumb-link");
@@ -519,62 +576,100 @@ export function createNewsView(dependencies) {
     else image.remove();
   }
 
-  function newsThumbBlob(articleId, index) {
-    const request = apiBlob(`/api/news/${articleId}/images/${index}`);
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("图片加载超时")), 8000);
-      request.then((blob) => {
-        clearTimeout(timer);
-        resolve(blob);
-      }, (err) => {
-        clearTimeout(timer);
-        reject(err);
-      });
+  function releaseCreatedThumbUrl(key, url) {
+    if (url && state.newsImageUrls.get(key) !== url) URL.revokeObjectURL(url);
+  }
+
+  function newsThumbBlob(articleId, index, parentSignal) {
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort();
+    if (parentSignal.aborted) controller.abort();
+    else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, NEWS_THUMB_TIMEOUT_MS);
+    return apiBlob(`/api/news/${articleId}/images/${index}`, { signal: controller.signal }).catch((err) => {
+      if (timedOut && !parentSignal.aborted) {
+        const timeout = new Error("timeout");
+        timeout.name = "TimeoutError";
+        throw timeout;
+      }
+      throw err;
+    }).finally(() => {
+      clearTimeout(timer);
+      parentSignal.removeEventListener("abort", abortFromParent);
     });
   }
 
+  async function paintNewsListThumb(image, url, created, key, seq, controller) {
+    image.src = url;
+    let usable = false;
+    try {
+      if (typeof image.decode === "function") await image.decode();
+      usable = image.naturalWidth >= NEWS_THUMB_MIN_PX && image.naturalHeight >= NEWS_THUMB_MIN_PX;
+    } catch {
+      usable = false;
+    }
+    if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) {
+      if (created) releaseCreatedThumbUrl(key, url);
+      return "left";
+    }
+    if (!usable) {
+      image.removeAttribute("src");
+      if (created) {
+        releaseCreatedThumbUrl(key, url);
+        rememberNewsThumbMiss(key);
+      }
+      return "skip";
+    }
+    newsThumbMisses.delete(key);
+    state.newsImageUrls.set(key, url);
+    image.classList.remove("is-pending");
+    image.dataset.newsThumbState = "ready";
+    return "ready";
+  }
+
   async function loadNewsListThumb(articleId, image, seq = currentRouteSeq()) {
-    for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
-      if (!routeStillActive(seq) || !image.isConnected) return;
-      const key = newsImageUrlKey(articleId, index);
-      let url = state.newsImageUrls.get(key) || "";
-      let created = false;
-      if (!url) {
+    const controller = new AbortController();
+    const job = { image, controller, seq };
+    newsThumbJobs.add(job);
+    syncNewsThumbWatch();
+    const thumbKey = (index) => newsImageUrlKey(articleId, index);
+    try {
+      // 已经解码成功的下标直接复用，避免返回列表时再把前面的失败或慢请求打一遍。
+      for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
+        if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+        const key = thumbKey(index);
+        const cached = state.newsImageUrls.get(key) || "";
+        if (!cached) continue;
+        const painted = await paintNewsListThumb(image, cached, false, key, seq, controller);
+        if (painted === "left" || painted === "ready") return;
+      }
+      for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
+        if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+        const key = thumbKey(index);
+        if (state.newsImageUrls.has(key) || newsThumbMisses.has(key)) continue;
         let blob;
         try {
-          blob = await newsThumbBlob(articleId, index);
+          blob = await newsThumbBlob(articleId, index, controller.signal);
         } catch (err) {
-          if (!routeStillActive(seq) || !image.isConnected) return;
-          // 超时不再连打。某一格不存在（空字符串或越界）仍试后面几张。
-          if (/超时/.test(String(err && err.message || ""))) break;
+          if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+          if (err && (err.name === "TimeoutError" || err.name === "AbortError")) continue;
+          rememberNewsThumbMiss(key);
           continue;
         }
-        if (!routeStillActive(seq) || !image.isConnected) return;
-        url = URL.createObjectURL(blob);
-        created = true;
+        if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+        const url = URL.createObjectURL(blob);
+        const painted = await paintNewsListThumb(image, url, true, key, seq, controller);
+        if (painted === "left" || painted === "ready") return;
       }
-      image.src = url;
-      let usable = false;
-      try {
-        if (typeof image.decode === "function") await image.decode();
-        usable = image.naturalWidth >= NEWS_THUMB_MIN_PX && image.naturalHeight >= NEWS_THUMB_MIN_PX;
-      } catch {
-        usable = false;
-      }
-      if (!routeStillActive(seq) || !image.isConnected) {
-        if (created) URL.revokeObjectURL(url);
-        return;
-      }
-      if (usable) {
-        state.newsImageUrls.set(key, url);
-        image.classList.remove("is-pending");
-        image.dataset.newsThumbState = "ready";
-        return;
-      }
-      image.removeAttribute("src");
-      if (created) URL.revokeObjectURL(url);
+      if (!controller.signal.aborted && routeStillActive(seq) && image.isConnected) dropNewsThumb(image);
+    } finally {
+      newsThumbJobs.delete(job);
+      syncNewsThumbWatch();
     }
-    if (routeStillActive(seq) && image.isConnected) dropNewsThumb(image);
   }
 
   async function loadNewsImageBlob(articleId, index, image, seq = currentRouteSeq()) {

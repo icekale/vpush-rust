@@ -3003,9 +3003,16 @@ struct CiccCategoriesBody {
 struct NewsQuery {
     source_id: Option<i64>,
     q: Option<String>,
+    topic: Option<String>,
     unread: Option<i64>,
     limit: Option<i64>,
     offset: Option<i64>,
+}
+
+fn news_topic_from_query(q: &NewsQuery) -> Result<String, ApiError> {
+    db::normalize_news_topic(q.topic.as_deref().unwrap_or(""))
+        .map(str::to_string)
+        .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))
 }
 
 async fn xincai_ingest(
@@ -3512,6 +3519,7 @@ async fn news_list(
     let user = require_user(&state, &headers).await?;
     let limit = q.limit.unwrap_or(30).clamp(1, 100);
     let offset = q.offset.unwrap_or(0).max(0);
+    let topic = news_topic_from_query(&q)?;
     Ok(Json(
         state
             .db
@@ -3519,6 +3527,7 @@ async fn news_list(
                 user.id,
                 q.source_id.unwrap_or(0),
                 q.q.as_deref().unwrap_or(""),
+                &topic,
                 q.unread.unwrap_or(0) != 0,
                 limit,
                 offset,
@@ -4385,6 +4394,7 @@ async fn admin_news_articles(
     Query(q): Query<NewsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
+    let topic = news_topic_from_query(&q)?;
     Ok(Json(
         state
             .db
@@ -4392,6 +4402,7 @@ async fn admin_news_articles(
                 0,
                 q.source_id.unwrap_or(0),
                 "",
+                &topic,
                 false,
                 q.limit.unwrap_or(50).clamp(1, 100),
                 0,

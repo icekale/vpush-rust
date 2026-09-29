@@ -369,10 +369,7 @@ function avatarText(name) {
 // Truth Social 官方粉勾：压在头像右下角（站外唯一带认证标的平台）
 const TRUTH_CHECK_SVG = `<svg class="vs-check" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="12" fill="#f0426b"/><path d="m6.6 12.6 3.4 3.4 7.4-8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 function avatarHtml(name, url, platform) {
-  const src = url ? imgSrcFor(url) : "";
-  const inner = src
-    ? `<img class="kol-avatar" src="${escapeHtml(src)}" alt="" loading="lazy" onerror="imgOnError(this)">`
-    : `<div class="kol-avatar">${escapeHtml(avatarText(name))}</div>`;
+  const inner = url ? `<img class="kol-avatar" src="${escapeHtml(url)}" alt="" loading="lazy">` : `<div class="kol-avatar">${escapeHtml(avatarText(name))}</div>`;
   if (platform !== "truth") return inner;
   return `<span class="avatar-verified">${inner}${TRUTH_CHECK_SVG}</span>`;
 }

@@ -432,7 +432,10 @@ mod tests {
         let updated = ingest(&db, &again).await.unwrap();
         assert_eq!(updated["accepted"], 1);
         let user = db.user_by_username("admin").await.unwrap().unwrap();
-        let listed = db.list_news(user.id, 0, "", false, 20, 0).await.unwrap();
+        let listed = db
+            .list_news(user.id, 0, "", "", false, 20, 0)
+            .await
+            .unwrap();
         let items = listed["items"].as_array().unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(
@@ -452,7 +455,10 @@ mod tests {
         assert_eq!(article["topics"], json!(["政经", "市场"]));
         let figure = json!({"articles": [{"sourceId": "ft", "sourceName": "FT · 中国", "externalId": "f1", "title": "图", "platform": "ft", "html": "<figure><img src=\"https://img.example/a.jpg\"></figure>", "text": "正文 & 说明", "url": "https://example.com/f"}]});
         ingest(&db, &figure).await.unwrap();
-        let listed = db.list_news(user.id, 0, "", false, 20, 0).await.unwrap();
+        let listed = db
+            .list_news(user.id, 0, "", "", false, 20, 0)
+            .await
+            .unwrap();
         let figure_id = listed["items"]
             .as_array()
             .unwrap()

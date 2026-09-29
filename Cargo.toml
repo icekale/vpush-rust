@@ -1,6 +1,6 @@
 [package]
 name = "vpush"
-version = "1.12.277"
+version = "1.12.278"
 edition = "2021"
 rust-version = "1.95"
 

@@ -2363,16 +2363,19 @@ impl Db {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn list_news(
         &self,
         user_id: i64,
         source_id: i64,
         q: &str,
+        topic: &str,
         unread: bool,
         limit: i64,
         offset: i64,
     ) -> Result<Value, sqlx::Error> {
         let like = like_pattern(q);
+        let topic_like = tag_pattern(topic);
         let rows = sqlx::query(
             "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
                     a.title, a.summary, a.url, a.author, a.published_at, a.topics,
@@ -2389,6 +2392,7 @@ impl Db {
                  OR EXISTS (SELECT 1 FROM user_news_sources u WHERE u.user_id = ? AND u.source_id = a.source_id)
                )
                AND (? = '' OR a.title LIKE ? ESCAPE '!' OR a.summary LIKE ? ESCAPE '!')
+               AND (? = '' OR a.topics LIKE ? ESCAPE '!')
                AND (? = 0 OR NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at)))
              ORDER BY a.published_at DESC, a.id DESC
              LIMIT ? OFFSET ?",
@@ -2402,6 +2406,8 @@ impl Db {
         .bind(q)
         .bind(&like)
         .bind(&like)
+        .bind(topic)
+        .bind(&topic_like)
         .bind(i64::from(unread))
         .bind(limit + 1)
         .bind(offset)
@@ -7680,6 +7686,17 @@ fn like_pattern(q: &str) -> String {
     out
 }
 
+pub fn normalize_news_topic(raw: &str) -> Result<&str, &'static str> {
+    let topic = raw.trim();
+    if topic.is_empty() {
+        return Ok("");
+    }
+    if matches!(topic, "宏观" | "国际" | "科技" | "公司" | "市场") {
+        return Ok(topic);
+    }
+    Err("未知的资讯主题")
+}
+
 fn tag_pattern(tag: &str) -> String {
     if tag.is_empty() {
         return String::new();
@@ -9530,7 +9547,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(added, 1);
-        let page = db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap();
+        let page = db
+            .list_news(admin.id, 0, "", "", false, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(page["items"][0]["is_read"], false);
         let id = page["items"][0]["id"].as_i64().unwrap();
         assert!(db.mark_news_read(admin.id, id).await.unwrap());
@@ -9573,18 +9593,315 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(
-            db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap()["items"]
+            db.list_news(admin.id, 0, "", "", false, 10, 0)
+                .await
+                .unwrap()["items"]
                 .as_array()
                 .unwrap()
                 .len(),
             2
         );
         db.set_user_news_sources(admin.id, &[source]).await.unwrap();
-        let kept = db.list_news(admin.id, 0, "", false, 10, 0).await.unwrap();
+        let kept = db
+            .list_news(admin.id, 0, "", "", false, 10, 0)
+            .await
+            .unwrap();
         assert_eq!(kept["items"].as_array().unwrap().len(), 1);
         assert_eq!(kept["items"][0]["title"], "标题");
         assert!(db.news_article(admin.id, id).await.unwrap().is_some());
         assert!(db.set_user_news_sources(admin.id, &[999]).await.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn news_topic_whitelist_rejects_unknown_and_injection() {
+        assert_eq!(normalize_news_topic(""), Ok(""));
+        assert_eq!(normalize_news_topic("  "), Ok(""));
+        assert_eq!(normalize_news_topic(" 公司 "), Ok("公司"));
+        for topic in ["宏观", "国际", "科技", "公司", "市场"] {
+            assert_eq!(normalize_news_topic(topic), Ok(topic));
+        }
+        for topic in ["政经", "公司债", "公司' OR 1=1 --", "%", "公司\u{0000}"] {
+            assert!(normalize_news_topic(topic).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn news_list_topic_combines_with_source_search_unread_and_pages() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-news-topic-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        let source_a = db.add_news_source("甲报", "宏观").await.unwrap();
+        let feed_a = db
+            .add_news_feed(source_a, "甲", "https://example.com/a")
+            .await
+            .unwrap();
+        let source_b = db.add_news_source("乙报", "公司").await.unwrap();
+        let feed_b = db
+            .add_news_feed(source_b, "乙", "https://example.com/b")
+            .await
+            .unwrap();
+        let rows = [
+            (
+                source_a,
+                feed_a,
+                "公司长文",
+                "盈利增长",
+                "2026-09-26 18:00",
+                r#"["公司"]"#,
+            ),
+            (
+                source_a,
+                feed_a,
+                "已读公司",
+                "旧闻",
+                "2026-09-26 17:00",
+                r#"["公司"]"#,
+            ),
+            (
+                source_a,
+                feed_a,
+                "公司短讯",
+                "简讯",
+                "2026-09-26 16:00",
+                r#"["公司","宏观"]"#,
+            ),
+            (
+                source_b,
+                feed_b,
+                "公司另一来源",
+                "乙",
+                "2026-09-26 15:00",
+                r#"["公司"]"#,
+            ),
+            (
+                source_a,
+                feed_a,
+                "宏观观察",
+                "宏观",
+                "2026-09-26 14:00",
+                r#"["宏观"]"#,
+            ),
+            (
+                source_a,
+                feed_a,
+                "公司债",
+                "债",
+                "2026-09-26 13:00",
+                r#"["公司债"]"#,
+            ),
+            (
+                source_a,
+                feed_a,
+                "政经",
+                "政经",
+                "2026-09-26 12:00",
+                r#"["政经"]"#,
+            ),
+        ];
+        for (source, feed, title, summary, published, _topics) in rows {
+            db.save_news_entries(
+                source,
+                feed,
+                &[NewsEntry {
+                    external_id: title.into(),
+                    title: title.into(),
+                    summary: summary.into(),
+                    content: "".into(),
+                    url: format!("https://example.com/{title}"),
+                    author: "".into(),
+                    published_at: published.into(),
+                }],
+            )
+            .await
+            .unwrap();
+        }
+        for (title, topics) in rows.iter().map(|row| (row.2, row.5)) {
+            sqlx::query("UPDATE news_articles SET topics = ? WHERE title = ?")
+                .bind(topics)
+                .bind(title)
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        let titles = |page: Value| -> Vec<String> {
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["title"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "", "", false, 20, 0)
+                    .await
+                    .unwrap()
+            )
+            .len(),
+            7
+        );
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "", "公司", false, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司长文", "已读公司", "公司短讯", "公司另一来源"]
+        );
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "", "公司债", false, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司债"]
+        );
+        assert!(titles(
+            db.list_news(admin.id, 0, "", "公司' OR 1=1 --", false, 20, 0)
+                .await
+                .unwrap()
+        )
+        .is_empty());
+        assert!(titles(
+            db.list_news(admin.id, 0, "", "%", false, 20, 0)
+                .await
+                .unwrap()
+        )
+        .is_empty());
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "盈利", "公司", false, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司长文"]
+        );
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, source_b, "", "公司", false, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司另一来源"]
+        );
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, source_a, "", "宏观", false, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司短讯", "宏观观察"]
+        );
+        let first = db
+            .list_news(admin.id, 0, "", "公司", false, 1, 0)
+            .await
+            .unwrap();
+        assert_eq!(titles(first.clone()), vec!["公司长文"]);
+        assert_eq!(first["has_more"], true);
+        assert_eq!(first["next_offset"], 1);
+        let last = db
+            .list_news(admin.id, 0, "", "公司", false, 1, 3)
+            .await
+            .unwrap();
+        assert_eq!(titles(last.clone()), vec!["公司另一来源"]);
+        assert_eq!(last["has_more"], false);
+        assert_eq!(
+            db.user_news_sources(admin.id).await.unwrap()["unread_count"],
+            7
+        );
+        let read_id = first["items"][0]["id"].as_i64().unwrap();
+        let read_target = db
+            .list_news(admin.id, 0, "", "公司", false, 20, 0)
+            .await
+            .unwrap()["items"][1]["id"]
+            .as_i64()
+            .unwrap();
+        assert!(db.mark_news_read(admin.id, read_target).await.unwrap());
+        assert_ne!(read_id, read_target);
+        assert_eq!(
+            db.user_news_sources(admin.id).await.unwrap()["unread_count"],
+            6
+        );
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "", "公司", true, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司长文", "公司短讯", "公司另一来源"]
+        );
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, source_a, "", "公司", true, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司长文", "公司短讯"]
+        );
+        db.set_user_news_sources(admin.id, &[source_a])
+            .await
+            .unwrap();
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "", "公司", false, 20, 0)
+                    .await
+                    .unwrap()
+            ),
+            vec!["公司长文", "已读公司", "公司短讯"]
+        );
+        assert_eq!(
+            db.user_news_sources(admin.id).await.unwrap()["unread_count"],
+            5
+        );
+        db.set_user_news_sources(admin.id, &[source_a, source_b])
+            .await
+            .unwrap();
+        db.mark_news_seen_now(admin.id).await.unwrap();
+        assert_eq!(
+            db.user_news_sources(admin.id).await.unwrap()["unread_count"],
+            0
+        );
+        let after_all = db
+            .list_news(admin.id, 0, "", "公司", false, 20, 0)
+            .await
+            .unwrap();
+        assert!(after_all["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["is_read"] == true));
+        assert_eq!(
+            titles(
+                db.list_news(admin.id, 0, "", "宏观", false, 20, 0)
+                    .await
+                    .unwrap()
+            )
+            .len(),
+            2
+        );
+        assert!(db
+            .list_news(admin.id, 0, "", "宏观", false, 20, 0)
+            .await
+            .unwrap()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["is_read"] == true));
+        assert!(titles(
+            db.list_news(admin.id, 0, "", "公司", true, 20, 0)
+                .await
+                .unwrap()
+        )
+        .is_empty());
         let _ = std::fs::remove_file(&path);
     }
 

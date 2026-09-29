@@ -50,8 +50,10 @@ export function createNewsView(dependencies) {
   }
 
   function clearNewsImageUrls() {
+    abortNewsThumbJobs();
     for (const url of state.newsImageUrls.values()) URL.revokeObjectURL(url);
     state.newsImageUrls.clear();
+    newsThumbMisses.clear();
   }
 
   function stopNewsAutoLoad() {
@@ -103,6 +105,7 @@ export function createNewsView(dependencies) {
   function renderNewsCenter(seq, articleId = "") {
     stopNewsAutoLoad();
     stopReadProgress();
+    abortStaleNewsThumbs();
     if (!routeStillActive(seq)) return;
     if (articleId) return renderFinancialNewsArticle(Number(articleId), seq);
     return renderFinancialNewsList(seq);
@@ -156,18 +159,22 @@ export function createNewsView(dependencies) {
 
   function newsListItemHtml(item) {
     const unread = !item.is_read;
+    // 先不放可见占位：灰底空框会在图片还没回来、或只是一张透明占位图时一直留着。
     const thumbnail = item.has_image
-      ? `<img class="news-list-thumb" src="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 3 2'%3E%3C/svg%3E" data-news-thumbnail="${item.id}" alt="" width="112" height="75" loading="lazy" onerror="this.closest('.news-list-thumb-link').style.display='none'">`
+      ? `<img class="news-list-thumb is-pending" data-news-thumbnail="${item.id}" alt="" width="112" height="75" decoding="async">`
       : "";
     const activeTopic = state.newsTopic || "";
     const topicNames = (Array.isArray(item.topics) ? item.topics : []).filter((topic) => topic && topic !== item.source_name);
     const topics = topicNames.length
       ? `<span class="news-item-topics">${topicNames.map((topic) => NEWS_TOPICS.includes(topic) ? `<button type="button" class="news-item-topic${topic === activeTopic ? " is-on" : ""}" aria-pressed="${topic === activeTopic ? "true" : "false"}" onclick="selectNewsTopic('${topic}')">${escapeHtml(topic)}</button>` : `<i>${escapeHtml(topic)}</i>`).join("")}</span>`
       : "";
+    const dot = unread
+      ? '<i class="news-item-unread-dot" aria-label="未读"></i>'
+      : '<i class="news-item-unread-dot is-off" aria-hidden="true"></i>';
     return `<article class="news-list-item ${unread ? "is-unread" : "is-read"}" data-news-id="${item.id}">
     <div class="news-list-copy">
       <a class="news-item-open" href="/news/${item.id}">
-        <div class="news-item-title-row">${unread ? '<i class="news-item-unread-dot" aria-label="未读"></i>' : ""}<h3>${escapeHtml(item.title)}</h3></div>
+        <div class="news-item-title-row">${dot}<h3>${escapeHtml(item.title)}</h3></div>
         <p>${escapeHtml(item.summary || "暂无摘要")}</p>
       </a>
       <div class="news-list-meta"><span class="news-item-source">${newsPlatformMark(item.source_platform)}<span class="news-item-source-name">${escapeHtml(channelName(item.source_name))}</span></span><time datetime="${escapeHtml(item.published_at || "")}">${escapeHtml(fmtPublished(item.published_at, true))}</time>${topics}${unread ? `<button type="button" class="news-mark-read" onclick="markNewsItemRead(${item.id})" aria-label="标为已读">${CHECK_ICON}</button>` : ""}</div>
@@ -292,7 +299,9 @@ export function createNewsView(dependencies) {
 
   function newsFilterSummaryHtml() {
     const parts = newsActiveFilterParts();
-    const body = parts.length ? `<span>${parts.map((part) => escapeHtml(part)).join(" · ")}</span><button type="button" class="btn-ghost" onclick="clearNewsFilters()">清除</button>` : "";
+    const body = parts.length
+      ? `<span class="news-filter-chips">${parts.map((part) => `<b>${escapeHtml(part)}</b>`).join("")}</span><button type="button" class="btn-ghost news-filter-clear" onclick="clearNewsFilters()">清除</button>`
+      : "";
     return `<div id="news-filter-summary" class="news-filter-summary"${parts.length ? "" : " hidden"}>${body}</div>`;
   }
 
@@ -365,9 +374,12 @@ export function createNewsView(dependencies) {
   }
 
   function attachListImages(seq) {
+    abortStaleNewsThumbs();
     for (const item of state.newsItems) {
       const image = document.querySelector(`[data-news-thumbnail="${item.id}"]`);
-      if (image) loadNewsImageBlob(item.id, 0, image, seq);
+      if (!image || image.dataset.newsThumbState) continue;
+      image.dataset.newsThumbState = "loading";
+      scheduleNewsThumb(() => loadNewsListThumb(item.id, image, seq));
     }
   }
 
@@ -497,6 +509,182 @@ export function createNewsView(dependencies) {
         return;
       }
       list.innerHTML = emptyState("加载失败: " + err.message, `<div><button type="button" class="btn-ghost" onclick="loadFinancialNews(${reset})">重试</button></div>`);
+    }
+  }
+
+  // 列表缩略图不走正文那条直接铺图的路径：第一张经常是追踪像素或加载失败，
+  // 铺上去就是一块灰框。太小、解码失败或接口报错记到离开资讯页为止。
+  // 单张超时也记入负缓存，但只保留一分钟，慢网不会被整段会话跳过。
+  // 路由取消（AbortError）不记。失败记录不再按条数淘汰，否则同一列表回到
+  // 顶部时会把刚被挤掉的下标再请求一遍。成功的 blob URL 仍放在 state.newsImageUrls。
+  const NEWS_THUMB_MIN_PX = 48;
+  const NEWS_THUMB_ATTEMPTS = 3;
+  const NEWS_THUMB_TIMEOUT_MS = 8000;
+  const NEWS_THUMB_TIMEOUT_MISS_MS = 60_000;
+  const NEWS_THUMB_CONCURRENCY = 4;
+  // key -> 过期时间戳；0 表示留到离开资讯页。
+  const newsThumbMisses = new Map();
+  const newsThumbJobs = new Set();
+  let newsThumbActive = 0;
+  const newsThumbWait = [];
+  let newsThumbWatch = null;
+
+  function syncNewsThumbWatch() {
+    if (newsThumbJobs.size && !newsThumbWatch) {
+      newsThumbWatch = new MutationObserver(() => abortStaleNewsThumbs());
+      newsThumbWatch.observe(document.documentElement, { childList: true, subtree: true });
+    } else if (!newsThumbJobs.size && newsThumbWatch) {
+      newsThumbWatch.disconnect();
+      newsThumbWatch = null;
+    }
+  }
+
+  function newsThumbMissed(key) {
+    const expiresAt = newsThumbMisses.get(key);
+    if (expiresAt == null) return false;
+    if (expiresAt !== 0 && expiresAt <= Date.now()) {
+      newsThumbMisses.delete(key);
+      return false;
+    }
+    return true;
+  }
+
+  function rememberNewsThumbMiss(key, ttlMs = 0) {
+    const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : 0;
+    const prev = newsThumbMisses.get(key);
+    if (prev === 0) return;
+    if (prev != null && expiresAt !== 0 && expiresAt <= prev) return;
+    newsThumbMisses.set(key, expiresAt);
+  }
+
+  function abortNewsThumbJobs() {
+    for (const job of newsThumbJobs) job.controller.abort();
+  }
+
+  function abortStaleNewsThumbs() {
+    for (const job of newsThumbJobs) {
+      if (!job.image.isConnected || !routeStillActive(job.seq)) job.controller.abort();
+    }
+  }
+
+  function scheduleNewsThumb(task) {
+    const run = () => {
+      newsThumbActive += 1;
+      Promise.resolve()
+        .then(task)
+        .finally(() => {
+          newsThumbActive -= 1;
+          const next = newsThumbWait.shift();
+          if (next) next();
+        });
+    };
+    if (newsThumbActive < NEWS_THUMB_CONCURRENCY) run();
+    else newsThumbWait.push(run);
+  }
+
+  function dropNewsThumb(image) {
+    const link = image.closest(".news-list-thumb-link");
+    if (link) link.remove();
+    else image.remove();
+  }
+
+  function releaseCreatedThumbUrl(key, url) {
+    if (url && state.newsImageUrls.get(key) !== url) URL.revokeObjectURL(url);
+  }
+
+  function newsThumbBlob(articleId, index, parentSignal) {
+    const controller = new AbortController();
+    const abortFromParent = () => controller.abort();
+    if (parentSignal.aborted) controller.abort();
+    else parentSignal.addEventListener("abort", abortFromParent, { once: true });
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, NEWS_THUMB_TIMEOUT_MS);
+    return apiBlob(`/api/news/${articleId}/images/${index}`, { signal: controller.signal }).catch((err) => {
+      if (timedOut && !parentSignal.aborted) {
+        const timeout = new Error("timeout");
+        timeout.name = "TimeoutError";
+        throw timeout;
+      }
+      throw err;
+    }).finally(() => {
+      clearTimeout(timer);
+      parentSignal.removeEventListener("abort", abortFromParent);
+    });
+  }
+
+  async function paintNewsListThumb(image, url, created, key, seq, controller) {
+    image.src = url;
+    let usable = false;
+    try {
+      if (typeof image.decode === "function") await image.decode();
+      usable = image.naturalWidth >= NEWS_THUMB_MIN_PX && image.naturalHeight >= NEWS_THUMB_MIN_PX;
+    } catch {
+      usable = false;
+    }
+    if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) {
+      if (created) releaseCreatedThumbUrl(key, url);
+      return "left";
+    }
+    if (!usable) {
+      image.removeAttribute("src");
+      if (created) {
+        releaseCreatedThumbUrl(key, url);
+        rememberNewsThumbMiss(key);
+      }
+      return "skip";
+    }
+    newsThumbMisses.delete(key);
+    state.newsImageUrls.set(key, url);
+    image.classList.remove("is-pending");
+    image.dataset.newsThumbState = "ready";
+    return "ready";
+  }
+
+  async function loadNewsListThumb(articleId, image, seq = currentRouteSeq()) {
+    const controller = new AbortController();
+    const job = { image, controller, seq };
+    newsThumbJobs.add(job);
+    syncNewsThumbWatch();
+    const thumbKey = (index) => newsImageUrlKey(articleId, index);
+    try {
+      // 已经解码成功的下标直接复用，避免返回列表时再把前面的失败或慢请求打一遍。
+      for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
+        if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+        const key = thumbKey(index);
+        const cached = state.newsImageUrls.get(key) || "";
+        if (!cached) continue;
+        const painted = await paintNewsListThumb(image, cached, false, key, seq, controller);
+        if (painted === "left" || painted === "ready") return;
+      }
+      for (let index = 0; index < NEWS_THUMB_ATTEMPTS; index += 1) {
+        if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+        const key = thumbKey(index);
+        if (state.newsImageUrls.has(key) || newsThumbMissed(key)) continue;
+        let blob;
+        try {
+          blob = await newsThumbBlob(articleId, index, controller.signal);
+        } catch (err) {
+          if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+          if (err && err.name === "AbortError") continue;
+          if (err && err.name === "TimeoutError") {
+            rememberNewsThumbMiss(key, NEWS_THUMB_TIMEOUT_MISS_MS);
+            continue;
+          }
+          rememberNewsThumbMiss(key);
+          continue;
+        }
+        if (controller.signal.aborted || !routeStillActive(seq) || !image.isConnected) return;
+        const url = URL.createObjectURL(blob);
+        const painted = await paintNewsListThumb(image, url, true, key, seq, controller);
+        if (painted === "left" || painted === "ready") return;
+      }
+      if (!controller.signal.aborted && routeStillActive(seq) && image.isConnected) dropNewsThumb(image);
+    } finally {
+      newsThumbJobs.delete(job);
+      syncNewsThumbWatch();
     }
   }
 
@@ -639,7 +827,12 @@ export function createNewsView(dependencies) {
     }
     card.classList.remove("is-unread");
     card.classList.add("is-read");
-    card.querySelector(".news-item-unread-dot")?.remove();
+    const dot = card.querySelector(".news-item-unread-dot");
+    if (dot) {
+      dot.classList.add("is-off");
+      dot.removeAttribute("aria-label");
+      dot.setAttribute("aria-hidden", "true");
+    }
     card.querySelector(".news-mark-read")?.remove();
     return true;
   }

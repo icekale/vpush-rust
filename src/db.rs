@@ -3,8 +3,8 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Connection, Row, SqlitePool};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{ConnectOptions, Connection, Row, SqlitePool};
 
 #[derive(Debug)]
 pub struct KeywordDigest {
@@ -618,8 +618,13 @@ impl Db {
             .filename(path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .foreign_keys(true)
-            .busy_timeout(std::time::Duration::from_secs(5));
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .log_slow_statements(
+                log::LevelFilter::Warn,
+                std::time::Duration::from_millis(500),
+            );
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(opts)
@@ -632,6 +637,7 @@ impl Db {
         ensure_register_code_columns(&pool).await?;
         ensure_feishu_columns(&pool).await?;
         ensure_news_admin_columns(&pool).await?;
+        ensure_hot_indexes(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -8441,6 +8447,19 @@ async fn ensure_user_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+async fn ensure_hot_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::raw_sql(
+        "CREATE INDEX IF NOT EXISTS idx_push_logs_post ON push_logs(post_id, channel, user_id);
+         CREATE INDEX IF NOT EXISTS idx_push_logs_created ON push_logs(created_at);
+         CREATE INDEX IF NOT EXISTS idx_push_logs_user ON push_logs(user_id);
+         CREATE INDEX IF NOT EXISTS idx_posts_fetched ON posts(fetched_at);
+         CREATE INDEX IF NOT EXISTS idx_news_articles_published ON news_articles(published_at);",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 async fn ensure_register_code_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     let existing: Vec<String> =
         sqlx::query_scalar("SELECT name FROM pragma_table_info('register_codes')")
@@ -8713,6 +8732,77 @@ fn clip_title(title: &str, fallback: &str) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[tokio::test]
+    async fn open_adds_hot_indexes_to_existing_databases_and_syncs_normal() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-hot-indexes-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let names = [
+            "idx_news_articles_published",
+            "idx_posts_fetched",
+            "idx_push_logs_created",
+            "idx_push_logs_post",
+            "idx_push_logs_user",
+        ];
+        let db = Db::open(&path).await.unwrap();
+        for name in names {
+            sqlx::query(&format!("DROP INDEX {name}"))
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let found: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name IN
+             ('idx_news_articles_published', 'idx_posts_fetched', 'idx_push_logs_created',
+              'idx_push_logs_post', 'idx_push_logs_user') ORDER BY name",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(found, names);
+        let plan = |sql: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+        };
+        let failed = plan("SELECT COUNT(*) FROM push_logs WHERE post_id = 1 AND channel = 'telegram' AND user_id = 2 AND status = 'failed'").await;
+        assert!(failed.contains("idx_push_logs_post"), "{failed}");
+        let expired =
+            plan("SELECT id FROM push_logs WHERE created_at < datetime('now', '-90 days')").await;
+        assert!(expired.contains("idx_push_logs_created"), "{expired}");
+        let owned = plan("SELECT 1 FROM push_logs WHERE user_id = 3").await;
+        assert!(owned.contains("idx_push_logs_user"), "{owned}");
+        let old_posts =
+            plan("SELECT id FROM posts WHERE fetched_at < datetime('now', '-30 days')").await;
+        assert!(old_posts.contains("idx_posts_fetched"), "{old_posts}");
+        let old_news = plan("SELECT id FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-30 days')").await;
+        assert!(
+            old_news.contains("idx_news_articles_published"),
+            "{old_news}"
+        );
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 1);
+        let _ = std::fs::remove_file(&path);
+    }
 
     #[tokio::test]
     async fn telegram_token_uniqueness_compares_decrypted_enc2_values() {

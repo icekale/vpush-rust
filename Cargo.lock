@@ -2722,6 +2722,7 @@ dependencies = [
  "hkdf",
  "hmac",
  "libc",
+ "log",
  "md-5",
  "num-bigint",
  "p256",

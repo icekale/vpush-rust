@@ -1033,7 +1033,7 @@ async fn market_indices(
     if !matches!(group.as_str(), "auto" | "day" | "night") {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "无效的分组"));
     }
-    Ok(Json(market::snapshot(&group).await))
+    Ok(Json(market::snapshot(&state.db, &group).await))
 }
 
 async fn etf_premiums(
@@ -1041,7 +1041,7 @@ async fn etf_premiums(
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    let mut snapshot = etf_premium::snapshot().await;
+    let mut snapshot = etf_premium::snapshot(&state.db).await;
     snapshot["latest_alert"] = etf_premium::latest_alert(&state.db, user.id)
         .await
         .map_err(db_err)?

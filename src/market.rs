@@ -1,4 +1,4 @@
-//! 时间线右侧的指数报价。数据来自腾讯行情，缓存 30 秒；冷缓存同步取，失败不编造价格。
+//! 时间线右侧的指数报价。数据优先来自雪球，失败或过期时逐项回退腾讯行情，缓存 30 秒。
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -8,6 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Map, Value};
 
 const QUOTE_URL: &str = "https://qt.gtimg.cn/q=";
+const XUEQIU_QUOTE_URL: &str = "https://stock.xueqiu.com/v5/stock/batch/quote.json";
 const DAY: &[(&str, &str)] = &[
     ("sh000001", "上证指数"),
     ("sz399001", "深证成指"),
@@ -74,7 +75,7 @@ enum Start {
     Idle,
 }
 
-pub async fn snapshot(group: &str) -> Value {
+pub async fn snapshot(db: &crate::db::Db, group: &str) -> Value {
     let now = now_unix();
     let group = if group == "auto" {
         default_group(now)
@@ -82,12 +83,18 @@ pub async fn snapshot(group: &str) -> Value {
         group
     };
     let (start, previous) = begin(group);
+    let cookie = if matches!(start, Start::Idle) {
+        None
+    } else {
+        crate::xueqiu::app_cookie(db).await.ok()
+    };
     match start {
         Start::Cold => {
             let fetched = tokio::task::spawn_blocking({
                 let previous = previous.clone();
                 let group = group.to_string();
-                move || fetch_group(&group, &previous)
+                let cookie = cookie.clone();
+                move || fetch_group(&group, &previous, cookie.as_deref())
             })
             .await
             .unwrap_or(previous);
@@ -99,7 +106,8 @@ pub async fn snapshot(group: &str) -> Value {
             tokio::spawn(async move {
                 let fetched = tokio::task::spawn_blocking({
                     let group = group.clone();
-                    move || fetch_group(&group, &previous)
+                    let cookie = cookie.clone();
+                    move || fetch_group(&group, &previous, cookie.as_deref())
                 })
                 .await
                 .unwrap_or_default();
@@ -197,7 +205,7 @@ fn placeholders(group: &str) -> Vec<Item> {
         .collect()
 }
 
-fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
+fn fetch_group(group: &str, previous: &[Item], cookie: Option<&str>) -> Vec<Item> {
     let names = symbols(group);
     let url = format!(
         "{QUOTE_URL}{}",
@@ -207,7 +215,23 @@ fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
             .collect::<Vec<_>>()
             .join(",")
     );
-    let fresh = http_text(&url).and_then(|text| parse_quotes(&text, group).ok());
+    let fallback = http_text(&url).and_then(|text| parse_quotes(&text, group).ok());
+    let primary = cookie.and_then(|cookie| {
+        fetch_xueqiu_quotes(cookie, group)
+            .map_err(|err| tracing::warn!("雪球指数行情获取失败: {err}"))
+            .ok()
+    });
+    let fresh = names
+        .iter()
+        .filter_map(|(symbol, _)| {
+            primary
+                .as_ref()
+                .and_then(|rows| rows.iter().find(|row| row.symbol == *symbol))
+                .filter(|row| xueqiu_quote_usable(row, now_unix()))
+                .or_else(|| fallback.as_ref()?.iter().find(|row| row.symbol == *symbol))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
     let mut items = Vec::new();
     for (symbol, name) in names {
         let mut item = previous
@@ -216,10 +240,7 @@ fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
             .cloned()
             .unwrap_or_else(|| placeholder(symbol, name));
         item.name = (*name).to_string();
-        if let Some(quote) = fresh
-            .as_ref()
-            .and_then(|rows| rows.iter().find(|row| row.symbol == *symbol))
-        {
+        if let Some(quote) = fresh.iter().find(|row| row.symbol == *symbol) {
             item.price = Some(quote.price);
             item.previous_close = Some(quote.previous_close);
             item.change = Some(quote.change);
@@ -231,7 +252,7 @@ fn fetch_group(group: &str, previous: &[Item]) -> Vec<Item> {
         }
         items.push(item);
     }
-    let Some(fresh) = fresh else {
+    let Some(fresh) = (!fresh.is_empty()).then_some(fresh) else {
         return items;
     };
     let symbols = fresh
@@ -341,6 +362,7 @@ pub(crate) fn http_text_with_referer(url: &str, referer: &str) -> Option<String>
     Some(bytes.iter().map(|b| *b as char).collect())
 }
 
+#[derive(Clone)]
 struct Quote {
     symbol: String,
     price: f64,
@@ -350,6 +372,173 @@ struct Quote {
     quoted_at: String,
 }
 
+fn xueqiu_symbol(symbol: &str) -> &'static str {
+    match symbol {
+        "usSOXX" => "SOXX",
+        "usYINN" => "YINN",
+        "us.INX" => ".INX",
+        "us.IXIC" => ".IXIC",
+        "us.NDX" => ".NDX",
+        "us.DJI" => ".DJI",
+        "sh000001" => "SH000001",
+        "sz399001" => "SZ399001",
+        "sh000688" => "SH000688",
+        "sz399006" => "SZ399006",
+        "hkHSI" => "HKHSI",
+        "hkHSTECH" => "HKHSTECH",
+        _ => "",
+    }
+}
+
+fn xueqiu_number(value: &Value) -> Option<f64> {
+    let value = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+    value.is_finite().then_some(value)
+}
+
+fn xueqiu_quote_time(symbol: &str, timestamp: i64) -> Option<String> {
+    if timestamp <= 0 {
+        return None;
+    }
+    let unix = timestamp / 1000;
+    let civil = if symbol.starts_with("us") {
+        to_ny(unix)
+    } else {
+        to_cn(unix)
+    };
+    let offset = if symbol.starts_with("us") {
+        ny_offset_wall(&civil)
+    } else {
+        8 * 60
+    };
+    Some(format_iso(&civil, offset))
+}
+
+fn parse_xueqiu_quotes(value: &Value, group: &str) -> Result<Vec<Quote>, String> {
+    let items = value
+        .get("data")
+        .and_then(|data| data.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "雪球指数行情缺少 data.items".to_string())?;
+    let mut quotes = Vec::new();
+    for (symbol, _) in symbols(group) {
+        let target = xueqiu_symbol(symbol);
+        let Some(quote) = items
+            .iter()
+            .filter_map(|item| item.get("quote"))
+            .find(|quote| quote.get("symbol").and_then(Value::as_str) == Some(target))
+        else {
+            continue;
+        };
+        let Some(timestamp) = quote.get("timestamp").and_then(Value::as_i64) else {
+            continue;
+        };
+        let Some(quoted_at) = xueqiu_quote_time(symbol, timestamp) else {
+            continue;
+        };
+        let Some(price) = xueqiu_number(&quote["current"]) else {
+            continue;
+        };
+        let Some(previous_close) = xueqiu_number(&quote["last_close"]) else {
+            continue;
+        };
+        let Some(change) = xueqiu_number(&quote["chg"]) else {
+            continue;
+        };
+        let Some(percent) = xueqiu_number(&quote["percent"]) else {
+            continue;
+        };
+        if price <= 0.0 || previous_close <= 0.0 {
+            continue;
+        }
+        quotes.push(Quote {
+            symbol: (*symbol).to_string(),
+            price,
+            previous_close,
+            change,
+            percent,
+            quoted_at,
+        });
+    }
+    if quotes.is_empty() {
+        Err("雪球指数行情没有有效报价".into())
+    } else {
+        Ok(quotes)
+    }
+}
+
+fn xueqiu_quote_usable(quote: &Quote, now: i64) -> bool {
+    let Some(at) = parse_iso_unix(&quote.quoted_at) else {
+        return false;
+    };
+    let age = now - at;
+    if age < 0 {
+        return false;
+    }
+    if quote_status(&quote.symbol, Some(&quote.quoted_at), now) == "closed" {
+        age <= 24 * 3600
+    } else {
+        age <= 180
+    }
+}
+
+fn fetch_xueqiu_quotes(cookie: &str, group: &str) -> Result<Vec<Quote>, String> {
+    let symbols = symbols(group)
+        .iter()
+        .map(|(symbol, _)| xueqiu_symbol(symbol))
+        .filter(|symbol| !symbol.is_empty())
+        .collect::<Vec<_>>()
+        .join(",");
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let response = agent
+        .get(XUEQIU_QUOTE_URL)
+        .query("symbol", &symbols)
+        .query("extend", "detail")
+        .set("User-Agent", crate::xueqiu::APP_UA)
+        .set("Accept", "application/json, text/plain, */*")
+        .set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .set("Origin", "https://xueqiu.com")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Referer", "https://xueqiu.com/")
+        .set("Cookie", cookie)
+        .call();
+    let (status, text) = match response {
+        Ok(response) => {
+            let status = response.status();
+            (
+                status,
+                response.into_string().map_err(|err| err.to_string())?,
+            )
+        }
+        Err(ureq::Error::Status(status, response)) => (
+            status,
+            response.into_string().map_err(|err| err.to_string())?,
+        ),
+        Err(err) => return Err(format!("雪球指数行情请求失败: {err}")),
+    };
+    if text.trim().is_empty() {
+        return Err("雪球指数行情返回空响应".into());
+    }
+    if text.contains("EO_Bot_Ssid") || text.contains("__tst_status") || text.contains("aliyun_waf")
+    {
+        return Err("雪球指数行情返回挑战页".into());
+    }
+    if status == 401 || status == 403 {
+        return Err(format!("雪球指数行情身份/权限错误 HTTP {status}"));
+    }
+    if status == 429 {
+        return Err("雪球指数行情限流 HTTP 429".into());
+    }
+    let value: Value =
+        serde_json::from_str(&text).map_err(|_| "雪球指数行情返回非 JSON".to_string())?;
+    let error_code = value.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+    if error_code != 0 || status != 200 {
+        return Err(format!("雪球指数行情 HTTP {status} 错误码 {error_code}"));
+    }
+    parse_xueqiu_quotes(&value, group)
+}
 fn parse_quotes(text: &str, group: &str) -> Result<Vec<Quote>, ()> {
     let records = quote_records(text);
     let mut items = Vec::new();
@@ -869,6 +1058,38 @@ fn civil_from_days(z: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn xueqiu_payload() -> Value {
+        json!({"data":{"items":[
+            {"quote":{"symbol":"SH000001","name":"上证指数","current":3842.19,"last_close":3830.45,"chg":11.74,"percent":0.31,"timestamp":1790751600000_i64}},
+            {"quote":{"symbol":".IXIC","name":"纳斯达克综合指数","current":27025.277,"last_close":26797.541,"chg":227.736,"percent":0.85,"timestamp":1790791642000_i64}}
+        ]}})
+    }
+
+    #[test]
+    fn xueqiu_quotes_parse_batch_values_and_exchange_time() {
+        assert_eq!(xueqiu_symbol("usSOXX"), "SOXX");
+        assert_eq!(xueqiu_symbol("usYINN"), "YINN");
+        assert_eq!(xueqiu_symbol("us.IXIC"), ".IXIC");
+        let quotes = parse_xueqiu_quotes(&xueqiu_payload(), "night").unwrap();
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].symbol, "us.IXIC");
+        assert_eq!(quotes[0].price, 27025.277);
+        assert_eq!(quotes[0].previous_close, 26797.541);
+        assert_eq!(quotes[0].change, 227.736);
+        assert_eq!(quotes[0].percent, 0.85);
+        assert_eq!(quotes[0].quoted_at, "2026-09-30T14:07:22-04:00");
+    }
+
+    #[test]
+    fn xueqiu_quotes_reject_missing_or_invalid_timestamp() {
+        for timestamp in [Value::Null, json!(0), json!(-1), json!("bad")] {
+            let value = json!({"data":{"items":[{"quote":{
+                "symbol":"SH000001","current":1,"last_close":1,"chg":0,"percent":0,"timestamp":timestamp
+            }}]}});
+            assert!(parse_xueqiu_quotes(&value, "day").is_err());
+        }
+    }
 
     fn payload(price: &str, timestamp: &str, group: &str) -> String {
         let mut rows = Vec::new();

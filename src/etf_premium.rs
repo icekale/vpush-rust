@@ -126,11 +126,12 @@ pub async fn latest_alert(db: &Db, user_id: i64) -> Result<Option<Value>, sqlx::
     }))
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Quote {
     symbol: &'static str,
     price: Option<f64>,
     iopv: Option<f64>,
+    premium_rate: Option<f64>,
     market_at: Option<String>,
     market_unix: Option<i64>,
     reference_at: Option<String>,
@@ -149,7 +150,9 @@ impl Quote {
     }
 
     fn render(&self, now: i64, fetch_ok: bool) -> Value {
-        let rate = self.price.zip(self.iopv).and_then(|(p, v)| premium(p, v));
+        let rate = self
+            .premium_rate
+            .or_else(|| self.price.zip(self.iopv).and_then(|(p, v)| premium(p, v)));
         let status = if !fetch_ok || rate.is_none() {
             "unavailable"
         } else if !crate::market::mainland_open(now) {
@@ -164,59 +167,141 @@ impl Quote {
             "reference_type": if self.iopv.is_some() { "iopv_unverified_realtime" } else { "unavailable" },
             "market_at": self.market_at, "reference_at": self.reference_at,
             "stale": !fetch_ok || !self.fresh(now), "status": status, "alerts_enabled": false,
-            "source": "新浪行情IOPV（实时性未独立验证）"})
+            "source": "雪球批量行情（IOPV实时性待盘中验证）"})
     }
 }
 
-fn sina_time(parts: &[&str], date: usize, time: usize) -> Option<(String, i64)> {
-    let date = parts.get(date)?;
-    let time = parts.get(time)?;
-    if date.len() != 10 || time.len() != 8 {
-        return None;
+fn xueqiu_time(time: &str, timestamp: i64) -> Result<(String, i64), String> {
+    let compact = time.replace(['-', ' ', ':'], "");
+    let Some((at, unix)) = crate::market::mainland_quote_time(&compact) else {
+        return Err("雪球行情时间非法".into());
+    };
+    if timestamp <= 0 || timestamp / 1000 != unix {
+        return Err("雪球行情时间戳不一致".into());
     }
-    crate::market::mainland_quote_time(&format!(
-        "{}{}",
-        date.replace('-', ""),
-        time.replace(':', "")
-    ))
+    Ok((at, unix))
 }
 
-fn positive(raw: &str) -> Option<f64> {
-    raw.parse::<f64>()
-        .ok()
-        .filter(|v| v.is_finite() && *v > 0.0)
+fn finite_value(value: &Value) -> Option<f64> {
+    let value = value.as_f64().or_else(|| value.as_str()?.parse().ok())?;
+    value.is_finite().then_some(value)
 }
 
-fn parse_quotes(text: &str) -> Vec<Quote> {
-    // 新浪和腾讯的变量包装相同，只是变量前缀不同。
-    let text = text.replace("hq_str_", "v_");
-    let records = crate::market::quote_records(&text);
-    FUNDS
-        .iter()
-        .map(|(symbol, _)| {
-            let raw_symbol = format!("sh{symbol}");
-            let parts = records
-                .get(raw_symbol.as_str())
-                .map(|raw| raw.split(',').collect::<Vec<_>>())
-                .unwrap_or_default();
-            let iopv_symbol = format!("sh{symbol}_iopv");
-            let reference = records
-                .get(iopv_symbol.as_str())
-                .map(|raw| raw.split(',').collect::<Vec<_>>())
-                .unwrap_or_default();
-            let time = sina_time(&parts, 30, 31);
-            let reference_time = sina_time(&reference, 0, 1);
-            Quote {
-                symbol,
-                price: parts.get(3).and_then(|raw| positive(raw)),
-                iopv: reference.get(2).and_then(|raw| positive(raw)),
-                market_at: time.as_ref().map(|(at, _)| at.clone()),
-                market_unix: time.map(|(_, at)| at),
-                reference_at: reference_time.as_ref().map(|(at, _)| at.clone()),
-                reference_unix: reference_time.map(|(_, at)| at),
-            }
+fn positive_value(value: &Value) -> Option<f64> {
+    finite_value(value).filter(|value| *value > 0.0)
+}
+
+fn parse_xueqiu_quotes(value: &Value) -> Result<Vec<Quote>, String> {
+    let items = value
+        .get("data")
+        .and_then(|data| data.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| "雪球行情缺少 data.items".to_string())?;
+    let mut quotes = Vec::with_capacity(FUNDS.len());
+    for (symbol, _) in FUNDS {
+        let target = format!("SH{symbol}");
+        let quote = items
+            .iter()
+            .filter_map(|item| item.get("quote"))
+            .find(|quote| quote.get("symbol").and_then(Value::as_str) == Some(target.as_str()))
+            .ok_or_else(|| format!("雪球行情缺少 {symbol}"))?;
+        let timestamp = quote
+            .get("timestamp")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| format!("雪球行情 {symbol} 缺少时间戳"))?;
+        let time = quote
+            .get("time")
+            .and_then(Value::as_str)
+            .ok_or_else(|| format!("雪球行情 {symbol} 缺少报价时间"))?;
+        let (market_at, market_unix) = xueqiu_time(time, timestamp)?;
+        quotes.push(Quote {
+            symbol,
+            price: positive_value(&quote["current"]),
+            iopv: positive_value(&quote["iopv"]),
+            premium_rate: finite_value(&quote["premium_rate"]),
+            market_at: Some(market_at.clone()),
+            market_unix: Some(market_unix),
+            reference_at: Some(market_at),
+            reference_unix: Some(market_unix),
+        });
+    }
+    Ok(quotes)
+}
+
+fn decode_xueqiu_response(status: u16, text: &str) -> Result<Value, String> {
+    if text.contains("EO_Bot_Ssid")
+        || text.contains("__tst_status")
+        || text.contains("aliyun_waf")
+        || text.contains("挑战")
+    {
+        return Err("雪球行情返回挑战页".into());
+    }
+    if status == 401 || status == 403 {
+        return Err(format!("雪球行情身份/权限错误 HTTP {status}"));
+    }
+    if status == 429 {
+        return Err("雪球行情限流 HTTP 429".into());
+    }
+    if text.trim().is_empty() {
+        return Err("雪球行情返回空响应".into());
+    }
+    let value: Value = serde_json::from_str(text).map_err(|_| "雪球行情返回非 JSON".to_string())?;
+    let error_code = value
+        .get("error_code")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            value
+                .get("error_code")
+                .and_then(Value::as_str)?
+                .parse()
+                .ok()
         })
-        .collect()
+        .unwrap_or(0);
+    if error_code == 110017 {
+        return Err("雪球行情限流 110017".into());
+    }
+    if [400016, 10022, 400012, 400013, 70007, 20250, 20251].contains(&error_code) {
+        return Err(format!("雪球行情身份失效 {error_code}"));
+    }
+    if status != 200 || error_code != 0 {
+        return Err(format!("雪球行情 HTTP {status} 错误码 {error_code}"));
+    }
+    Ok(value)
+}
+
+fn fetch_xueqiu_quotes(cookie: &str) -> Result<Vec<Quote>, String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(8))
+        .timeout_read(Duration::from_secs(8))
+        .build();
+    let response = agent
+        .get("https://stock.xueqiu.com/v5/stock/batch/quote.json")
+        .query("symbol", "SH513100,SH513500")
+        .query("extend", "detail")
+        .set("User-Agent", crate::xueqiu::APP_UA)
+        .set("Accept", "application/json, text/plain, */*")
+        .set("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
+        .set("Origin", "https://xueqiu.com")
+        .set("X-Requested-With", "XMLHttpRequest")
+        .set("Referer", "https://xueqiu.com/")
+        .set("Cookie", cookie)
+        .call();
+    let (status, text) = match response {
+        Ok(response) => {
+            let status = response.status();
+            (
+                status,
+                response.into_string().map_err(|err| err.to_string())?,
+            )
+        }
+        Err(ureq::Error::Status(status, response)) => (
+            status,
+            response.into_string().map_err(|err| err.to_string())?,
+        ),
+        Err(err) => return Err(format!("雪球行情请求失败: {err}")),
+    };
+    let value = decode_xueqiu_response(status, &text)?;
+    parse_xueqiu_quotes(&value)
 }
 
 #[derive(Default)]
@@ -231,35 +316,31 @@ fn cache() -> &'static tokio::sync::Mutex<Cache> {
     CACHE.get_or_init(|| tokio::sync::Mutex::new(Cache::default()))
 }
 
-async fn quotes() -> (Vec<Quote>, bool) {
+async fn quotes(db: &Db) -> (Vec<Quote>, bool) {
     let mut cache = cache().lock().await;
     if cache
         .at
         .is_none_or(|at| at.elapsed() >= Duration::from_secs(30))
     {
-        let text = tokio::task::spawn_blocking(|| {
-            crate::market::http_text_with_referer(
-                "https://hq.sinajs.cn/list=sh513100,sh513100_iopv,sh513500,sh513500_iopv",
-                "https://finance.sina.com.cn/",
-            )
-        })
-        .await
-        .ok()
-        .flatten();
-        cache.fetch_ok = text.is_some();
-        if let Some(text) = text {
-            cache.items = parse_quotes(&text);
-        }
-        if cache.items.is_empty() {
-            cache.items = parse_quotes("");
+        let result = match crate::xueqiu::app_cookie(db).await {
+            Ok(cookie) => tokio::task::spawn_blocking(move || fetch_xueqiu_quotes(&cookie))
+                .await
+                .map_err(|err| err.to_string())
+                .and_then(|result| result),
+            Err(err) => Err(err),
+        };
+        cache.fetch_ok = result.is_ok();
+        match result {
+            Ok(items) => cache.items = items,
+            Err(err) => tracing::warn!("雪球 ETF 行情获取失败: {err}"),
         }
         cache.at = Some(Instant::now());
     }
     (cache.items.clone(), cache.fetch_ok)
 }
 
-pub async fn snapshot() -> Value {
-    let (items, ok) = quotes().await;
+pub async fn snapshot(db: &Db) -> Value {
+    let (items, ok) = quotes(db).await;
     let now = crate::market::now_unix();
     json!({"items": items.iter().map(|quote| quote.render(now, ok)).collect::<Vec<_>>()})
 }
@@ -293,7 +374,7 @@ async fn evaluate(db: &Db, quote: &Quote, now: i64) -> Result<(), sqlx::Error> {
         .bind(quote.symbol)
         .fetch_one(db.pool())
         .await?;
-        let text = format!("【ETF高溢价提醒】\n\n{} {}\n当前溢价率：{rate:.2}%\n提醒水位：{threshold:.2}%\n触发时间：{}\n\n参考价值：新浪行情IOPV（{:.4}）\nIOPV更新时间：{}",
+        let text = format!("【ETF高溢价提醒】\n\n{} {}\n当前溢价率：{rate:.2}%\n提醒水位：{threshold:.2}%\n触发时间：{}\n\n参考价值：雪球行情IOPV（{:.4}）\nIOPV更新时间：{}",
             quote.symbol, fund_name(quote.symbol).unwrap(), at.replace('T', " ").replace("+08:00", ""), quote.iopv.unwrap(),
             quote.reference_at.as_deref().unwrap().replace('T', " ").replace("+08:00", ""));
         let status = match crate::push::send_user_alert(db, user_id, &text).await {
@@ -318,7 +399,7 @@ pub fn spawn(db: Db) {
             if !crate::market::mainland_open(now) {
                 continue;
             }
-            let (quotes, ok) = quotes().await;
+            let (quotes, ok) = quotes(&db).await;
             if !ok {
                 continue;
             }
@@ -335,29 +416,75 @@ pub fn spawn(db: Db) {
 mod tests {
     use super::*;
 
-    fn sample(symbol: &str, at: &str, price: &str, iopv: &str) -> String {
-        let (date, time) = if at.len() == 14 && at.bytes().all(|b| b.is_ascii_digit()) {
+    fn sample_quote() -> Quote {
+        parse_xueqiu_quotes(&xueqiu_payload(json!(1_790_751_600_000_i64)))
+            .unwrap()
+            .into_iter()
+            .find(|quote| quote.symbol == "513100")
+            .unwrap()
+    }
+
+    fn xueqiu_payload(timestamp: Value) -> Value {
+        json!({"data":{"items":[
+            {"quote":{"symbol":"SH513500","current":2.688,"iopv":2.447,"premium_rate":9.85,"time":"2026-09-30 15:00:00","timestamp":timestamp}},
+            {"quote":{"symbol":"SH513100","current":2.352,"iopv":2.0381,"premium_rate":15.4,"time":"2026-09-30 15:00:00","timestamp":timestamp}}
+        ]}})
+    }
+
+    #[test]
+    fn xueqiu_batch_quotes_parse_price_iopv_premium_and_timestamp() {
+        let quotes = parse_xueqiu_quotes(&xueqiu_payload(json!(1_790_751_600_000_i64))).unwrap();
+        assert_eq!(
+            quotes.iter().map(|q| q.symbol).collect::<Vec<_>>(),
+            ["513100", "513500"]
+        );
+        assert_eq!(quotes[0].price, Some(2.352));
+        assert_eq!(quotes[0].iopv, Some(2.0381));
+        assert_eq!(quotes[0].premium_rate, Some(15.4));
+        assert!(
+            (premium(quotes[0].price.unwrap(), quotes[0].iopv.unwrap()).unwrap() - 15.4016).abs()
+                < 0.001
+        );
+        assert_eq!(
+            quotes[0].market_at.as_deref(),
+            Some("2026-09-30T15:00:00+08:00")
+        );
+        assert_eq!(quotes[0].market_unix, Some(1_790_751_600));
+    }
+
+    #[test]
+    fn xueqiu_batch_quotes_reject_missing_or_invalid_timestamps() {
+        for timestamp in [Value::Null, json!("bad"), json!(0), json!(-1)] {
+            assert!(parse_xueqiu_quotes(&xueqiu_payload(timestamp))
+                .unwrap_err()
+                .contains("时间戳"));
+        }
+    }
+
+    #[test]
+    fn xueqiu_response_errors_are_classified() {
+        for (status, body, message) in [
+            (200, "", "空响应"),
+            (200, "<html>no json</html>", "非 JSON"),
+            (401, "{}", "身份/权限"),
+            (403, "{}", "身份/权限"),
+            (429, "{}", "限流"),
+            (403, "EO_Bot_Ssid challenge", "挑战页"),
             (
-                format!("{}-{}-{}", &at[..4], &at[4..6], &at[6..8]),
-                format!("{}:{}:{}", &at[8..10], &at[10..12], &at[12..14]),
-            )
-        } else {
-            (at.to_owned(), at.to_owned())
-        };
-        let mut parts = vec![""; 33];
-        parts[3] = price;
-        parts[30] = &date;
-        parts[31] = &time;
-        format!(
-            "var hq_str_sh{symbol}=\"{}\";\nvar hq_str_sh{symbol}_iopv=\"{date},{time},{iopv}\";",
-            parts.join(",")
-        )
+                400,
+                r#"{"error_code":400016,"error_description":"identity mismatch"}"#,
+                "身份失效",
+            ),
+        ] {
+            assert!(decode_xueqiu_response(status, body)
+                .unwrap_err()
+                .contains(message));
+        }
     }
 
     #[test]
     fn source_snapshot_and_sessions_guard_alerts() {
-        let raw = sample("513100", "20260930143031", "2.352", "2.0381");
-        let quote = parse_quotes(&raw).remove(0);
+        let quote = sample_quote();
         let now = quote.market_unix.unwrap();
         assert!(
             (premium(quote.price.unwrap(), quote.iopv.unwrap()).unwrap() - 15.4015995).abs()
@@ -373,26 +500,6 @@ mod tests {
         assert!(!stale_iopv.alertable(now));
         stale_iopv.reference_unix = None;
         assert!(!stale_iopv.alertable(now));
-        for at in ["20260930120000", "20260930150100", "20261003100000"] {
-            let quote = parse_quotes(&sample("513100", at, "2.352", "2.0381")).remove(0);
-            assert!(!quote.alertable(quote.market_unix.unwrap()));
-        }
-        for at in [
-            "bad-time",
-            "20260900103000",
-            "20260230103000",
-            "20260930146000",
-        ] {
-            let quote = parse_quotes(&sample("513100", at, "2.352", "2.0381")).remove(0);
-            assert!(quote.market_at.is_none());
-            assert!(!quote.alertable(now));
-        }
-        for value in ["", "-", "0", "NaN", "inf"] {
-            let quote = parse_quotes(&sample("513100", "20260930143031", "2.352", value)).remove(0);
-            assert_eq!(quote.render(now, true)["premium_rate"], Value::Null);
-            assert!(!quote.alertable(now));
-        }
-        assert!(parse_quotes("").iter().all(|quote| !quote.alertable(now)));
     }
 
     #[tokio::test]
@@ -405,7 +512,7 @@ mod tests {
         save_setting(&db, user.id, "513100", true, 5.0)
             .await
             .unwrap();
-        let quote = parse_quotes(&sample("513100", "20260930143031", "1.1", "1.0")).remove(0);
+        let quote = sample_quote();
         let now = quote.market_unix.unwrap();
         evaluate(&db, &quote, now + 121).await.unwrap();
         assert!(latest_alert(&db, user.id).await.unwrap().is_none());
@@ -430,9 +537,12 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "访问新浪公网，手动验证行情源"]
+    #[ignore = "访问雪球公网，手动验证行情源"]
     async fn public_iopv_snapshot_has_both_funds_and_independent_times() {
-        let (quotes, ok) = quotes().await;
+        let db = crate::db::Db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        let (quotes, ok) = quotes(&db).await;
         assert!(ok);
         assert_eq!(quotes.len(), 2);
         for quote in quotes {

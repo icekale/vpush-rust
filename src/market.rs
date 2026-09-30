@@ -1024,6 +1024,15 @@ pub(crate) fn mainland_quote_time(raw: &str) -> Option<(String, i64)> {
     Some((format_iso(&civil, 480), unix - 8 * 3600))
 }
 
+pub(crate) fn mainland_timestamp(timestamp_ms: i64) -> Option<(String, i64)> {
+    if timestamp_ms <= 0 {
+        return None;
+    }
+    let unix = timestamp_ms / 1000;
+    let civil = from_unix(unix + 8 * 3600);
+    Some((format_iso(&civil, 480), unix))
+}
+
 pub(crate) fn mainland_open(now: i64) -> bool {
     let local = now + 8 * 3600;
     let weekday = (local.div_euclid(86400) + 3).rem_euclid(7);

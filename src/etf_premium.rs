@@ -171,7 +171,17 @@ impl Quote {
     }
 }
 
-fn xueqiu_time(time: &str, timestamp: i64) -> Result<(String, i64), String> {
+fn xueqiu_time(time: &Value, timestamp: i64) -> Result<(String, i64), String> {
+    if let Some(time) = time.as_i64() {
+        if time != timestamp {
+            return Err("雪球行情时间戳不一致".into());
+        }
+        return crate::market::mainland_timestamp(timestamp)
+            .ok_or_else(|| "雪球行情时间非法".into());
+    }
+    let time = time
+        .as_str()
+        .ok_or_else(|| "雪球行情时间格式非法".to_string())?;
     let compact = time.replace(['-', ' ', ':'], "");
     let Some((at, unix)) = crate::market::mainland_quote_time(&compact) else {
         return Err("雪球行情时间非法".into());
@@ -211,7 +221,6 @@ fn parse_xueqiu_quotes(value: &Value) -> Result<Vec<Quote>, String> {
             .ok_or_else(|| format!("雪球行情 {symbol} 缺少时间戳"))?;
         let time = quote
             .get("time")
-            .and_then(Value::as_str)
             .ok_or_else(|| format!("雪球行情 {symbol} 缺少报价时间"))?;
         let (market_at, market_unix) = xueqiu_time(time, timestamp)?;
         quotes.push(Quote {
@@ -445,6 +454,22 @@ mod tests {
             (premium(quotes[0].price.unwrap(), quotes[0].iopv.unwrap()).unwrap() - 15.4016).abs()
                 < 0.001
         );
+        assert_eq!(
+            quotes[0].market_at.as_deref(),
+            Some("2026-09-30T15:00:00+08:00")
+        );
+        assert_eq!(quotes[0].market_unix, Some(1_790_751_600));
+    }
+
+    #[test]
+    fn xueqiu_batch_quotes_accept_numeric_time_and_timestamp() {
+        let timestamp = json!(1_790_751_600_000_i64);
+        let mut payload = xueqiu_payload(timestamp.clone());
+        for item in payload["data"]["items"].as_array_mut().unwrap() {
+            item["quote"]["time"] = timestamp.clone();
+        }
+        let quotes = parse_xueqiu_quotes(&payload).unwrap();
+        assert_eq!(quotes.len(), 2);
         assert_eq!(
             quotes[0].market_at.as_deref(),
             Some("2026-09-30T15:00:00+08:00")

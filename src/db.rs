@@ -213,6 +213,18 @@ CREATE TABLE IF NOT EXISTS users (
     telegram_provisional INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wechat_openid ON users(wechat_openid) WHERE wechat_openid != '';
+CREATE TABLE IF NOT EXISTS etf_premium_alerts (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    symbol TEXT NOT NULL CHECK (symbol IN ('513100', '513500')),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    threshold_pct REAL NOT NULL DEFAULT 5.0 CHECK (threshold_pct BETWEEN 0 AND 100),
+    above_threshold INTEGER NOT NULL DEFAULT 0,
+    last_triggered_pct REAL,
+    last_threshold_pct REAL,
+    last_triggered_at TEXT,
+    delivery_status TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_id, symbol)
+);
 CREATE TABLE IF NOT EXISTS bind_codes (
     code TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,

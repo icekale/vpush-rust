@@ -69,6 +69,29 @@ fn outcome(channel: &str, result: Result<(), String>) -> serde_json::Value {
 }
 
 pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), String> {
+    send_user_text_with_title(db, user_id, text, "每日精选").await
+}
+
+/// 金融提醒复用所有文字推送渠道，并遵守全局开关和北京时间勿扰设置。
+pub async fn send_user_alert(db: &Db, user_id: i64, text: &str) -> Result<&'static str, String> {
+    let user = db
+        .user_by_id(user_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "用户不存在".to_owned())?;
+    if !user.notify_enabled || quiet_hours(&user.dnd_start, &user.dnd_end, beijing_minutes()) {
+        return Ok("suppressed");
+    }
+    send_user_text_with_title(db, user_id, text, "ETF高溢价提醒").await?;
+    Ok("sent")
+}
+
+async fn send_user_text_with_title(
+    db: &Db,
+    user_id: i64,
+    text: &str,
+    title: &str,
+) -> Result<(), String> {
     let Some(user) = db
         .user_by_id(user_id)
         .await
@@ -77,36 +100,63 @@ pub async fn send_user_text(db: &Db, user_id: i64, text: &str) -> Result<(), Str
         return Err("用户不存在".into());
     };
     let picked = channels(&user.push_channels);
-    let mut sent = false;
+    let mut results = Vec::new();
     if picked.wecom && wecom_bound(&user.wecom_webhook) {
-        send_wecom_text(&user.wecom_webhook, text).await?;
-        sent = true;
+        results.push(outcome(
+            "wecom",
+            send_wecom_text(&user.wecom_webhook, text).await,
+        ));
     }
     if picked.bark && valid_bark_key(&user.bark_key) {
-        send_bark_text(&user.bark_key, "每日精选", text).await?;
-        sent = true;
+        results.push(outcome(
+            "bark",
+            send_bark_text(&user.bark_key, title, text).await,
+        ));
     }
     if picked.telegram && !user.telegram_chat_id.trim().is_empty() {
         let key = crate::feishu_personal::credential_key().unwrap_or_default();
-        let token = telegram_secret(&user.telegram_bot_token, &key)?;
-        send_telegram(&token, &user.telegram_chat_id, text).await?;
-        sent = true;
+        let result = match telegram_secret(&user.telegram_bot_token, &key) {
+            Ok(token) => send_telegram(&token, &user.telegram_chat_id, text).await,
+            Err(err) => Err(err),
+        };
+        results.push(outcome("telegram", result));
     }
     if picked.feishu {
-        match crate::feishu::deliver_text(db, user_id, text).await {
-            Ok(()) => sent = true,
-            Err(err) if err == "飞书未绑定" => {}
-            Err(err) => return Err(err),
+        let result = crate::feishu::deliver_text(db, user_id, text).await;
+        if !result.as_ref().is_err_and(|err| err == "飞书未绑定") {
+            results.push(outcome("feishu", result));
         }
     }
-    if picked.webpush && db.webpush_count(user_id).await.unwrap_or(0) > 0 {
-        crate::webpush::send_text(db, user_id, text).await?;
-        sent = true;
+    if picked.webpush
+        && db
+            .webpush_count(user_id)
+            .await
+            .map_err(|err| err.to_string())?
+            > 0
+    {
+        results.push(outcome(
+            "webpush",
+            crate::webpush::send_text(db, user_id, text).await,
+        ));
     }
-    if sent {
+    if results.is_empty() {
+        return Err("该用户未绑定任何推送渠道".into());
+    }
+    let errors = results
+        .iter()
+        .filter(|result| result["ok"] != true)
+        .map(|result| {
+            format!(
+                "{}: {}",
+                result["channel"].as_str().unwrap_or(""),
+                result["error"].as_str().unwrap_or("推送失败")
+            )
+        })
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
         Ok(())
     } else {
-        Err("该用户未绑定任何推送渠道".into())
+        Err(errors.join("；"))
     }
 }
 
@@ -814,7 +864,11 @@ fn dnd_blocks(target: &PushTarget, now: u32) -> bool {
     if target.favorite && target.dnd_allow_favorite {
         return false;
     }
-    let (Some(start), Some(end)) = (clock(&target.dnd_start), clock(&target.dnd_end)) else {
+    quiet_hours(&target.dnd_start, &target.dnd_end, now)
+}
+
+fn quiet_hours(start: &str, end: &str, now: u32) -> bool {
+    let (Some(start), Some(end)) = (clock(start), clock(end)) else {
         return false;
     };
     if start == end {
@@ -2540,6 +2594,16 @@ fn post_json(url: &str, body: &str) -> Result<(), String> {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn etf_alert_quiet_hours_use_the_existing_cross_midnight_policy() {
+        assert!(quiet_hours("22:00", "08:00", 23 * 60));
+        assert!(quiet_hours("22:00", "08:00", 7 * 60));
+        assert!(!quiet_hours("22:00", "08:00", 8 * 60));
+        assert!(quiet_hours("13:00", "15:00", 14 * 60));
+        assert!(!quiet_hours("13:00", "15:00", 15 * 60));
+        assert!(!quiet_hours("00:00", "00:00", 14 * 60));
+    }
 
     #[test]
     fn unbound_channels_are_skips_not_failures() {

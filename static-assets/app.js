@@ -22,6 +22,7 @@ import { createImaView } from "./views/ima.js";
 import { createFeishuPersonalView } from "./views/feishu-personal.js";
 import { createPushSettingsView } from "./views/push-settings.js";
 import { createMarketView } from "./views/market.js";
+import { createEtfPremiumView } from "./views/etf-premium.js";
 import { createPostCardExport } from "./views/post-card-export.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -2131,6 +2132,7 @@ async function renderTimeline(seq) {
       <div class="tl-rail-body">
         <div class="tl-rail-card tl-rail-view" id="tl-rail-view">${tlViewTogglesHtml()}</div>
         <section class="tl-rail-card tl-market" id="tl-market" aria-labelledby="market-title"></section>
+        <div id="tl-etf-premium"></div>
         <div id="tl-live-rail"></div>
         <div id="tl-rail-recs"></div>
         <div id="tl-rail-tags"></div>
@@ -5176,6 +5178,8 @@ const {
   filterKolImageSettings,
   toggleKolImages,
   loadKolImageSettings,
+  loadEtfAlertSettings,
+  saveEtfPremiumAlert,
 } = pushSettingsView;
 
 // admin 视图懒加载：codes 由 ensureAdminViews() 赋值，求值期读到的是 undefined
@@ -6230,6 +6234,8 @@ const INLINE_HANDLERS = {
   saveCustomTgBot,
   saveDailyReport,
   saveDnd,
+  saveEtfPremiumAlert,
+  loadEtfAlertSettings,
   saveFeishuDocsConfig,
   saveImaCollector,
   saveImgbedSettings,
@@ -6355,6 +6361,7 @@ for (const name of Object.keys(INLINE_HANDLERS)) {
 }
 
 const { startMarketQuotes, stopMarketQuotes } = createMarketView({ api, escapeHtml });
+createEtfPremiumView({ api, escapeHtml });
 
 applyTheme(); // 与 index.html 防闪脚本同一逻辑，兜底 + 同步 meta theme-color
 router();

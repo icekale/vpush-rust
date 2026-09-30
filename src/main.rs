@@ -6,6 +6,7 @@ mod cicc;
 mod client_ip;
 mod combination;
 mod db;
+mod etf_premium;
 mod feishu;
 mod feishu_admin;
 mod feishu_docs;
@@ -290,6 +291,7 @@ async fn main() {
     truth::spawn(state.db.clone());
     twitter::spawn(state.db.clone());
     maintenance::spawn(state.db.clone());
+    etf_premium::spawn(state.db.clone());
     feishu_admin::spawn_sync(state.db.clone());
     feishu_ws::resume(state.db.clone()).await;
     feishu_ws::spawn_shared(state.db.clone());
@@ -694,6 +696,12 @@ fn router(state: AppState) -> Router {
         .route("/api/img-proxy", get(img_proxy))
         .route("/api/live/wscn", get(live_wscn))
         .route("/api/market/indices", get(market_indices))
+        .route("/api/market/etf-premiums", get(etf_premiums))
+        .route("/api/me/etf-premium-alerts", get(etf_alert_settings))
+        .route(
+            "/api/me/etf-premium-alerts/{symbol}",
+            put(save_etf_alert_settings),
+        )
         .fallback(static_or_spa)
         .layer(middleware::from_fn(attach_ip))
         .layer(middleware::from_fn(security_headers))
@@ -1026,6 +1034,63 @@ async fn market_indices(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "无效的分组"));
     }
     Ok(Json(market::snapshot(&group).await))
+}
+
+async fn etf_premiums(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    let mut snapshot = etf_premium::snapshot().await;
+    snapshot["latest_alert"] = etf_premium::latest_alert(&state.db, user.id)
+        .await
+        .map_err(db_err)?
+        .unwrap_or(Value::Null);
+    Ok(Json(snapshot))
+}
+
+async fn etf_alert_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    Ok(Json(
+        etf_premium::settings(&state.db, user.id)
+            .await
+            .map_err(db_err)?,
+    ))
+}
+
+#[derive(Deserialize)]
+struct EtfAlertIn {
+    enabled: bool,
+    threshold_pct: f64,
+}
+
+async fn save_etf_alert_settings(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath(symbol): UrlPath<String>,
+    Json(body): Json<EtfAlertIn>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    if !etf_premium::valid_setting(&symbol, body.threshold_pct) {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "ETF代码或提醒阈值无效（0～100%）",
+        ));
+    }
+    Ok(Json(
+        etf_premium::save_setting(
+            &state.db,
+            user.id,
+            &symbol,
+            body.enabled,
+            body.threshold_pct,
+        )
+        .await
+        .map_err(db_err)?,
+    ))
 }
 
 #[derive(Deserialize)]
@@ -6950,6 +7015,103 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn etf_alert_api_validates_and_isolates_users() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        sqlx::query("INSERT INTO users (username) VALUES ('reader')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        let reader = db.user_by_username("reader").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "etf-test".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let token = |user: &User| {
+            auth::create_token(
+                user.id,
+                &user.username,
+                &state.secret,
+                user.token_version,
+                now_secs(),
+                &user.created_at,
+            )
+        };
+        let admin_token = token(&admin);
+        let reader_token = token(&reader);
+        let app = router(state);
+        for path in ["/api/market/etf-premiums", "/api/me/etf-premium-alerts"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        }
+        for (symbol, body, expected) in [
+            (
+                "513100",
+                r#"{"enabled":true,"threshold_pct":13.58}"#,
+                StatusCode::OK,
+            ),
+            (
+                "999999",
+                r#"{"enabled":true,"threshold_pct":5}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "513100",
+                r#"{"enabled":true,"threshold_pct":-1}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "513100",
+                r#"{"enabled":true,"threshold_pct":101}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/me/etf-premium-alerts/{symbol}"))
+                        .header(header::AUTHORIZATION, format!("Bearer {admin_token}"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        for (token, enabled, threshold) in [(admin_token, true, 13.58), (reader_token, false, 5.0)]
+        {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/me/etf-premium-alerts")
+                        .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: Value =
+                serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap())
+                    .unwrap();
+            assert_eq!(body["items"][0]["enabled"], enabled);
+            assert_eq!(body["items"][0]["threshold_pct"], threshold);
+        }
+    }
 
     #[tokio::test]
     async fn apply_profile_rejects_custom_telegram_token_without_credential_key() {

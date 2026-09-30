@@ -34,6 +34,13 @@ export function createPushSettingsView(dependencies) {
   let _kolImageLoadGeneration = 0;
   let _kolImageDataRevision = 0;
   let _kolImageReloadNeeded = false;
+  const ETF_ALERTS = [
+    ["513100", "纳指ETF国泰"],
+    ["513500", "标普500ETF博时"],
+  ];
+  let _etfAlertData = null;
+  const _etfAlertDrafts = new Map();
+  const _etfAlertPending = new Set();
 
   function stopSettingsPoll() {
     settingsPollSeq += 1;
@@ -278,6 +285,15 @@ export function createPushSettingsView(dependencies) {
             </select>
           </div>
           <p class="muted">只影响你的时间线和推送。管理员需开启「X / Truth 内容自动翻译」后，新抓的帖才会同时留下原文。</p>
+        </section>
+        <section class="section-panel">
+          <header class="section-head">
+            <div>
+              <h2 class="section-title">ETF 溢价提醒</h2>
+              <p class="section-meta">支持纳指ETF国泰和标普500ETF博时，达到自定义溢价阈值后提醒。</p>
+            </div>
+          </header>
+          <div id="etf-alert-settings" aria-live="polite"><p class="muted">正在加载 ETF 溢价提醒…</p></div>
         </section>
         <section class="section-panel">
           <header class="section-head">
@@ -555,6 +571,7 @@ export function createPushSettingsView(dependencies) {
       switchSettingsTab(state.settingsTab || "push"); // 恢复上次所在分栏
       toggleDnd(); // 根据开关初始状态同步时段输入框的禁用/置灰
       loadKolImageSettings(seq);
+      loadEtfAlertSettings(seq);
     } catch (err) {
       if (!routeStillActive(seq) || token !== state.token
         || sessionGeneration !== imaMountState.sessionGeneration) return;
@@ -716,6 +733,97 @@ export function createPushSettingsView(dependencies) {
     }
   }
 
+  async function loadEtfAlertSettings(seq = currentRouteSeq()) {
+    const target = $("#etf-alert-settings");
+    if (!target) return;
+    target.setAttribute("aria-busy", "true");
+    try {
+      const data = await api("/api/me/etf-premium-alerts");
+      if (!routeStillActive(seq)) return;
+      _etfAlertData = data;
+      renderEtfAlertSettings();
+    } catch (err) {
+      if (!routeStillActive(seq)) return;
+      target.removeAttribute("aria-busy");
+      target.innerHTML = `<p class="muted">ETF 溢价提醒加载失败：${escapeHtml(err.message)}</p>
+        <button type="button" class="btn-ghost" onclick="loadEtfAlertSettings()">重试</button>`;
+    }
+  }
+
+  function renderEtfAlertSettings() {
+    const target = $("#etf-alert-settings");
+    if (!target) return;
+    const items = _etfAlertData?.items || [];
+    const rows = ETF_ALERTS.map(([symbol, fallbackName]) => {
+      const item = items.find(entry => entry.symbol === symbol) || { symbol, name: fallbackName, enabled: false, threshold_pct: 5 };
+      const draft = _etfAlertDrafts.get(symbol) || {};
+      const enabled = draft.enabled ?? !!item.enabled;
+      const threshold = draft.threshold ?? (Number.isFinite(item.threshold_pct) ? item.threshold_pct : 5);
+      const pending = _etfAlertPending.has(symbol);
+      return `<div class="etf-alert-row" data-etf-alert="${escapeHtml(symbol)}">
+        <div class="etf-alert-name"><strong>${escapeHtml(item.name || fallbackName)}</strong><span>${escapeHtml(symbol)}</span></div>
+        <label class="switch etf-alert-switch"><input type="checkbox" data-etf-enabled ${enabled ? "checked" : ""} ${pending ? "disabled" : ""} aria-label="启用${escapeHtml(item.name || fallbackName)}溢价提醒"><span class="track"></span><span>提醒</span></label>
+        <label class="etf-alert-threshold">阈值 <input class="form-control" type="number" min="0" max="100" step=".01" value="${escapeHtml(String(threshold))}" data-etf-threshold ${pending ? "disabled" : ""} aria-label="${escapeHtml(item.name || fallbackName)}溢价阈值百分比"><span>%</span></label>
+        <button type="button" class="btn-ghost" data-etf-save ${pending ? "disabled" : ""}>${pending ? "保存中" : "保存"}</button>
+        <span class="etf-alert-result" data-etf-result role="status"></span>
+      </div>`;
+    }).join("");
+    target.removeAttribute("aria-busy");
+    target.innerHTML = `<div class="etf-alert-list">${rows}</div>
+      <p class="muted">${_etfAlertData?.notify_enabled === false ? "全局推送已关闭，开启后才会发送 ETF 提醒。" : "持续超阈值不重复推送，回落后重新触发；静默期间不补发。"} 设置会沿用上方免打扰时段和已绑定渠道。阈值范围 0–100%，默认 5%。</p>`;
+    target.querySelectorAll("[data-etf-alert]").forEach(row => {
+      const symbol = row.dataset.etfAlert;
+      row.querySelector("[data-etf-threshold]").addEventListener("input", event => {
+        const draft = _etfAlertDrafts.get(symbol) || {};
+        draft.threshold = event.target.value;
+        _etfAlertDrafts.set(symbol, draft);
+      });
+      row.querySelector("[data-etf-enabled]").addEventListener("change", event => {
+        const draft = _etfAlertDrafts.get(symbol) || {};
+        draft.enabled = event.target.checked;
+        _etfAlertDrafts.set(symbol, draft);
+      });
+      row.querySelector("[data-etf-save]").addEventListener("click", () => saveEtfPremiumAlert(symbol));
+    });
+  }
+
+  async function saveEtfPremiumAlert(symbol) {
+    if (_etfAlertPending.has(symbol)) return;
+    const row = [...document.querySelectorAll("[data-etf-alert]")].find(item => item.dataset.etfAlert === symbol);
+    if (!row) return;
+    const enabledInput = row.querySelector("[data-etf-enabled]");
+    const thresholdInput = row.querySelector("[data-etf-threshold]");
+    const threshold = Number(thresholdInput.value);
+    if (!Number.isFinite(threshold) || threshold < 0 || threshold > 100) {
+      flash("阈值须在 0–100% 之间", "error");
+      thresholdInput.focus();
+      return;
+    }
+    const seq = currentRouteSeq();
+    _etfAlertPending.add(symbol);
+    const draft = _etfAlertDrafts.get(symbol) || {};
+    draft.enabled = enabledInput.checked;
+    draft.threshold = thresholdInput.value;
+    _etfAlertDrafts.set(symbol, draft);
+    renderEtfAlertSettings();
+    try {
+      const item = await api(`/api/me/etf-premium-alerts/${encodeURIComponent(symbol)}`, {
+        method: "PUT",
+        body: JSON.stringify({ enabled: enabledInput.checked, threshold_pct: threshold }),
+      });
+      if (!routeStillActive(seq)) return;
+      const items = (_etfAlertData?.items || []).filter(entry => entry.symbol !== symbol);
+      _etfAlertData = { ..._etfAlertData, items: [...items, item] };
+      _etfAlertDrafts.delete(symbol);
+      flash(`${item.name || symbol} 溢价提醒已保存`);
+    } catch (err) {
+      if (routeStillActive(seq)) flash("ETF 溢价提醒保存失败：" + err.message, "error");
+    } finally {
+      _etfAlertPending.delete(symbol);
+      if (routeStillActive(seq)) renderEtfAlertSettings();
+    }
+  }
+
   function switchSettingsTab(name) {
     // 设置页分段导航：推送 / 渠道绑定 / AI 网关 / 账号设置
     if (!SETTINGS_TABS.includes(name)) name = "push";
@@ -753,5 +861,7 @@ export function createPushSettingsView(dependencies) {
     filterKolImageSettings,
     toggleKolImages,
     loadKolImageSettings,
+    loadEtfAlertSettings,
+    saveEtfPremiumAlert,
   };
 }

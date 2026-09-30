@@ -1855,9 +1855,43 @@ body.lightbox-open { overflow: hidden; }
 .market-change.positive, .market-spark.positive { color: var(--color-data-positive); }
 .market-change.negative, .market-spark.negative { color: var(--color-data-negative); }
 .market-change.flat, .market-spark.flat { color: var(--color-text-muted); }
+.market-etf { border-top: 1px solid var(--color-border); margin-top: var(--space-3); padding-top: var(--space-3); }
+.market-etf-row { border-top: 1px solid var(--color-border); padding: var(--space-2) 0; }
+.market-etf-name, .market-etf-times, .market-etf-alert, .market-etf-empty { display: flex; gap: var(--space-2); align-items: baseline; font-size: var(--text-xs); }
+.market-etf-name { justify-content: space-between; }
+.market-etf-name span, .market-etf-times, .market-etf-empty { color: var(--color-text-muted); }
+.market-etf-values { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-2); margin: var(--space-2) 0; }
+.market-etf-values div { min-width: 0; }
+.market-etf-values dt { color: var(--color-text-muted); font-size: 11px; }
+.market-etf-values dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
+.market-etf-alert { border-top: 1px solid var(--color-border); padding-top: var(--space-2); margin-top: var(--space-1); flex-wrap: wrap; }
+.market-etf-alert strong { color: var(--color-accent-text); }
+.market-etf-alert time { color: var(--color-text-muted); }
+
 .market-footer { display: flex; align-items: center; justify-content: space-between; gap: var(--space-2); min-height: 24px; margin-top: var(--space-2); }
 .market-retry { border: 0; background: transparent; color: var(--color-accent-text); font-size: var(--text-xs); min-height: 32px; padding: 0 var(--space-2); }
 .market-retry:disabled { color: var(--color-text-muted); cursor: wait; }
+.market-etf { margin-top: var(--space-4); padding-top: var(--space-3); border-top: var(--border-soft); }
+.market-etf-list { margin-top: var(--space-2); }
+.market-etf-row { padding: 8px 0; border-bottom: var(--border-soft); }
+.market-etf-row:last-child { border-bottom: 0; }
+.market-etf-name { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.market-etf-name strong { color: var(--color-text-strong); font-size: var(--text-sm); }
+.market-etf-name span, .market-etf-time, .market-etf-empty, .market-etf-note { color: var(--color-text-muted); font-size: var(--text-xs); }
+.market-etf-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; margin: 6px 0 2px; }
+.market-etf-values div { min-width: 0; }
+.market-etf-values dt { color: var(--color-text-muted); font-size: var(--text-xs); }
+.market-etf-values dd { margin: 1px 0 0; color: var(--color-text-strong); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.market-etf-values dd.positive { color: var(--color-data-positive); }
+.market-etf-values dd.negative { color: var(--color-data-negative); }
+.market-etf-times { display: grid; gap: 2px; margin-top: 2px; }
+.market-etf-time { color: var(--color-text-muted); font-size: var(--text-xs); }
+.market-etf-alert { display: grid; gap: 2px; margin-top: var(--space-3); padding-top: var(--space-3); border-top: var(--border-soft); font-size: var(--text-xs); }
+.market-etf-alert strong { color: var(--color-text-strong); }
+.market-etf-alert span { color: var(--color-text); font-variant-numeric: tabular-nums; }
+.market-etf-alert time { color: var(--color-text-muted); }
+.market-etf-empty { margin: var(--space-3) 0 0; }
+.market-etf-note { margin: 6px 0 0; }
 .tl-rail-rec { display: flex; align-items: center; gap: 10px; min-height: 44px; }
 .tl-rail-rec + .tl-rail-rec { margin-top: 8px; }
 .tl-rail-rec .kol-avatar { width: 36px; height: 36px; flex-shrink: 0; }
@@ -3286,6 +3320,21 @@ button.linkish:hover { text-decoration: underline; }
 .kol-images-switch input:disabled ~ span { opacity: 0.55; cursor: default; }
 .kol-images-local-state { display: flex; align-items: center; gap: 12px; min-height: 44px; }
 .kol-images-local-state .muted { margin: 0; }
+.etf-alert-list { display: grid; gap: 10px; }
+.etf-alert-row { display: grid; grid-template-columns: minmax(130px, 1fr) auto minmax(128px, auto) auto; align-items: center; gap: 10px; padding: 10px 0; border-bottom: var(--border-soft); }
+.etf-alert-row:last-child { border-bottom: 0; }
+.etf-alert-name { display: grid; gap: 2px; min-width: 0; }
+.etf-alert-name strong { color: var(--color-text-strong); font-size: var(--text-sm); }
+.etf-alert-name span { color: var(--color-text-muted); font-size: var(--text-xs); }
+.etf-alert-switch { min-height: 36px; }
+.etf-alert-threshold { display: inline-flex; align-items: center; gap: 5px; color: var(--color-text-muted); font-size: var(--text-sm); white-space: nowrap; }
+.etf-alert-threshold .form-control { width: 82px; min-height: 36px; padding: 6px 8px; }
+.etf-alert-result { grid-column: 1 / -1; min-height: 0; color: var(--color-data-negative); font-size: var(--text-xs); }
+@media (max-width: 600px) {
+  .etf-alert-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+  .etf-alert-threshold { grid-column: 1; }
+  .etf-alert-row [data-etf-save] { grid-column: 2; grid-row: 2; }
+}
 .dnd-form { display: flex; flex-direction: column; gap: 16px; margin-top: 4px; max-width: 560px; }
 .dnd-range-field { display: flex; flex-direction: column; gap: 6px; }
 .dnd-range-label { font-size: var(--text-xs); color: var(--color-text-muted); font-variant-numeric: tabular-nums; }

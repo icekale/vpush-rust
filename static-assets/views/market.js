@@ -51,6 +51,77 @@ export function createMarketView({ api, escapeHtml }) {
     const snapshots = {};
     const pending = new Set();
     const failures = new Set();
+    let etfSnapshot = null;
+    let etfPending = false;
+    let etfFailed = false;
+
+    function etfValue(value, suffix = "") {
+      return Number.isFinite(value) ? `${number(value)}${suffix}` : "--";
+    }
+
+    function etfTime(value) {
+      if (!value) return "暂无报价时间";
+      const date = new Date(value);
+      return Number.isFinite(date.getTime()) ? `${timeFormat.format(date)}（北京时间）` : "报价时间未知";
+    }
+
+    function renderEtfSection() {
+      const previous = host.querySelector("#market-etf-premiums");
+      const items = etfSnapshot?.items || [];
+      const stale = etfFailed || etfSnapshot?.items?.some(item => item.stale || item.status === "stale");
+      const status = etfPending && !etfSnapshot ? "加载中"
+        : etfFailed && !items.length ? "暂不可用"
+        : items.some(item => item.status === "closed") ? "已收盘"
+        : stale ? "更新延迟"
+        : items.some(item => item.status === "reference_only") ? "参考值"
+        : items.some(item => item.status === "live") ? "交易中" : "暂无数据";
+      const rows = [["513100", "纳指ETF国泰"], ["513500", "标普500ETF博时"]].map(([symbol, fallbackName]) => {
+        const item = items.find(entry => entry.symbol === symbol) || { symbol, name: fallbackName };
+        const statusLabel = item.status === "closed" ? "收盘" : item.status === "reference_only" ? "参考值" : item.status === "stale" || item.stale ? "延迟" : item.status === "unavailable" || item.reference_type === "unavailable" ? "参考值不可用" : "实时";
+        const premiumTone = Number.isFinite(item.premium_rate) ? tone(item.premium_rate) : "flat";
+        return `<div class="market-etf-row">
+          <div class="market-etf-name"><strong>${escapeHtml(item.name || fallbackName)}</strong><span>${escapeHtml(symbol)} · ${statusLabel}</span></div>
+          <dl class="market-etf-values">
+            <div><dt>现价</dt><dd>${etfValue(item.market_price)}</dd></div>
+            <div><dt>IOPV</dt><dd>${item.reference_type === "unavailable" ? "--" : etfValue(item.reference_value)}</dd></div>
+            <div><dt>溢价率</dt><dd class="${premiumTone}">${etfValue(item.premium_rate, "%")}</dd></div>
+          </dl>
+          <div class="market-etf-times">
+            <time class="market-etf-time" datetime="${escapeHtml(item.market_at || "")}">报价时间 · ${escapeHtml(etfTime(item.market_at))}</time>
+            ${item.reference_at ? `<time class="market-etf-time" datetime="${escapeHtml(item.reference_at)}">IOPV 时间 · ${escapeHtml(etfTime(item.reference_at))}</time>` : ""}
+          </div>
+        </div>`;
+      }).join("");
+      const alert = etfSnapshot?.latest_alert;
+      const alertStatus = alert?.delivery_status === "sent" ? "已发送" : alert?.delivery_status === "failed" ? "发送失败" : alert?.delivery_status === "suppressed" ? "未发送" : alert?.delivery_status === "pending" ? "发送中" : "";
+      const alertHtml = alert ? `<div class="market-etf-alert" role="status">
+        <strong>最近触发${alertStatus ? ` · ${alertStatus}` : ""}</strong><span>${escapeHtml(alert.name)} · ${etfValue(alert.triggered_pct, "%")}（阈值 ${etfValue(alert.threshold_pct, "%")}）</span>
+        <time datetime="${escapeHtml(alert.triggered_at || "")}">触发时间 · ${escapeHtml(etfTime(alert.triggered_at))}</time>
+      </div>` : `<p class="market-etf-empty">暂无触发记录</p>`;
+      const html = `<section class="market-etf" id="market-etf-premiums" aria-labelledby="market-etf-title">
+        <div class="market-heading"><h3 class="tl-rail-title" id="market-etf-title">ETF 溢价</h3><span class="market-status">${status}</span></div>
+        <div class="market-etf-list">${rows}</div>${alertHtml}
+        ${stale ? `<p class="market-etf-note">保留最近数据，当前报价更新延迟</p>` : `<p class="market-etf-note">溢价率仅供参考，IOPV 实时性未独立验证，当前不发送提醒</p>`}
+      </section>`;
+      if (previous) previous.outerHTML = html;
+      else host.insertAdjacentHTML("beforeend", html);
+    }
+
+    function refreshEtfPremiums() {
+      if (!active || document.visibilityState === "hidden" || etfPending) return;
+      etfPending = true;
+      renderEtfSection();
+      api("/api/market/etf-premiums").then(data => {
+        if (!active || !host.isConnected) return;
+        etfSnapshot = data;
+        etfFailed = false;
+      }).catch(() => {
+        etfFailed = true;
+      }).finally(() => {
+        etfPending = false;
+        if (active && host.isConnected) renderEtfSection();
+      });
+    }
 
     function render() {
       const focus = host.contains(document.activeElement) && document.activeElement.matches(":focus-visible")
@@ -100,6 +171,7 @@ export function createMarketView({ api, escapeHtml }) {
           ${stale ? `<button type="button" class="market-retry" data-market-focus="retry" ${pending.has(group) ? "disabled" : ""}>重试</button>` : ""}
           <span title="报价时间（北京时间）">${oldest ? `<time datetime="${oldest.toISOString()}">${escapeHtml(timeFormat.format(oldest))}</time>` : "--"}</span>
         </div>`;
+      renderEtfSection();
       host.querySelectorAll("[data-market-group]").forEach(button => button.addEventListener("click", () => {
         selection = button.dataset.marketGroup;
         group = selection;
@@ -117,6 +189,7 @@ export function createMarketView({ api, escapeHtml }) {
 
     async function refresh() {
       if (!active || document.visibilityState === "hidden") return;
+      refreshEtfPremiums();
       const next = selection === "auto" ? automaticGroup() : selection;
       if (next !== group) { group = next; render(); }
       if (pending.has(group)) return;

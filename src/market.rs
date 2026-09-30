@@ -327,11 +327,15 @@ fn minute_code(symbol: &str) -> &'static str {
 }
 
 fn http_text(url: &str) -> Option<String> {
+    http_text_with_referer(url, "")
+}
+
+pub(crate) fn http_text_with_referer(url: &str, referer: &str) -> Option<String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(8))
         .timeout_read(Duration::from_secs(8))
         .build();
-    let resp = agent.get(url).call().ok()?;
+    let resp = agent.get(url).set("Referer", referer).call().ok()?;
     let mut bytes = Vec::new();
     resp.into_reader().read_to_end(&mut bytes).ok()?;
     Some(bytes.iter().map(|b| *b as char).collect())
@@ -391,7 +395,7 @@ fn parse_quotes(text: &str, group: &str) -> Result<Vec<Quote>, ()> {
     }
 }
 
-fn quote_records(text: &str) -> HashMap<&str, &str> {
+pub(crate) fn quote_records(text: &str) -> HashMap<&str, &str> {
     let mut out = HashMap::new();
     for chunk in text.split("v_") {
         let Some((symbol, rest)) = chunk.split_once("=\"") else {
@@ -806,11 +810,36 @@ fn civil_unix(civil: &Civil) -> i64 {
         + civil.second as i64
 }
 
-fn now_unix() -> i64 {
+pub(crate) fn now_unix() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+pub(crate) fn mainland_quote_time(raw: &str) -> Option<(String, i64)> {
+    let civil = parse_compact(raw)?;
+    if !(1..=12).contains(&civil.month)
+        || !(1..=31).contains(&civil.day)
+        || civil.hour > 23
+        || civil.minute > 59
+        || civil.second > 59
+    {
+        return None;
+    }
+    let unix = civil_unix(&civil);
+    let normalized = from_unix(unix);
+    if (civil.year, civil.month, civil.day) != (normalized.year, normalized.month, normalized.day) {
+        return None;
+    }
+    Some((format_iso(&civil, 480), unix - 8 * 3600))
+}
+
+pub(crate) fn mainland_open(now: i64) -> bool {
+    let local = now + 8 * 3600;
+    let weekday = (local.div_euclid(86400) + 3).rem_euclid(7);
+    let second = local.rem_euclid(86400);
+    weekday < 5 && ((34200..=41400).contains(&second) || (46800..=54000).contains(&second))
 }
 
 fn days_from_civil(mut year: i32, month: u32, day: u32) -> i64 {

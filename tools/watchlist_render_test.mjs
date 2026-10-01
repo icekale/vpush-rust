@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { alertPayloadFromValues, createWatchlistView, normalizeMarketSnapshot, parseRealtimeData, renderMarketTemperatureMarkup, renderWatchlistMarkup } from "../static-assets/views/watchlist.js";
+import { alertPayloadFromValues, createWatchlistView, normalizeA500Data, normalizeMarketSnapshot, parseRealtimeData, renderA500Tabs, renderMarketTemperatureMarkup, renderWatchlistMarkup } from "../static-assets/views/watchlist.js";
 
 test("watchlist renders loading, empty, unavailable, and zero states", () => {
   assert.match(renderWatchlistMarkup({ loading: true }), /正在加载自选股/);
@@ -27,6 +27,22 @@ test("parses the published a500 realtime payload", () => {
   const payload = parseRealtimeData('window.__RT = {"temperature":41,"fresh":true};');
   assert.equal(payload.temperature, 41);
   assert.equal(payload.fresh, true);
+});
+test("renders all A500 project sections from the owned aggregate", () => {
+  const data = normalizeA500Data({
+    schema_version: 1,
+    generated_at: "2026-10-01T05:06:27Z",
+    a500: { temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4, fresh: true, delayed: false, market: false, ts: "2026-10-01 12:04:49", temperature_history: [{ date: "2026-10-01", value: 41 }], pe_history: [{ date: "2026-10-01", value: 16.31 }] },
+    dividend: { light_score: 74, light_label: "偏冷", pe: 8.24, dividend_yield: 4.39, spread: 1.2, etf_premium: -0.4, temp_history: [{ date: "2026-10-01", value: 52 }] },
+    transition: { date: "2026-09-29", temperature: 61.6, band: "温和区", indicators: [{ name: "就业", score: 70 }] },
+  }, new Date("2026-10-01T05:10:00Z"));
+  assert.equal(data.a500.available, true);
+  const html = renderA500Tabs(data);
+  assert.match(html, /A500 温度/);
+  assert.match(html, /红利低波/);
+  assert.match(html, /经济健康/);
+  assert.match(html, /就业/);
+  assert.match(html, /74/);
 });
 test("market snapshot renders a fresh A500 temperature card and rejects stale data", () => {
   const snapshot = normalizeMarketSnapshot({

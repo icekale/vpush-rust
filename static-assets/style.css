@@ -5166,7 +5166,39 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-state-panel strong { color: var(--color-text-strong); }
 .watch-state-panel .btn-ghost { min-height: 36px; margin-top: 4px; }
 .watch-state-error strong { color: var(--color-danger); }
-.watch-temperature { margin-top: 8px; }
+.watch-a500 { margin-top: 8px; }
+.watch-a500-tabs .settings-tabs { margin-bottom: var(--space-4); }
+.watch-a500-panel-body { display: grid; gap: 16px; }
+.watch-a500-score { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.watch-a500-score > div { display: grid; gap: 3px; }
+.watch-a500-kicker, .watch-a500-score > div > span:last-child, .watch-a500-source, .watch-a500-muted, .watch-a500-description, .watch-a500-metrics span, .watch-a500-line-grid span, .watch-a500-line-grid small, .watch-a500-indicator span, .watch-a500-indicator small { color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-a500-score > div > strong { color: var(--color-text-strong); font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; }
+.watch-a500-score > div > span:last-child { color: var(--color-text); font-size: var(--text-sm); }
+.watch-a500-emoji { font-size: 28px; }
+.watch-a500-description, .watch-a500-source { margin: 0; }
+.watch-a500-metrics, .watch-a500-line-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.watch-a500-metrics > div, .watch-a500-line-grid > div { display: grid; gap: 4px; min-width: 0; padding: 10px 12px; border: var(--border-soft); border-radius: var(--radius-sm); background: var(--color-bg-muted); }
+.watch-a500-metrics strong, .watch-a500-line-grid strong { color: var(--color-text-strong); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.watch-a500-columns { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+.watch-a500-columns h4, .watch-a500-indicators h4 { margin: 0 0 8px; color: var(--color-text-strong); font-size: var(--text-sm); }
+.watch-a500-history { display: grid; gap: 7px; }
+.watch-a500-history-row { display: grid; grid-template-columns: 72px minmax(0, 1fr) 56px; align-items: center; gap: 8px; color: var(--color-text-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.watch-a500-history-row i { display: block; height: 6px; overflow: hidden; border-radius: var(--radius-pill); background: var(--color-bg-muted); }
+.watch-a500-history-row b { display: block; height: 100%; border-radius: inherit; background: var(--color-accent); }
+.watch-a500-history-row strong { color: var(--color-text); text-align: right; }
+.watch-a500-indicators { display: grid; gap: 1px; }
+.watch-a500-indicator { display: grid; grid-template-columns: minmax(0, 1fr) 42px minmax(130px, .8fr); align-items: center; gap: 8px; padding: 8px 0; border-top: var(--border-soft); }
+.watch-a500-indicator > div { display: grid; gap: 2px; min-width: 0; }
+.watch-a500-indicator > strong { color: var(--color-text-strong); text-align: right; font-variant-numeric: tabular-nums; }
+.watch-a500-indicator small { text-align: right; }
+.watch-a500-unavailable { display: flex; align-items: center; gap: 12px; }
+.watch-a500-unavailable p { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); }
+@media (max-width: 640px) {
+  .watch-a500-columns, .watch-a500-metrics, .watch-a500-line-grid { grid-template-columns: 1fr 1fr; }
+  .watch-a500-indicator { grid-template-columns: minmax(0, 1fr) 42px; }
+  .watch-a500-indicator small { grid-column: 1 / -1; text-align: left; }
+}
+
 .watch-temperature-card { display: grid; gap: 16px; }
 .watch-temperature-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
 .watch-temperature-kicker, .watch-temperature-label, .watch-temperature-meta, .watch-temperature-scale-label, .watch-temperature-source, .watch-temperature-metrics span { color: var(--color-text-muted); font-size: var(--text-xs); }

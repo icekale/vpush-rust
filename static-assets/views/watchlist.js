@@ -4,7 +4,8 @@ const STATUS_LABELS = { live: "交易中", closed: "休市", stale: "更新延�
 const DELIVERY_LABELS = {
   sent: "已发送", failed: "发送失败", suppressed: "已抑制", pending: "发送中",
 };
-const MARKET_TEMPERATURE_URL = "https://jinleiviva.github.io/a500/realtime_data.js";
+const A500_DATA_URL = "https://icekale.github.io/a500/vpush_data.json";
+const A500_DATA_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 const MARKET_TEMPERATURE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TEMPERATURE_LABELS = { cold: "偏冷", normal: "正常", hot: "偏热", overheated: "过热", unavailable: "暂不可用" };
 
@@ -88,12 +89,57 @@ function renderMarketTemperatureMarkup(snapshot) {
   return `<div class="watch-temperature-card" data-watch-temperature-state>
     <div class="watch-temperature-hero"><div><span class="watch-temperature-kicker">中国A500</span><strong class="watch-temperature-value">${snapshot.temperature}<small>°</small></strong><span class="watch-temperature-label">${escapeFallback(snapshot.temperatureLabel)}</span></div><div class="watch-temperature-meta"><span class="watch-status watch-status-${snapshot.market_status === "live" ? "live" : "stale"}">${snapshot.market_status === "live" ? "交易中" : "收盘"}</span><span>${escapeFallback(snapshot.updatedLabel)}</span></div></div>
     <div class="watch-temperature-scale" aria-label="市场温度 ${snapshot.temperature} 度"><span class="watch-temperature-marker" style="left:${marker}%"></span><span class="watch-temperature-scale-label">偏冷</span><span class="watch-temperature-scale-label">正常</span><span class="watch-temperature-scale-label">偏热</span></div>
-    <div class="watch-temperature-metrics"><div><span>PE-TTM</span><strong>${number(snapshot.pe)}</strong></div><div><span>PE 分位</span><strong>${number(snapshot.pe_percentile)}%</strong></div><div><span>价格分位</span><strong>${number(snapshot.price_percentile)}%</strong></div><div><span>指数涨跌</span><strong class="${tone(snapshot.change)}">${percent(snapshot.change)}</strong></div></div>
-    <div class="watch-temperature-source">数据源：a500 · 更新于 ${escapeFallback(snapshot.updatedLabel)}</div>
+    <div class="watch-temperature-metrics"><div><span>PE-TTM</span><strong>${number(snapshot.pe)}</strong></div><div><span>PE 分位</span><strong>${number(snapshot.pe_percentile)}%</strong></div><div><span>价格分位</span><strong>${number(snapshot.price_percentile)}%</strong></div><div><span>指数涨跌</span><strong class="${tone(snapshot.change)}">${percent(snapshot.change)}</strong></div><div><span>股债利差</span><strong>${number(snapshot.stockYield)}%</strong></div><div><span>定投比例</span><strong>${number(snapshot.dcaPct)}%</strong></div></div>
+    <div class="watch-a500-columns"><div><h4>温度历史</h4>${historyMarkup(snapshot.temperature_history, "temp", "°")}</div><div><h4>PE 历史</h4>${historyMarkup(snapshot.pe_history, "pe", "")}</div></div>
+    <div class="watch-temperature-source">数据源：a500 · ${escapeFallback(snapshot.dcaLabel || "定投策略数据") } · 更新于 ${escapeFallback(snapshot.updatedLabel)}</div>
   </div>`;
 }
+function normalizeA500Data(payload, now = new Date()) {
+  if (!payload || payload.schema_version !== 1 || !payload.a500 || !payload.dividend || !payload.transition) return { available: false, reason: "数据格式无效" };
+  const generated = payload.generated_at ? new Date(payload.generated_at) : null;
+  const age = generated && Number.isFinite(generated.getTime()) ? now.getTime() - generated.getTime() : Infinity;
+  const dataFresh = age >= 0 && age <= A500_DATA_MAX_AGE_MS;
+  const a500 = normalizeMarketSnapshot(payload.a500, now);
+  return {
+    available: dataFresh,
+    generated_at: payload.generated_at,
+    age,
+    a500: { ...a500, available: a500.available && dataFresh, reason: dataFresh ? a500.reason : "数据延迟" },
+    dividend: payload.dividend || {},
+    transition: payload.transition || {},
+    reason: dataFresh ? a500.reason : "数据延迟",
+  };
+}
 
+function historyMarkup(items, valueKey, suffix = "") {
+  const rows = Array.isArray(items) ? items.slice(-8) : [];
+  if (!rows.length) return `<p class="watch-a500-muted">暂无历史数据</p>`;
+  const values = rows.map(row => Number(row[valueKey])).filter(Number.isFinite);
+  const max = Math.max(...values, 1);
+  return `<div class="watch-a500-history">${rows.map(row => {
+    const value = Number(row[valueKey]);
+    const width = Number.isFinite(value) ? Math.max(5, Math.min(100, value / max * 100)) : 5;
+    return `<div class="watch-a500-history-row"><span>${escapeFallback(row.d || row.date || "--")}</span><i><b style="width:${width}%"></b></i><strong>${Number.isFinite(value) ? value.toFixed(2) : "--"}${suffix}</strong></div>`;
+  }).join("")}</div>`;
+}
 
+function renderDividendPanel(data) {
+  const d = data.dividend || {};
+  const metrics = [["PE", d.pe, "", d.pe_date], ["PE 分位", d.pe_percentile, "%", "估值位置"], ["股息率", d.dividend_yield, "%", d.dividend_yield_date], ["股息率分位", d.dividend_yield_percentile, "%", "股息位置"], ["PB", d.pb, "", ""], ["ROE", d.roe, "%", ""], ["10Y 国债", d.bond_yield, "%", ""], ["股债利差", d.spread, "%", ""], ["ETF 价格", d.etf_price, "", d.etf_update_time], ["ETF 溢价", d.etf_premium, "%", ""], ["ETF 成交额", d.etf_volume, "", ""], ["ETF 规模", d.etf_size, "", ""]];
+  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">红利低波温度</span><strong>${escapeFallback(d.light_score ?? "--")}</strong><span>${escapeFallback(d.light_label || "暂无评级")}</span></div><span class="watch-status watch-status-live">${escapeFallback(d.update_time || "数据日期未知")}</span></div><div class="watch-a500-metrics">${metrics.map(([label, value, suffix, date]) => `<div><span>${label}</span><strong>${isNumber(value) ? number(value) + suffix : "--"}</strong><small>${escapeFallback(date || "")}</small></div>`).join("")}</div><div class="watch-a500-columns"><div><h4>红利率历史</h4>${historyMarkup(d.dividend_history, "v", "%")}</div><div><h4>红利温度历史</h4>${historyMarkup(d.temp_history, "t", "°")}</div></div><p class="watch-a500-source">数据源：a500 红利低波数据 · 权重：${escapeFallback(d.light_weights || "--")} · ${escapeFallback(d.trend_reason || "趋势状态未知")}</p></div>`;
+}
+
+function renderTransitionPanel(data) {
+  const t = data.transition || {};
+  const lines = Object.values(t.lineScores || {});
+  const indicators = Array.isArray(t.indicators) ? t.indicators : Object.values(t.indicators || {});
+  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">经济健康温度</span><strong>${isNumber(t.temperature) ? t.temperature.toFixed(1) : "--"}</strong><span>${escapeFallback(t.band || "暂无区间")}</span></div><span class="watch-a500-emoji">${escapeFallback(t.emoji || "")}</span></div><p class="watch-a500-description">${escapeFallback(t.description || "暂无说明")}</p><div class="watch-a500-line-grid">${lines.map(line => `<div><span>${escapeFallback(line.name)}</span><strong>${isNumber(line.score) ? line.score.toFixed(1) : "--"}</strong><small>权重 ${isNumber(line.weight) ? line.weight.toFixed(1) : "--"}%</small></div>`).join("")}</div><div class="watch-a500-indicators"><h4>指标明细</h4>${indicators.map(item => `<div class="watch-a500-indicator"><div><strong>${escapeFallback(item.name || "未命名指标")}</strong><span>${escapeFallback(item.label || "")}</span></div><strong>${isNumber(item.score) ? item.score.toFixed(0) : "--"}</strong><small>${isNumber(item.value) ? item.value : "--"} · ${escapeFallback(item.date || "日期未知")} · ${escapeFallback(item.source || "来源未知")}${item.stale ? ` · 数据较旧${isNumber(item.stale_days) ? ` ${item.stale_days} 天` : ""}` : ""}</small></div>`).join("")}</div><p class="watch-a500-source">数据日期：${escapeFallback(t.date || "未知")} · 指标来源与更新时间随原项目数据同步。</p></div>`;
+}
+
+function renderA500Tabs(data) {
+  if (!data?.available) return `<div class="watch-a500-unavailable"><span class="watch-status watch-status-unavailable">${escapeFallback(data?.reason || "暂不可用")}</span><p>自有 A500 数据源暂时不可用，暂不展示旧读数。</p></div>`;
+  return `<div class="watch-a500-tabs" data-a500-tabs><div class="settings-tabs" role="tablist" aria-label="A500 数据分页"><button type="button" class="settings-tab active" role="tab" aria-selected="true" aria-controls="a500-panel-temperature" data-a500-tab="temperature">A500 温度</button><button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="a500-panel-dividend" data-a500-tab="dividend">红利低波</button><button type="button" class="settings-tab" role="tab" aria-selected="false" aria-controls="a500-panel-transition" data-a500-tab="transition">经济健康</button></div><div id="a500-panel-temperature" role="tabpanel" data-a500-panel="temperature">${renderMarketTemperatureMarkup(data.a500)}</div><div id="a500-panel-dividend" role="tabpanel" data-a500-panel="dividend" hidden>${renderDividendPanel(data)}</div><div id="a500-panel-transition" role="tabpanel" data-a500-panel="transition" hidden>${renderTransitionPanel(data)}</div></div>`;
+}
 function targetValue(alert) {
   return alert?.target == null ? "" : String(alert.target);
 }
@@ -152,9 +198,9 @@ function itemMarkup(item, escapeHtml) {
   </article>`;
 }
 
-export { normalizeMarketSnapshot, parseRealtimeData, renderMarketTemperatureMarkup };
+export { normalizeA500Data, normalizeMarketSnapshot, parseRealtimeData, renderA500Tabs, renderMarketTemperatureMarkup };
 
-export function renderWatchlistMarkup({ items = [], loading = false, error = "", marketTemperature = null, escapeHtml: escape = escapeFallback } = {}) {
+export function renderWatchlistMarkup({ items = [], loading = false, error = "", a500Data = null, marketTemperature = null, escapeHtml: escape = escapeFallback } = {}) {
   const list = Array.isArray(items) ? items : [];
   const listHtml = loading
     ? `<div class="watch-state-panel" role="status"><strong>正在加载自选股</strong><span>从服务器读取最新缓存报价…</span></div>`
@@ -171,7 +217,7 @@ export function renderWatchlistMarkup({ items = [], loading = false, error = "",
       <p class="watch-search-note">支持按股票名称或代码搜索；搜索结果来自可用数据源。</p><div class="watch-search-results" data-watch-search-results aria-live="polite"></div>
     </section>
     <section class="watchlist-section" aria-labelledby="watch-items-title"><div class="watch-section-heading"><h3 class="section-title" id="watch-items-title">我的自选</h3><span class="watch-list-state" data-watch-list-state>${loading ? "加载中" : error ? "加载失败" : `${list.length} 个标的`}</span></div><div data-watch-list>${listHtml}</div></section>
-    <section class="section-panel watch-temperature" aria-labelledby="watch-temperature-title"><div class="section-head"><h3 class="section-title" id="watch-temperature-title">市场温度</h3><p class="section-meta">来源：a500 · 不展示过期读数</p></div><div data-watch-temperature-content>${renderMarketTemperatureMarkup(marketTemperature)}</div></section>
+    <section class="section-panel watch-a500" aria-labelledby="watch-a500-title"><div class="section-head"><h3 class="section-title" id="watch-a500-title">A500 市场研究</h3><p class="section-meta">自有数据源 · 不展示过期读数</p></div><div data-watch-a500-content>${renderA500Tabs(a500Data || (marketTemperature ? { available: marketTemperature.available, a500: marketTemperature } : null))}</div></section>
   </div>`;
 }
 
@@ -179,7 +225,7 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
   const escape = escapeHtml;
   let active = false;
   let timer = null;
-  let temperatureTimer = null;
+  let a500Timer = null;
   let host = null;
   let dirtyRules = new Set();
   let latestItems = [];
@@ -199,9 +245,9 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     actionSeq += 1;
     requestSeq += 1;
     if (timer) clearInterval(timer);
-    if (temperatureTimer) clearInterval(temperatureTimer);
+    if (a500Timer) clearInterval(a500Timer);
     timer = null;
-    temperatureTimer = null;
+    a500Timer = null;
     if (searchTimer) clearTimeout(searchTimer);
     searchTimer = null;
     searchSeq += 1;
@@ -405,17 +451,29 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     removeListeners = () => { listeners.forEach(remove => remove()); };
   }
 
-  async function loadMarketTemperature(seq) {
+  function bindA500Tabs() {
+    host?.querySelectorAll("[data-a500-tab]").forEach(button => button.addEventListener("click", () => {
+      const name = button.dataset.a500Tab;
+      host.querySelectorAll("[data-a500-tab]").forEach(tab => {
+        const selected = tab === button;
+        tab.classList.toggle("active", selected);
+        tab.setAttribute("aria-selected", String(selected));
+      });
+      host.querySelectorAll("[data-a500-panel]").forEach(panel => { panel.hidden = panel.dataset.a500Panel !== name; });
+    }));
+  }
+
+  async function loadA500(seq) {
     const request = ++temperatureRequest;
-    const content = host?.querySelector("[data-watch-temperature-content]");
+    const content = host?.querySelector("[data-watch-a500-content]");
     if (!content || typeof fetchSnapshot !== "function") return;
     try {
-      const response = await fetchSnapshot(`${MARKET_TEMPERATURE_URL}?v=${Date.now()}`, { cache: "no-store" });
+      const response = await fetchSnapshot(`${A500_DATA_URL}?v=${Date.now()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      const snapshot = normalizeMarketSnapshot(parseRealtimeData(await response.text()));
-      if (isCurrent(seq) && request === temperatureRequest) content.innerHTML = renderMarketTemperatureMarkup(snapshot);
+      const data = normalizeA500Data(await response.json());
+      if (isCurrent(seq) && request === temperatureRequest) { content.innerHTML = renderA500Tabs(data); bindA500Tabs(); }
     } catch {
-      if (isCurrent(seq) && request === temperatureRequest) content.innerHTML = renderMarketTemperatureMarkup({ available: false, reason: "暂不可用" });
+      if (isCurrent(seq) && request === temperatureRequest) content.innerHTML = renderA500Tabs({ available: false, reason: "暂不可用" });
     }
   }
 
@@ -459,11 +517,13 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     if (!host) return;
     host.innerHTML = renderWatchlistMarkup({ loading: true, escapeHtml });
     bindEvents(seq);
-    loadMarketTemperature(seq);
-    temperatureTimer = setInterval(() => loadMarketTemperature(seq), 300000);
+    loadA500(seq);
+    a500Timer = setInterval(() => loadA500(seq), 300000);
+    a500Timer.unref?.();
     await refresh(seq);
     if (!isCurrent(seq)) return;
     timer = setInterval(() => refresh(seq), 30000);
+    timer.unref?.();
   }
 
   return { renderWatchlist, stopWatchlist: stop, getLatestItems: () => latestItems };

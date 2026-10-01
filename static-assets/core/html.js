@@ -33,10 +33,17 @@ export function imgSrcFor(url) {
 
 export function imgOnError(img) {
   // 第三方图床直连失败（大陆访问 X 图床被墙等）→ 经服务端代理转发
-  if (!img || img.dataset.proxied) return;
+  if (!img) return;
   const src = img.getAttribute("src") || "";
-  if (src.startsWith("/api/img-proxy")) return;
+  if (img.dataset.avatarFallback !== undefined && (img.dataset.proxied || src.startsWith("/"))) {
+    const fallback = document.createElement("div");
+    fallback.className = "kol-avatar";
+    fallback.textContent = img.dataset.avatarFallback;
+    img.replaceWith(fallback);
+    return;
+  }
+  if (img.dataset.proxied || src.startsWith("/api/img-proxy")) return;
   img.dataset.proxied = "1";
   img.src = imgProxyUrl(src);
-  img.onerror = null;
+  img.onerror = img.dataset.avatarFallback !== undefined ? () => imgOnError(img) : null;
 }

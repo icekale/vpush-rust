@@ -55,7 +55,7 @@ const GROK_TRANSLATE_ICON = `<svg class="p-tr-grok" viewBox="0 0 33 32" fill="cu
 const CHANNEL_LABELS = { telegram: "Telegram", feishu: "飞书", wecom: "企业微信", bark: "Bark", webpush: "浏览器通知" };
 const USER_CHANNEL_KEYS = ["telegram", "feishu", "wecom", "bark", "webpush"];
 const APP_VERSION = "1.12.278";
-const STATIC_ASSET_VERSION = "watchlist-1";
+const STATIC_ASSET_VERSION = "avatar-nav-1";
 const KEYWORDS_MAX_COUNT = 20;
 const REPORT_WATCH_BLOCKED_TAGS = new Set([
   "中金研报", "宏观经济", "市场策略", "全球研究", "行业研究", "公司研究",
@@ -373,7 +373,7 @@ function avatarText(name) {
 // Truth Social 官方粉勾：压在头像右下角（站外唯一带认证标的平台）
 const TRUTH_CHECK_SVG = `<svg class="vs-check" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="12" fill="#f0426b"/><path d="m6.6 12.6 3.4 3.4 7.4-8" fill="none" stroke="#fff" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"/></svg>`;
 function avatarHtml(name, url, platform) {
-  const inner = url ? `<img class="kol-avatar" src="${escapeHtml(url)}" alt="" loading="lazy">` : `<div class="kol-avatar">${escapeHtml(avatarText(name))}</div>`;
+  const inner = url ? `<img class="kol-avatar" src="${escapeHtml(imgSrcFor(url.replace(/^http:/, "https:")))}" alt="" loading="lazy" data-avatar-fallback="${escapeHtml(avatarText(name))}" onerror="imgOnError(this)">` : `<div class="kol-avatar">${escapeHtml(avatarText(name))}</div>`;
   if (platform !== "truth") return inner;
   return `<span class="avatar-verified">${inner}${TRUTH_CHECK_SVG}</span>`;
 }
@@ -382,10 +382,10 @@ function avatarHtml(name, url, platform) {
 const NAV = [
   { group: "订阅", items: [
     { route: "timeline", icon: LIST_ICON, label: "最新动态" },
-    { route: "market", icon: DASHBOARD_ICON, label: "行情" },
     { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
     { route: "knowledge", icon: BOOK_ICON, label: "研报中心" },
     { route: "home", icon: GRID_ICON, label: "订阅广场" },
+    { route: "market", icon: DASHBOARD_ICON, label: "行情" },
     { route: "settings", icon: GEAR_ICON, label: "个人设置" },
   ]},
   { group: "管理", admin: true, items: [
@@ -456,9 +456,9 @@ function renderSidebar(user) {
 
 const MOBILE_NAV = [
   { route: "timeline", icon: HOME_ICON, label: "动态" },
-  { route: "market", icon: DASHBOARD_ICON, label: "行情" },
   { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
   { route: "home", icon: GRID_ICON, label: "广场" },
+  { route: "market", icon: DASHBOARD_ICON, label: "行情" },
   { route: "settings", icon: USER_ICON, label: "个人设置" },
 ];
 
@@ -2294,7 +2294,7 @@ function tlBadgeAvatarsHtml(posts, max = 3) {
     seen.add(key);
     if (avs.length >= max) break;
     avs.push(p.avatar_url
-      ? `<img src="${escapeHtml(p.avatar_url)}" alt="" onerror="this.remove()">`
+      ? `<img src="${escapeHtml(imgSrcFor(p.avatar_url.replace(/^http:/, "https:")))}" alt="" onerror="this.remove()">`
       : `<span class="ph">${escapeHtml(avatarText(p.kol_name))}</span>`);
   }
   return avs.join("");

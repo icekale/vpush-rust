@@ -1,11 +1,11 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-watchlist-1";
+const CACHE = "dav-shell-avatar-nav-1";
 const SHELL = [
   "/",
-  "/app.9eb834eaac57.js",
+  "/app.eaa164404ede.js",
   // asset-modules:start
   "/core/dialog.b2db015b3a5e.js",
-  "/core/html.817ab2339b89.js",
+  "/core/html.be440515d828.js",
   "/core/icons.7fb4f43f1230.js",
   "/core/lightbox.63db409ddbd8.js",
   "/core/platforms.e3f9b30aa971.js",

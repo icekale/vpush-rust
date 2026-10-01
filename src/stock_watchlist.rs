@@ -895,6 +895,15 @@ fn parse_search_candidates(payload: &Value, market: Market) -> Result<Vec<Instru
         if row.get("Classify").and_then(Value::as_str) != Some(classify) {
             continue;
         }
+        let security_type = row.get("TypeUS").and_then(Value::as_str);
+        let ordinary = match market {
+            Market::Cn => true,
+            Market::Hk => security_type == Some("3"),
+            Market::Us => matches!(security_type, Some("1" | "3")),
+        };
+        if !ordinary {
+            continue;
+        }
         if let Some(code) = row.get("Code").and_then(Value::as_str) {
             if let Ok(instrument) = normalize_symbol(market.as_str(), code) {
                 if seen.insert(instrument.key()) {
@@ -1334,19 +1343,28 @@ mod tests {
         let payload = json!({"QuotationCodeTable":{"Status":0,"Data":[
             {"Code":"600519","Classify":"AStock"},
             {"Code":"510300","Classify":"AStock"},
-            {"Code":"00700","Classify":"HK"},
-            {"Code":"AAPL","Classify":"UsStock"},
+            {"Code":"00700","Classify":"HK","TypeUS":"3"},
+            {"Code":"13005","Classify":"HK","TypeUS":"6"},
+            {"Code":"AAPL","Classify":"UsStock","TypeUS":"1"},
+            {"Code":"TME","Classify":"UsStock","TypeUS":"3"},
+            {"Code":"AAPL24","Classify":"UsStock","TypeUS":"6"},
+            {"Code":"AAPX","Classify":"UsStock","TypeUS":"5"},
             {"Code":"600519","Classify":"AStock"},
             {"Code":"123","Classify":"AStock"}
         ]}});
-        for (market, symbol) in [
-            (Market::Cn, "600519"),
-            (Market::Hk, "00700"),
-            (Market::Us, "AAPL"),
+        for (market, symbols) in [
+            (Market::Cn, vec!["600519"]),
+            (Market::Hk, vec!["00700"]),
+            (Market::Us, vec!["AAPL", "TME"]),
         ] {
             let found = parse_search_candidates(&payload, market).unwrap();
-            assert_eq!(found.len(), 1);
-            assert_eq!(found[0].symbol, symbol);
+            assert_eq!(
+                found
+                    .iter()
+                    .map(|item| item.symbol.as_str())
+                    .collect::<Vec<_>>(),
+                symbols
+            );
         }
         assert!(parse_search_candidates(
             &json!({"QuotationCodeTable":{"Status":1,"Data":[]}}),

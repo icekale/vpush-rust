@@ -9,7 +9,7 @@ use sqlx::Row;
 use crate::db::Db;
 
 const QUOTE_URL: &str = "https://stock.xueqiu.com/v5/stock/batch/quote.json";
-const SEARCH_URL: &str = "https://xueqiu.com/stock/search.json";
+const SEARCH_URL: &str = "https://searchapi.eastmoney.com/api/suggest/get";
 const MAX_SYMBOLS: i64 = 50;
 const MAX_SEARCH: usize = 40;
 const QUOTE_MAX_AGE_MS: i64 = 120_000;
@@ -873,57 +873,57 @@ pub async fn save_alerts(
     )
 }
 
-fn fetch_search(cookie: &str, market: Market, q: &str) -> Result<Vec<Instrument>, String> {
+fn parse_search_candidates(payload: &Value, market: Market) -> Result<Vec<Instrument>, String> {
+    let table = payload
+        .get("QuotationCodeTable")
+        .ok_or_else(|| "搜索源缺少结果表".to_string())?;
+    if table.get("Status").and_then(Value::as_i64) != Some(0) {
+        return Err("搜索源返回异常状态".into());
+    }
+    let rows = table
+        .get("Data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "搜索源缺少结果列表".to_string())?;
+    let classify = match market {
+        Market::Cn => "AStock",
+        Market::Hk => "HK",
+        Market::Us => "UsStock",
+    };
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for row in rows {
+        if row.get("Classify").and_then(Value::as_str) != Some(classify) {
+            continue;
+        }
+        if let Some(code) = row.get("Code").and_then(Value::as_str) {
+            if let Ok(instrument) = normalize_symbol(market.as_str(), code) {
+                if seen.insert(instrument.key()) {
+                    candidates.push(instrument);
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn fetch_search(market: Market, q: &str) -> Result<Vec<Instrument>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
         .timeout_read(Duration::from_secs(5))
         .build();
     let response = agent
         .get(SEARCH_URL)
-        .query("code", q)
-        .query("size", "20")
-        .query("page", "1")
-        .set("User-Agent", crate::xueqiu::APP_UA)
-        .set("Accept", "application/json, text/plain, */*")
-        .set("Referer", "https://xueqiu.com/")
-        .set("Cookie", cookie)
-        .call();
-    let (status, text) = match response {
-        Ok(response) => {
-            let status = response.status();
-            (
-                status,
-                response.into_string().map_err(|err| err.to_string())?,
-            )
-        }
-        Err(ureq::Error::Status(status, response)) => {
-            (status, response.into_string().unwrap_or_default())
-        }
-        Err(err) => return Err(format!("雪球搜索请求失败: {err}")),
-    };
-    if status != 200 {
-        return Err(source_error(status, &text));
-    }
-    let payload: Value = serde_json::from_str(&text).map_err(|_| source_error(status, &text))?;
-    let stocks = payload
-        .get("stocks")
-        .and_then(Value::as_array)
-        .ok_or_else(|| "雪球搜索返回缺少 stocks".to_string())?;
-    let mut candidates = Vec::new();
-    for stock in stocks {
-        if stock.get("state").and_then(Value::as_i64) != Some(1)
-            || stock.get("type").and_then(Value::as_i64) != Some(market.quote_type())
-        {
-            continue;
-        }
-        let Some(code) = stock.get("code").and_then(Value::as_str) else {
-            continue;
-        };
-        if let Ok(instrument) = normalize_symbol(market.as_str(), code) {
-            candidates.push(instrument);
-        }
-    }
-    Ok(candidates)
+        .query("input", q)
+        .query("type", "14")
+        .query("count", "20")
+        .call()
+        .map_err(|err| format!("搜索源请求失败: {err}"))?;
+    let text = response
+        .into_string()
+        .map_err(|err| format!("搜索源响应无效: {err}"))?;
+    let payload: Value =
+        serde_json::from_str(&text).map_err(|err| format!("搜索源响应无效: {err}"))?;
+    parse_search_candidates(&payload, market)
 }
 
 pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError> {
@@ -939,9 +939,8 @@ pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError
         vec![instrument]
     } else {
         tokio::task::spawn_blocking({
-            let cookie = cookie.clone();
             let query = q.to_string();
-            move || fetch_search(&cookie, market, &query)
+            move || fetch_search(market, &query)
         })
         .await
         .map_err(|error| WatchlistError::gateway(error.to_string()))?
@@ -1328,6 +1327,36 @@ mod tests {
         assert_eq!(normalize_symbol("us", "aapl").unwrap().symbol, "AAPL");
         assert!(normalize_symbol("cn", "513100").is_err());
         assert!(normalize_symbol("hk", "700.W").is_err());
+    }
+
+    #[test]
+    fn parses_eastmoney_search_candidates_by_market() {
+        let payload = json!({"QuotationCodeTable":{"Status":0,"Data":[
+            {"Code":"600519","Classify":"AStock"},
+            {"Code":"510300","Classify":"AStock"},
+            {"Code":"00700","Classify":"HK"},
+            {"Code":"AAPL","Classify":"UsStock"},
+            {"Code":"600519","Classify":"AStock"},
+            {"Code":"123","Classify":"AStock"}
+        ]}});
+        for (market, symbol) in [
+            (Market::Cn, "600519"),
+            (Market::Hk, "00700"),
+            (Market::Us, "AAPL"),
+        ] {
+            let found = parse_search_candidates(&payload, market).unwrap();
+            assert_eq!(found.len(), 1);
+            assert_eq!(found[0].symbol, symbol);
+        }
+        assert!(parse_search_candidates(
+            &json!({"QuotationCodeTable":{"Status":1,"Data":[]}}),
+            Market::Cn
+        )
+        .is_err());
+        assert!(
+            parse_search_candidates(&json!({"QuotationCodeTable":{"Status":0}}), Market::Cn)
+                .is_err()
+        );
     }
 
     #[test]

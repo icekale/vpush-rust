@@ -5167,6 +5167,26 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-state-panel .btn-ghost { min-height: 36px; margin-top: 4px; }
 .watch-state-error strong { color: var(--color-danger); }
 .watch-temperature { margin-top: 8px; }
+.watch-temperature-card { display: grid; gap: 16px; }
+.watch-temperature-hero { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; }
+.watch-temperature-kicker, .watch-temperature-label, .watch-temperature-meta, .watch-temperature-scale-label, .watch-temperature-source, .watch-temperature-metrics span { color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-temperature-kicker, .watch-temperature-label { display: block; }
+.watch-temperature-value { display: inline-block; margin-top: 2px; color: var(--color-text-strong); font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; }
+.watch-temperature-value small { margin-left: 2px; color: var(--color-text-muted); font-size: var(--text-lg); font-weight: var(--font-weight-normal); }
+.watch-temperature-label { display: inline-block; margin-left: 10px; color: var(--color-text); font-size: var(--text-sm); }
+.watch-temperature-meta { display: grid; justify-items: end; gap: 5px; text-align: right; }
+.watch-temperature-scale { position: relative; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding-top: 12px; }
+.watch-temperature-scale::before { content: ""; position: absolute; top: 0; left: 0; right: 0; height: 8px; border-radius: var(--radius-pill); background: linear-gradient(90deg, #3a9c72 0 30%, #d6ad42 30% 60%, #d87644 60% 80%, #c75454 80%); }
+.watch-temperature-marker { position: absolute; top: -4px; z-index: 1; width: 16px; height: 16px; margin-left: -8px; border: 3px solid var(--color-surface); border-radius: 50%; background: var(--color-text-strong); box-shadow: 0 0 0 1px var(--color-border-strong); }
+.watch-temperature-scale-label { font-variant-numeric: tabular-nums; text-align: left; }
+.watch-temperature-scale-label:nth-last-child(2) { text-align: center; }
+.watch-temperature-scale-label:last-child { text-align: right; }
+.watch-temperature-metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
+.watch-temperature-metrics > div { display: grid; gap: 4px; min-width: 0; padding: 10px 12px; border: var(--border-soft); border-radius: var(--radius-sm); background: var(--color-bg-muted); }
+.watch-temperature-metrics strong { color: var(--color-text-strong); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.watch-temperature-metrics strong.positive { color: var(--color-data-positive); }
+.watch-temperature-metrics strong.negative { color: var(--color-data-negative); }
+.watch-temperature-source { padding-top: 2px; }
 .watch-temperature-unavailable { display: flex; align-items: center; gap: 12px; padding-top: 4px; }
 .watch-temperature-unavailable p { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); }
 .market-heading .market-open-link { margin-left: auto; font-size: var(--text-xs); }
@@ -5182,4 +5202,7 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watch-quote { grid-template-columns: 1fr 1fr; gap: 10px; }
   .watch-state { grid-column: 1 / -1; justify-items: start; text-align: left; }
   .watch-temperature-unavailable { align-items: flex-start; flex-direction: column; }
+  .watch-temperature-hero { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .watch-temperature-meta { justify-items: start; text-align: left; }
+  .watch-temperature-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

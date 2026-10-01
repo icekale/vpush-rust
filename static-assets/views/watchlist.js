@@ -4,6 +4,9 @@ const STATUS_LABELS = { live: "交易中", closed: "休市", stale: "更新延�
 const DELIVERY_LABELS = {
   sent: "已发送", failed: "发送失败", suppressed: "已抑制", pending: "发送中",
 };
+const MARKET_TEMPERATURE_URL = "https://jinleiviva.github.io/a500/realtime_data.js";
+const MARKET_TEMPERATURE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const TEMPERATURE_LABELS = { cold: "偏冷", normal: "正常", hot: "偏热", overheated: "过热", unavailable: "暂不可用" };
 
 const isNumber = value => typeof value === "number" && Number.isFinite(value);
 const escapeFallback = value => String(value ?? "").replace(/[&<>\"']/g, char => ({
@@ -49,6 +52,47 @@ function statusLabel(status) {
 function deliveryLabel(status) {
   return DELIVERY_LABELS[status] || status || "暂无记录";
 }
+
+function parseRealtimeData(text) {
+  const match = String(text || "").match(/window\.__RT\s*=\s*(\{.*?\})\s*;/s);
+  if (!match) throw new Error("数据格式无效");
+  return JSON.parse(match[1]);
+}
+
+function normalizeMarketSnapshot(payload, now = new Date()) {
+  if (!payload || !isNumber(payload.temperature)) return { available: false, reason: "数据格式无效" };
+  const updated = payload.ts ? new Date(payload.ts.replace(" ", "T") + "+08:00") : null;
+  const age = updated && Number.isFinite(updated.getTime()) ? now.getTime() - updated.getTime() : Infinity;
+  const valid = [payload.temperature, payload.price, payload.pePercentile, payload.pricePercentile].every(isNumber);
+  const available = valid && payload.fresh === true && payload.delayed !== true && age >= 0 && age <= MARKET_TEMPERATURE_MAX_AGE_MS;
+  const status = payload.temperature < 30 ? "cold" : payload.temperature < 60 ? "normal" : payload.temperature < 80 ? "hot" : "overheated";
+  return {
+    ...payload,
+    available,
+    age,
+    temperature_status: status,
+    temperatureLabel: TEMPERATURE_LABELS[status],
+    market_status: payload.market ? "live" : "closed",
+    pe: payload.pe,
+    pe_percentile: payload.pePercentile,
+    price_percentile: payload.pricePercentile,
+    change: payload.change,
+    updatedLabel: updated && Number.isFinite(updated.getTime()) ? quoteTime(updated.toISOString()) : "更新时间未知",
+    reason: available ? "" : age > MARKET_TEMPERATURE_MAX_AGE_MS || payload.delayed ? "数据延迟" : "暂不可用",
+  };
+}
+
+function renderMarketTemperatureMarkup(snapshot) {
+  if (!snapshot?.available) return `<div class="watch-temperature-unavailable" data-watch-temperature-state><span class="watch-status watch-status-unavailable">${escapeFallback(snapshot?.reason || "暂不可用")}</span><p>${escapeFallback(snapshot?.reason === "数据延迟" ? "a500 数据超过可接受时效，暂不展示旧读数" : "a500 数据暂时不可用，暂不展示未经核验的读数")}</p></div>`;
+  const marker = Math.max(0, Math.min(100, Number(snapshot.temperature)));
+  return `<div class="watch-temperature-card" data-watch-temperature-state>
+    <div class="watch-temperature-hero"><div><span class="watch-temperature-kicker">中国A500</span><strong class="watch-temperature-value">${snapshot.temperature}<small>°</small></strong><span class="watch-temperature-label">${escapeFallback(snapshot.temperatureLabel)}</span></div><div class="watch-temperature-meta"><span class="watch-status watch-status-${snapshot.market_status === "live" ? "live" : "stale"}">${snapshot.market_status === "live" ? "交易中" : "收盘"}</span><span>${escapeFallback(snapshot.updatedLabel)}</span></div></div>
+    <div class="watch-temperature-scale" aria-label="市场温度 ${snapshot.temperature} 度"><span class="watch-temperature-marker" style="left:${marker}%"></span><span class="watch-temperature-scale-label">偏冷</span><span class="watch-temperature-scale-label">正常</span><span class="watch-temperature-scale-label">偏热</span></div>
+    <div class="watch-temperature-metrics"><div><span>PE-TTM</span><strong>${number(snapshot.pe)}</strong></div><div><span>PE 分位</span><strong>${number(snapshot.pe_percentile)}%</strong></div><div><span>价格分位</span><strong>${number(snapshot.price_percentile)}%</strong></div><div><span>指数涨跌</span><strong class="${tone(snapshot.change)}">${percent(snapshot.change)}</strong></div></div>
+    <div class="watch-temperature-source">数据源：a500 · 更新于 ${escapeFallback(snapshot.updatedLabel)}</div>
+  </div>`;
+}
+
 
 function targetValue(alert) {
   return alert?.target == null ? "" : String(alert.target);
@@ -108,7 +152,9 @@ function itemMarkup(item, escapeHtml) {
   </article>`;
 }
 
-export function renderWatchlistMarkup({ items = [], loading = false, error = "", escapeHtml: escape = escapeFallback } = {}) {
+export { normalizeMarketSnapshot, parseRealtimeData, renderMarketTemperatureMarkup };
+
+export function renderWatchlistMarkup({ items = [], loading = false, error = "", marketTemperature = null, escapeHtml: escape = escapeFallback } = {}) {
   const list = Array.isArray(items) ? items : [];
   const listHtml = loading
     ? `<div class="watch-state-panel" role="status"><strong>正在加载自选股</strong><span>从服务器读取最新缓存报价…</span></div>`
@@ -125,14 +171,15 @@ export function renderWatchlistMarkup({ items = [], loading = false, error = "",
       <p class="watch-search-note">支持按股票名称或代码搜索；搜索结果来自可用数据源。</p><div class="watch-search-results" data-watch-search-results aria-live="polite"></div>
     </section>
     <section class="watchlist-section" aria-labelledby="watch-items-title"><div class="watch-section-heading"><h3 class="section-title" id="watch-items-title">我的自选</h3><span class="watch-list-state" data-watch-list-state>${loading ? "加载中" : error ? "加载失败" : `${list.length} 个标的`}</span></div><div data-watch-list>${listHtml}</div></section>
-    <section class="section-panel watch-temperature" aria-labelledby="watch-temperature-title"><div class="section-head"><h3 class="section-title" id="watch-temperature-title">市场温度</h3><p class="section-meta">当前不展示未经核验的估值与利率数据。</p></div><div class="watch-temperature-unavailable"><span class="watch-status watch-status-unavailable">暂不可用</span><p>雪球沪深300报价未提供 PE-TTM；国债收益率来源仍待核验</p><p class="section-meta">计算口径：沪深300盈利收益率（1 / PE-TTM）减中国10年期国债收益率，单位为百分点。</p></div></section>
+    <section class="section-panel watch-temperature" aria-labelledby="watch-temperature-title"><div class="section-head"><h3 class="section-title" id="watch-temperature-title">市场温度</h3><p class="section-meta">来源：a500 · 不展示过期读数</p></div><div data-watch-temperature-content>${renderMarketTemperatureMarkup(marketTemperature)}</div></section>
   </div>`;
 }
 
-export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageTitle, go, flash, routeStillActive, currentRouteSeq }) {
+export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageTitle, go, flash, routeStillActive, currentRouteSeq, fetchSnapshot = globalThis.fetch } ) {
   const escape = escapeHtml;
   let active = false;
   let timer = null;
+  let temperatureTimer = null;
   let host = null;
   let dirtyRules = new Set();
   let latestItems = [];
@@ -141,6 +188,7 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
   let requestSeq = 0;
   let actionSeq = 0;
   let lastFetchedAt = null;
+  let temperatureRequest = 0;
   let removeListeners = () => {};
 
   const isCurrent = seq => active && routeStillActive(seq) && currentRouteSeq() === seq;
@@ -151,7 +199,9 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     actionSeq += 1;
     requestSeq += 1;
     if (timer) clearInterval(timer);
+    if (temperatureTimer) clearInterval(temperatureTimer);
     timer = null;
+    temperatureTimer = null;
     if (searchTimer) clearTimeout(searchTimer);
     searchTimer = null;
     searchSeq += 1;
@@ -355,6 +405,20 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     removeListeners = () => { listeners.forEach(remove => remove()); };
   }
 
+  async function loadMarketTemperature(seq) {
+    const request = ++temperatureRequest;
+    const content = host?.querySelector("[data-watch-temperature-content]");
+    if (!content || typeof fetchSnapshot !== "function") return;
+    try {
+      const response = await fetchSnapshot(`${MARKET_TEMPERATURE_URL}?v=${Date.now()}`, { cache: "no-store" });
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      const snapshot = normalizeMarketSnapshot(parseRealtimeData(await response.text()));
+      if (isCurrent(seq) && request === temperatureRequest) content.innerHTML = renderMarketTemperatureMarkup(snapshot);
+    } catch {
+      if (isCurrent(seq) && request === temperatureRequest) content.innerHTML = renderMarketTemperatureMarkup({ available: false, reason: "暂不可用" });
+    }
+  }
+
   async function refresh(seq, forceRender = false) {
     if (!isCurrent(seq)) return;
     const request = ++requestSeq;
@@ -395,6 +459,8 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     if (!host) return;
     host.innerHTML = renderWatchlistMarkup({ loading: true, escapeHtml });
     bindEvents(seq);
+    loadMarketTemperature(seq);
+    temperatureTimer = setInterval(() => loadMarketTemperature(seq), 300000);
     await refresh(seq);
     if (!isCurrent(seq)) return;
     timer = setInterval(() => refresh(seq), 30000);

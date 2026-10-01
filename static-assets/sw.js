@@ -1,8 +1,8 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-watchlist-2";
+const CACHE = "dav-shell-a500-watchlist-1";
 const SHELL = [
   "/",
-  "/app.238ef9edd51a.js",
+  "/app.c7cec4b3012b.js",
   // asset-modules:start
   "/core/dialog.b2db015b3a5e.js",
   "/core/html.be440515d828.js",
@@ -25,9 +25,9 @@ const SHELL = [
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.b47a87a80190.js",
   "/views/etf-premium.c45e6eb6a567.js",
-  "/views/watchlist.f080d1e25aa6.js",
+  "/views/watchlist.c5b2b1378e3e.js",
   // asset-modules:end
-  "/style.fdfae5255f53.css",
+  "/style.d51e8a4b341d.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",

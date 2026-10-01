@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { alertPayloadFromValues, createWatchlistView, renderWatchlistMarkup } from "../static-assets/views/watchlist.js";
+import { alertPayloadFromValues, createWatchlistView, normalizeMarketSnapshot, parseRealtimeData, renderMarketTemperatureMarkup, renderWatchlistMarkup } from "../static-assets/views/watchlist.js";
 
 test("watchlist renders loading, empty, unavailable, and zero states", () => {
   assert.match(renderWatchlistMarkup({ loading: true }), /正在加载自选股/);
@@ -23,6 +23,26 @@ test("watchlist renders loading, empty, unavailable, and zero states", () => {
   assert.match(unavailable, /&lt;bad&gt;/);
 });
 
+test("parses the published a500 realtime payload", () => {
+  const payload = parseRealtimeData('window.__RT = {"temperature":41,"fresh":true};');
+  assert.equal(payload.temperature, 41);
+  assert.equal(payload.fresh, true);
+});
+test("market snapshot renders a fresh A500 temperature card and rejects stale data", () => {
+  const snapshot = normalizeMarketSnapshot({
+    temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4,
+    market: false, fresh: true, delayed: false, change: 0.19, ts: "2026-10-01 12:04:49",
+  }, new Date("2026-10-01T04:05:00Z"));
+  assert.equal(snapshot.available, true);
+  assert.match(renderMarketTemperatureMarkup(snapshot), /41/);
+  assert.match(renderMarketTemperatureMarkup(snapshot), /中国A500/);
+
+  const stale = normalizeMarketSnapshot({ temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4, market: false, fresh: true, delayed: false, change: 0.19, ts: "2026-09-30 12:04:49" }, new Date("2026-10-01T04:05:00Z"));
+  assert.equal(stale.available, false);
+  assert.match(renderMarketTemperatureMarkup(stale), /数据延迟/);
+});
+
+
 test("mounted view renders escaped live data and ignores a departed route response", async () => {
   const originalDocument = globalThis.document;
   const nodes = new Map(["[data-watch-list]", "[data-watch-list-state]", "[data-watch-fetched]"].map(key => [key, { innerHTML: "", textContent: "" }]));
@@ -37,6 +57,7 @@ test("mounted view renders escaped live data and ignores a departed route respon
       price: 0.249, percent: 0, status: "closed", alerts: {},
     }] }),
     setPageTitle() {}, currentRouteSeq: () => seq, routeStillActive: value => value === seq,
+    fetchSnapshot: () => Promise.reject(new Error("test")),
   });
   try {
     await view.renderWatchlist(1);

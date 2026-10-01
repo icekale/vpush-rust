@@ -5640,7 +5640,7 @@ impl Db {
                     "platform": row.get::<String, _>("platform"),
                     "name": row.get::<String, _>("name"),
                     "external_id": row.get::<String, _>("external_id"),
-                    "avatar_url": row.get::<String, _>("avatar_url"),
+                    "avatar_url": row_avatar_url(row, "id"),
                     "enabled": row.get::<i64, _>("enabled") != 0,
                     "is_private": row.get::<i64, _>("is_private") != 0,
                     "original_only": row.get::<i64, _>("original_only") != 0,
@@ -5714,7 +5714,7 @@ impl Db {
                 "id": row.get::<i64, _>("id"),
                 "name": row.get::<String, _>("name"),
                 "platform": row.get::<String, _>("platform"),
-                "avatar_url": row.get::<String, _>("avatar_url"),
+                "avatar_url": row_avatar_url(&row, "id"),
                 "category_name": row.get::<String, _>("category_name"),
                 "subscriber_count": row.get::<i64, _>("subscriber_count"),
                 "subscribed": subscribed,
@@ -7750,13 +7750,35 @@ fn tag_pattern(tag: &str) -> String {
     out
 }
 
+fn resolve_avatar_url(static_dir: &Path, kol_id: i64, source: String) -> String {
+    let relative = format!("avatars/{kol_id}.jpg");
+    if static_dir
+        .join(&relative)
+        .metadata()
+        .is_ok_and(|m| m.is_file() && m.len() > 0)
+    {
+        format!("/{relative}")
+    } else {
+        source
+    }
+}
+
+fn row_avatar_url(row: &sqlx::sqlite::SqliteRow, id_column: &str) -> String {
+    let static_dir = std::env::var("VPUSH_STATIC").unwrap_or_else(|_| "static".into());
+    resolve_avatar_url(
+        Path::new(&static_dir),
+        row.get(id_column),
+        row.get("avatar_url"),
+    )
+}
+
 fn subscription_json(row: &sqlx::sqlite::SqliteRow) -> Value {
     json!({
         "id": row.get::<i64, _>("id"),
         "platform": row.get::<String, _>("platform"),
         "name": row.get::<String, _>("name"),
         "external_id": row.get::<String, _>("external_id"),
-        "avatar_url": row.get::<String, _>("avatar_url"),
+        "avatar_url": row_avatar_url(row, "id"),
         "subscribe_type": row.get::<String, _>("subscribe_type"),
         "favorite": row.get::<i64, _>("favorite") != 0,
         "secondary": row.get::<i64, _>("secondary") != 0,
@@ -7771,7 +7793,7 @@ fn kol_json(row: &sqlx::sqlite::SqliteRow) -> Value {
         "platform": platform,
         "name": row.get::<String, _>("name"),
         "external_id": row.get::<String, _>("external_id"),
-        "avatar_url": row.get::<String, _>("avatar_url"),
+        "avatar_url": row_avatar_url(row, "id"),
         "enabled": row.get::<i64, _>("enabled") != 0,
         "is_private": row.get::<i64, _>("is_private") != 0,
         "original_only": row.get::<i64, _>("original_only") != 0,
@@ -7828,7 +7850,7 @@ fn post_json(row: &sqlx::sqlite::SqliteRow) -> Value {
         "published_at": row.get::<String, _>("published_at"),
         "fetched_at": row.get::<String, _>("fetched_at"),
         "kol_name": row.get::<String, _>("kol_name"),
-        "avatar_url": row.get::<String, _>("avatar_url"),
+        "avatar_url": row_avatar_url(row, "kol_id"),
         "kol_external_id": row.get::<String, _>("kol_external_id"),
         "category_id": row.get::<Option<i64>, _>("category_id"),
         "category_name": row.get::<String, _>("category_name"),
@@ -8784,6 +8806,35 @@ fn clip_title(title: &str, fallback: &str) -> String {
 mod tests {
     use super::*;
     use base64::Engine;
+
+    #[test]
+    fn cached_avatar_precedes_source_only_when_file_is_usable() {
+        let root = std::env::temp_dir().join(format!(
+            "vpush-avatar-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("avatars")).unwrap();
+        let source = "https://pbs.twimg.com/profile_images/source.jpg";
+        assert_eq!(resolve_avatar_url(&root, 77, source.into()), source);
+        std::fs::write(root.join("avatars/77.jpg"), b"cached-image").unwrap();
+        assert_eq!(
+            resolve_avatar_url(&root, 77, source.into()),
+            "/avatars/77.jpg"
+        );
+        assert_eq!(
+            resolve_avatar_url(&root, 77, String::new()),
+            "/avatars/77.jpg"
+        );
+        std::fs::write(root.join("avatars/78.jpg"), b"").unwrap();
+        assert_eq!(resolve_avatar_url(&root, 78, source.into()), source);
+        std::fs::create_dir(root.join("avatars/79.jpg")).unwrap();
+        assert_eq!(resolve_avatar_url(&root, 79, source.into()), source);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn open_adds_hot_indexes_to_existing_databases_and_syncs_normal() {

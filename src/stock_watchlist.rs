@@ -935,6 +935,10 @@ fn fetch_search(market: Market, q: &str) -> Result<Vec<Instrument>, String> {
     parse_search_candidates(&payload, market)
 }
 
+fn needs_name_search(market: Market, direct: &Option<Instrument>) -> bool {
+    market == Market::Us || direct.is_none()
+}
+
 pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError> {
     let market = Market::parse(&input.market).map_err(WatchlistError::bad)?;
     let q = input.q.trim();
@@ -944,16 +948,26 @@ pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError
     let cookie = crate::xueqiu::app_cookie(db)
         .await
         .map_err(WatchlistError::gateway)?;
-    let candidates = if let Ok(instrument) = normalize_symbol(market.as_str(), q) {
-        vec![instrument]
-    } else {
-        tokio::task::spawn_blocking({
+    let direct = normalize_symbol(market.as_str(), q).ok();
+    let candidates = if needs_name_search(market, &direct) {
+        let suggestions = tokio::task::spawn_blocking({
             let query = q.to_string();
             move || fetch_search(market, &query)
         })
         .await
-        .map_err(|error| WatchlistError::gateway(error.to_string()))?
-        .map_err(|error| WatchlistError::gateway(format!("名称搜索暂不可用：{error}")))?
+        .map_err(|error| WatchlistError::gateway(error.to_string()))?;
+        match suggestions {
+            Ok(items) if !items.is_empty() => items,
+            Ok(_) => direct.into_iter().collect(),
+            Err(_) if direct.is_some() => direct.into_iter().collect(),
+            Err(error) => {
+                return Err(WatchlistError::gateway(format!(
+                    "名称搜索暂不可用：{error}"
+                )))
+            }
+        }
+    } else {
+        direct.into_iter().collect()
     };
     if candidates.is_empty() {
         return Ok(json!({"items": []}));
@@ -1336,6 +1350,15 @@ mod tests {
         assert_eq!(normalize_symbol("us", "aapl").unwrap().symbol, "AAPL");
         assert!(normalize_symbol("cn", "513100").is_err());
         assert!(normalize_symbol("hk", "700.W").is_err());
+    }
+
+    #[test]
+    fn us_words_use_name_suggestions_even_when_they_look_like_symbols() {
+        let apple = normalize_symbol("us", "Apple").ok();
+        assert_eq!(apple.as_ref().unwrap().symbol, "APPLE");
+        assert!(needs_name_search(Market::Us, &apple));
+        let cn = normalize_symbol("cn", "600519").ok();
+        assert!(!needs_name_search(Market::Cn, &cn));
     }
 
     #[test]

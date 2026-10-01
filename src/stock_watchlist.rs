@@ -11,6 +11,7 @@ use crate::db::Db;
 const QUOTE_URL: &str = "https://stock.xueqiu.com/v5/stock/batch/quote.json";
 const SEARCH_URL: &str = "https://searchapi.eastmoney.com/api/suggest/get";
 const US_SEARCH_URL: &str = "https://smartbox.gtimg.cn/s3/";
+const NO_VALID_QUOTE: &str = "雪球行情没有有效报价";
 const MAX_SYMBOLS: i64 = 50;
 const MAX_SEARCH: usize = 40;
 const QUOTE_MAX_AGE_MS: i64 = 120_000;
@@ -355,7 +356,7 @@ fn parse_batch_quotes(
         );
     }
     if out.is_empty() {
-        Err("雪球行情没有有效报价".into())
+        Err(NO_VALID_QUOTE.into())
     } else {
         Ok(out)
     }
@@ -1027,9 +1028,12 @@ pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError
             move || fetch_batch(&cookie, &batch)
         })
         .await
-        .map_err(|err| WatchlistError::gateway(err.to_string()))?
-        .map_err(WatchlistError::gateway)?;
-        verified.extend(found);
+        .map_err(|err| WatchlistError::gateway(err.to_string()))?;
+        match found {
+            Ok(found) => verified.extend(found),
+            Err(error) if error == NO_VALID_QUOTE => continue,
+            Err(error) => return Err(WatchlistError::gateway(error)),
+        }
     }
     let mut items = Vec::new();
     let mut shared = cache().lock().unwrap_or_else(|err| err.into_inner());
@@ -1397,6 +1401,16 @@ mod tests {
         assert_eq!(normalize_symbol("us", "aapl").unwrap().symbol, "AAPL");
         assert!(normalize_symbol("cn", "513100").is_err());
         assert!(normalize_symbol("hk", "700.W").is_err());
+    }
+
+    #[test]
+    fn no_quote_response_is_distinct_from_provider_failures() {
+        let wanted = vec![normalize_symbol("us", "Zznone").unwrap()];
+        let empty = json!({"data":{"items":[]}});
+        assert_eq!(
+            parse_batch_quotes(&empty, &wanted, now_ms()).unwrap_err(),
+            NO_VALID_QUOTE
+        );
     }
 
     #[test]

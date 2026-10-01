@@ -10,6 +10,7 @@ use crate::db::Db;
 
 const QUOTE_URL: &str = "https://stock.xueqiu.com/v5/stock/batch/quote.json";
 const SEARCH_URL: &str = "https://searchapi.eastmoney.com/api/suggest/get";
+const US_SEARCH_URL: &str = "https://smartbox.gtimg.cn/s3/";
 const MAX_SYMBOLS: i64 = 50;
 const MAX_SEARCH: usize = 40;
 const QUOTE_MAX_AGE_MS: i64 = 120_000;
@@ -915,6 +916,39 @@ fn parse_search_candidates(payload: &Value, market: Market) -> Result<Vec<Instru
     Ok(candidates)
 }
 
+fn parse_tencent_us_candidates(text: &str) -> Result<Vec<Instrument>, String> {
+    let hints: String = serde_json::from_str(
+        text.trim()
+            .strip_prefix("v_hint=")
+            .ok_or_else(|| "美股搜索源响应无效".to_string())?
+            .trim_end_matches(';'),
+    )
+    .map_err(|_| "美股搜索源响应无效".to_string())?;
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for row in hints.split('^') {
+        let mut fields = row.split('~');
+        if fields.next() != Some("us") {
+            continue;
+        }
+        let Some(code) = fields
+            .next()
+            .and_then(|code| code.rsplit_once('.').map(|(symbol, _)| symbol))
+        else {
+            continue;
+        };
+        if let Ok(instrument) = normalize_symbol("us", code) {
+            if seen.insert(instrument.key()) {
+                candidates.push(instrument);
+                if candidates.len() == BATCH_SIZE {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(candidates)
+}
+
 fn fetch_search(market: Market, q: &str) -> Result<Vec<Instrument>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(5))
@@ -932,7 +966,20 @@ fn fetch_search(market: Market, q: &str) -> Result<Vec<Instrument>, String> {
         .map_err(|err| format!("搜索源响应无效: {err}"))?;
     let payload: Value =
         serde_json::from_str(&text).map_err(|err| format!("搜索源响应无效: {err}"))?;
-    parse_search_candidates(&payload, market)
+    let candidates = parse_search_candidates(&payload, market)?;
+    if candidates.is_empty() && market == Market::Us {
+        let response = agent
+            .get(US_SEARCH_URL)
+            .query("q", q)
+            .query("t", "all")
+            .call()
+            .map_err(|err| format!("美股搜索源请求失败: {err}"))?;
+        let text = response
+            .into_string()
+            .map_err(|err| format!("美股搜索源响应无效: {err}"))?;
+        return parse_tencent_us_candidates(&text);
+    }
+    Ok(candidates)
 }
 
 fn needs_name_search(market: Market, direct: &Option<Instrument>) -> bool {
@@ -1350,6 +1397,20 @@ mod tests {
         assert_eq!(normalize_symbol("us", "aapl").unwrap().symbol, "AAPL");
         assert!(normalize_symbol("cn", "513100").is_err());
         assert!(normalize_symbol("hk", "700.W").is_err());
+    }
+
+    #[test]
+    fn parses_tencent_us_name_fallback() {
+        let text = r#"v_hint="us~tsla.oq~Tesla~tesla~GP^us~brk.b.n~Berkshire~brk~GP^hk~00700~Tencent~tx~GP""#;
+        let found = parse_tencent_us_candidates(text).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.symbol.as_str())
+                .collect::<Vec<_>>(),
+            vec!["TSLA", "BRK.B"]
+        );
+        assert!(parse_tencent_us_candidates("not JSONP").is_err());
     }
 
     #[test]

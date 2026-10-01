@@ -1,12 +1,12 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-watchlist-four-tabs-1";
+const CACHE = "dav-shell-market-polish-1";
 const SHELL = [
   "/",
-  "/app.c7cec4b3012b.js",
+  "/app.94a55957d7c4.js",
   // asset-modules:start
   "/core/dialog.b2db015b3a5e.js",
   "/core/html.be440515d828.js",
-  "/core/icons.7fb4f43f1230.js",
+  "/core/icons.7e8a5a25d922.js",
   "/core/lightbox.63db409ddbd8.js",
   "/core/platforms.e3f9b30aa971.js",
   "/views/admin/cicc.0cd7529b8514.js",
@@ -25,9 +25,9 @@ const SHELL = [
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.b47a87a80190.js",
   "/views/etf-premium.c45e6eb6a567.js",
-  "/views/watchlist.293c85910f5e.js",
+  "/views/watchlist.c9d7fd90ecda.js",
   // asset-modules:end
-  "/style.57426a70f669.css",
+  "/style.16fea6c415b5.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",

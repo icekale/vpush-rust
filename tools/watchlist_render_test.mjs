@@ -51,6 +51,62 @@ test("renders all A500 project sections from the owned aggregate", () => {
   assert.match(unavailableTabs, /宏观数据/);
 });
 
+test("research tabs render full trends, ETF state, and grouped macro indicators", () => {
+  const data = normalizeA500Data({
+    schema_version: 1, generated_at: "2026-10-01T05:06:27Z",
+    a500: {
+      temperature: 41, price: 5370.3, change: 0.19, pe: 16.31, pePercentile: 17.2,
+      pricePercentile: 68.4, stockYield: 6.1, bondYield: 1.68, dcaPct: 75,
+      dcaLabel: "正常定投", market: false, fresh: true, delayed: false, ts: "2026-10-01 12:04:49",
+      temperature_history: [
+        { date: "2026-09-25", temp: 30 }, { date: "2026-09-26", temp: 35 },
+        { date: "2026-09-27", temp: 41 },
+      ],
+      pe_history: [{ date: "2026-09-25", pe: 15 }, { date: "2026-09-27", pe: 16.31 }],
+    },
+    dividend: {
+      light_score: 74, light_label: "适合买入", etf_price: null, etf_update_time: null,
+      dividend_yield: 4.39, pe: 8.24, temp_history: [
+        { d: "2026-09-25", t: 70 }, { d: "2026-09-26", t: 72 }, { d: "2026-09-27", t: 74 },
+      ],
+      dividend_history: [{ d: "2026-09-25", v: 4.1 }, { d: "2026-09-27", v: 4.39 }],
+    },
+    transition: {
+      temperature: 61.6, band: "温和区", lineScores: {
+        line1: { name: "内需与物价", score: 65.5, weight: 30 },
+        line2: { name: "就业与收入", score: 39.3, weight: 15 },
+        line3: { name: "货币与信用", score: 39.8, weight: 25 },
+        line4: { name: "转型与开放", score: 87.2, weight: 30 },
+      },
+      indicators: { cpi: { name: "CPI同比", line: 1, value: 1.2, score: 70, label: "温和", source: "<unsafe>", date: "2026-05-31", stale: true, stale_days: 121 } },
+    },
+  }, new Date("2026-10-01T05:10:00Z"));
+  const config = { indicators: { cpi: { unit: "%", reference_range: "0.5%~3.0%" } } };
+  const html = renderA500Panels(data, config);
+  assert.match(html, /5,370\.30/);
+  assert.match(html, /正常定投/);
+  assert.match(html, /data-watch-trend="temperature"[\s\S]*?<polyline/);
+  assert.match(html, /2026-09-25/);
+  assert.match(html, /2026-09-27/);
+  assert.match(html, /data-watch-trend="pe"/);
+  assert.match(html, /data-watch-trend="dividend"/);
+  assert.match(html, /data-watch-trend="dividend-temperature"/);
+  assert.match(html, /563020/);
+  assert.match(html, /暂无行情/);
+  for (const name of ["内需与物价", "就业与收入", "货币与信用", "转型与开放"]) assert.match(html, new RegExp(name));
+  assert.match(html, /1\.2%/);
+  assert.match(html, /0\.5%~3\.0%/);
+  assert.match(html, /数据较旧/);
+  assert.match(html, /&lt;unsafe&gt;/);
+  assert.doesNotMatch(html, /<unsafe>/);
+  const noConfig = renderA500Panels(data);
+  assert.match(noConfig, /CPI同比/);
+  assert.match(noConfig, /1\.2/);
+  assert.doesNotMatch(noConfig, /0\.5%~3\.0%/);
+  data.a500.temperature_history = [];
+  assert.match(renderMarketTemperatureMarkup(data.a500), /暂无历史数据/);
+});
+
 test("watchlist has four peer tabs, defaulting to the watchlist and keeping other panels hidden", () => {
   const html = renderWatchlistMarkup({ loading: true });
   assert.deepEqual([...html.matchAll(/data-watch-tab="([^"]+)"/g)].map(match => match[1]), ["temperature", "dividend", "macro", "watchlist"]);
@@ -77,6 +133,36 @@ test("market snapshot renders a fresh A500 temperature card and rejects stale da
   assert.match(renderMarketTemperatureMarkup(stale), /数据延迟/);
 });
 
+
+test("slow or failed macro config does not hide the main A500 data", async () => {
+  const originalDocument = globalThis.document;
+  const nodes = new Map(["[data-watch-a500-content]", "[data-a500-temperature]", "[data-a500-dividend]", "[data-a500-macro]", "[data-watch-list]", "[data-watch-list-state]", "[data-watch-fetched]"].map(key => [key, { innerHTML: "", textContent: "" }]));
+  const content = nodes.get("[data-watch-a500-content]");
+  content.querySelector = key => nodes.get(key);
+  const host = { innerHTML: "", querySelector: key => nodes.get(key), querySelectorAll: () => [] };
+  globalThis.document = { querySelector: selector => selector === "#main" ? host : null };
+  let rejectConfig;
+  const payload = {
+    schema_version: 1, generated_at: new Date().toISOString(),
+    a500: { temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17, pricePercentile: 60, fresh: true, delayed: false, ts: new Date().toISOString() },
+    dividend: { light_score: 74 }, transition: { temperature: 61.6, indicators: { cpi: { name: "CPI", line: 1, value: 1.2 } }, lineScores: { line1: { name: "内需与物价" } } },
+  };
+  const view = createWatchlistView({
+    api: async () => ({ items: [] }), setPageTitle() {}, currentRouteSeq: () => 1, routeStillActive: () => true,
+    fetchSnapshot: url => url.includes("transition_config") ? new Promise((_, reject) => { rejectConfig = reject; }) : Promise.resolve({ ok: true, json: async () => payload }),
+  });
+  try {
+    await view.renderWatchlist(1);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.match(nodes.get("[data-a500-dividend]").innerHTML, /74/);
+    rejectConfig(new Error("offline"));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.match(nodes.get("[data-a500-macro]").innerHTML, /CPI/);
+  } finally {
+    view.stopWatchlist();
+    globalThis.document = originalDocument;
+  }
+});
 
 test("mounted view renders escaped live data and ignores a departed route response", async () => {
   const originalDocument = globalThis.document;

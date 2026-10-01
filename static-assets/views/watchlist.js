@@ -5,6 +5,7 @@ const DELIVERY_LABELS = {
   sent: "已发送", failed: "发送失败", suppressed: "已抑制", pending: "发送中",
 };
 const A500_DATA_URL = "https://icekale.github.io/a500/vpush_data.json";
+const A500_CONFIG_URL = "https://icekale.github.io/a500/transition_config.json";
 const A500_DATA_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 const MARKET_TEMPERATURE_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const TEMPERATURE_LABELS = { cold: "偏冷", normal: "正常", hot: "偏热", overheated: "过热", unavailable: "暂不可用" };
@@ -87,10 +88,10 @@ function renderMarketTemperatureMarkup(snapshot) {
   if (!snapshot?.available) return `<div class="watch-temperature-unavailable" data-watch-temperature-state><span class="watch-status watch-status-unavailable">${escapeFallback(snapshot?.reason || "暂不可用")}</span><p>${escapeFallback(snapshot?.reason === "数据延迟" ? "a500 数据超过可接受时效，暂不展示旧读数" : "a500 数据暂时不可用，暂不展示未经核验的读数")}</p></div>`;
   const marker = Math.max(0, Math.min(100, Number(snapshot.temperature)));
   return `<div class="watch-temperature-card" data-watch-temperature-state>
-    <div class="watch-temperature-hero"><div><span class="watch-temperature-kicker">中国A500</span><strong class="watch-temperature-value">${snapshot.temperature}<small>°</small></strong><span class="watch-temperature-label">${escapeFallback(snapshot.temperatureLabel)}</span></div><div class="watch-temperature-meta"><span class="watch-status watch-status-${snapshot.market_status === "live" ? "live" : "stale"}">${snapshot.market_status === "live" ? "交易中" : "收盘"}</span><span>${escapeFallback(snapshot.updatedLabel)}</span></div></div>
+    <div class="watch-temperature-hero"><div><span class="watch-temperature-kicker">中国A500 · 沪深全指</span><strong class="watch-temperature-index">${number(snapshot.price)}</strong><span class="watch-temperature-change ${tone(snapshot.change)}">${percent(snapshot.change)} · ${snapshot.market_status === "live" ? "交易中" : "收盘"}</span><strong class="watch-temperature-value">${snapshot.temperature}<small>°</small></strong><span class="watch-temperature-label">${escapeFallback(snapshot.temperatureLabel)}</span></div><div class="watch-temperature-meta"><span class="watch-status watch-status-${snapshot.market_status === "live" ? "live" : "stale"}">${snapshot.market_status === "live" ? "交易中" : "收盘"}</span><span>${escapeFallback(snapshot.updatedLabel)}</span></div></div>
     <div class="watch-temperature-scale" aria-label="市场温度 ${snapshot.temperature} 度"><span class="watch-temperature-marker" style="left:${marker}%"></span><span class="watch-temperature-scale-label">偏冷</span><span class="watch-temperature-scale-label">正常</span><span class="watch-temperature-scale-label">偏热</span></div>
     <div class="watch-temperature-metrics"><div><span>PE-TTM</span><strong>${number(snapshot.pe)}</strong></div><div><span>PE 分位</span><strong>${number(snapshot.pe_percentile)}%</strong></div><div><span>价格分位</span><strong>${number(snapshot.price_percentile)}%</strong></div><div><span>指数涨跌</span><strong class="${tone(snapshot.change)}">${percent(snapshot.change)}</strong></div><div><span>股债利差</span><strong>${number(snapshot.stockYield)}%</strong></div><div><span>定投比例</span><strong>${number(snapshot.dcaPct)}%</strong></div></div>
-    <div class="watch-a500-columns"><div><h4>温度历史</h4>${historyMarkup(snapshot.temperature_history, "temp", "°")}</div><div><h4>PE 历史</h4>${historyMarkup(snapshot.pe_history, "pe", "")}</div></div>
+    <div class="watch-a500-columns"><div>${trendBlock(snapshot.temperature_history, "temp", "temperature", "温度走势", "°")}</div><div>${trendBlock(snapshot.pe_history, "pe", "pe", "PE-TTM 走势")}</div></div>
     <div class="watch-temperature-source">数据源：a500 · ${escapeFallback(snapshot.dcaLabel || "定投策略数据") } · 更新于 ${escapeFallback(snapshot.updatedLabel)}</div>
   </div>`;
 }
@@ -111,44 +112,63 @@ function normalizeA500Data(payload, now = new Date()) {
   };
 }
 
-function historyMarkup(items, valueKey, suffix = "") {
-  const rows = Array.isArray(items) ? items.slice(-8) : [];
+function trendMarkup(items, valueKey, dataName, label, suffix = "") {
+  const rows = (Array.isArray(items) ? items : []).map(row => ({
+    date: row?.d || row?.date || "--", value: Number(row?.[valueKey]),
+  })).filter(row => Number.isFinite(row.value));
   if (!rows.length) return `<p class="watch-a500-muted">暂无历史数据</p>`;
-  const values = rows.map(row => Number(row[valueKey])).filter(Number.isFinite);
-  const max = Math.max(...values, 1);
-  return `<div class="watch-a500-history">${rows.map(row => {
-    const value = Number(row[valueKey]);
-    const width = Number.isFinite(value) ? Math.max(5, Math.min(100, value / max * 100)) : 5;
-    return `<div class="watch-a500-history-row"><span>${escapeFallback(row.d || row.date || "--")}</span><i><b style="width:${width}%"></b></i><strong>${Number.isFinite(value) ? value.toFixed(2) : "--"}${suffix}</strong></div>`;
-  }).join("")}</div>`;
+  const values = rows.map(row => row.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const spread = max - min || 1;
+  const points = rows.map((row, index) => `${(index / Math.max(1, rows.length - 1) * 100).toFixed(2)},${(94 - (row.value - min) / spread * 82).toFixed(2)}`).join(" ");
+  const first = rows[0];
+  const last = rows.at(-1);
+  return `<div class="watch-a500-trend" data-watch-trend="${escapeFallback(dataName)}">
+    <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="${escapeFallback(label)}，${escapeFallback(first.date)} 至 ${escapeFallback(last.date)}，${number(last.value)}${escapeFallback(suffix)}">
+      <path class="watch-a500-trend-grid" d="M0 12H100M0 53H100M0 94H100"></path><polyline points="${points}"></polyline>
+    </svg><div class="watch-a500-trend-meta"><span>${escapeFallback(first.date)} · ${number(first.value)}${escapeFallback(suffix)}</span><span>${escapeFallback(last.date)} · ${number(last.value)}${escapeFallback(suffix)}</span></div>
+  </div>`;
+}
+
+function trendBlock(items, valueKey, dataName, title, suffix = "") {
+  return `<div class="watch-a500-trend-block"><h4>${escapeFallback(title)}</h4>${trendMarkup(items, valueKey, dataName, title, suffix)}</div>`;
 }
 
 function renderDividendPanel(data) {
   const d = data.dividend || {};
-  const metrics = [["PE", d.pe, "", d.pe_date], ["PE 分位", d.pe_percentile, "%", "估值位置"], ["股息率", d.dividend_yield, "%", d.dividend_yield_date], ["股息率分位", d.dividend_yield_percentile, "%", "股息位置"], ["PB", d.pb, "", ""], ["ROE", d.roe, "%", ""], ["10Y 国债", d.bond_yield, "%", ""], ["股债利差", d.spread, "%", ""], ["ETF 价格", d.etf_price, "", d.etf_update_time], ["ETF 溢价", d.etf_premium, "%", ""], ["ETF 成交额", d.etf_volume, "", ""], ["ETF 规模", d.etf_size, "", ""]];
-  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">红利低波温度</span><strong>${escapeFallback(d.light_score ?? "--")}</strong><span>${escapeFallback(d.light_label || "暂无评级")}</span></div><span class="watch-status watch-status-live">${escapeFallback(d.update_time || "数据日期未知")}</span></div><div class="watch-a500-metrics">${metrics.map(([label, value, suffix, date]) => `<div><span>${label}</span><strong>${isNumber(value) ? number(value) + suffix : "--"}</strong><small>${escapeFallback(date || "")}</small></div>`).join("")}</div><div class="watch-a500-columns"><div><h4>红利率历史</h4>${historyMarkup(d.dividend_history, "v", "%")}</div><div><h4>红利温度历史</h4>${historyMarkup(d.temp_history, "t", "°")}</div></div><p class="watch-a500-source">数据源：a500 红利低波数据 · 权重：${escapeFallback(d.light_weights || "--")} · ${escapeFallback(d.trend_reason || "趋势状态未知")}</p></div>`;
+  const metrics = [["PE", d.pe, "", d.pe_date], ["PE 分位", d.pe_percentile, "%", "估值位置"], ["股息率", d.dividend_yield, "%", d.dividend_yield_date], ["股息率分位", d.dividend_yield_percentile, "%", "股息位置"], ["PB", d.pb, "", ""], ["ROE", d.roe, "%", ""], ["10Y 国债", d.bond_yield, "%", ""], ["股债利差", d.spread, "%", ""]];
+  const etf = isNumber(d.etf_price) ? `${number(d.etf_price)} · ${escapeFallback(d.etf_update_time || "时间未知")}` : "暂无行情";
+  return `<div class="watch-a500-panel-body"><div class="watch-a500-decision"><div><span class="watch-a500-kicker">红利低波 · 563020</span><strong>${escapeFallback(d.light_score ?? "--")}</strong><span>${escapeFallback(d.light_label || "暂无评级")}</span></div><div class="watch-a500-etf"><span>ETF 最新价</span><strong>${etf}</strong><small>${escapeFallback(d.update_time || "数据日期未知")}</small></div></div><div class="watch-a500-metrics watch-a500-core-metrics">${metrics.map(([label, value, suffix, date]) => `<div><span>${label}</span><strong>${isNumber(value) ? number(value) + suffix : "--"}</strong><small>${escapeFallback(date || "")}</small></div>`).join("")}</div><div class="watch-a500-columns"><div>${trendBlock(d.dividend_history, "v", "dividend", "股息率走势", "%")}</div><div>${trendBlock(d.temp_history, "t", "dividend-temperature", "红利温度走势", "°")}</div></div><p class="watch-a500-source">数据源：a500 红利低波数据 · 权重：${escapeFallback(d.light_weights || "--")} · ${escapeFallback(d.trend_reason || "趋势状态未知")}</p></div>`;
 }
 
 function renderTransitionPanel(data) {
   const t = data.transition || {};
-  const lines = Object.values(t.lineScores || {});
-  const indicators = Array.isArray(t.indicators) ? t.indicators : Object.values(t.indicators || {});
-  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">经济健康温度</span><strong>${isNumber(t.temperature) ? t.temperature.toFixed(1) : "--"}</strong><span>${escapeFallback(t.band || "暂无区间")}</span></div><span class="watch-a500-emoji">${escapeFallback(t.emoji || "")}</span></div><p class="watch-a500-description">${escapeFallback(t.description || "暂无说明")}</p><div class="watch-a500-line-grid">${lines.map(line => `<div><span>${escapeFallback(line.name)}</span><strong>${isNumber(line.score) ? line.score.toFixed(1) : "--"}</strong><small>权重 ${isNumber(line.weight) ? line.weight.toFixed(1) : "--"}%</small></div>`).join("")}</div><div class="watch-a500-indicators"><h4>指标明细</h4>${indicators.map(item => `<div class="watch-a500-indicator"><div><strong>${escapeFallback(item.name || "未命名指标")}</strong><span>${escapeFallback(item.label || "")}</span></div><strong>${isNumber(item.score) ? item.score.toFixed(0) : "--"}</strong><small>${isNumber(item.value) ? item.value : "--"} · ${escapeFallback(item.date || "日期未知")} · ${escapeFallback(item.source || "来源未知")}${item.stale ? ` · 数据较旧${isNumber(item.stale_days) ? ` ${item.stale_days} 天` : ""}` : ""}</small></div>`).join("")}</div><p class="watch-a500-source">数据日期：${escapeFallback(t.date || "未知")} · 指标来源与更新时间随原项目数据同步。</p></div>`;
+  const config = data.transitionConfig || {};
+  const configIndicators = config.indicators || {};
+  const entries = Array.isArray(t.indicators) ? t.indicators.map((item, index) => [item.key || item.id || String(index), item]) : Object.entries(t.indicators || {});
+  const lines = Object.entries(t.lineScores || {});
+  if (!lines.length && entries.length) lines.push(["line1", { name: "指标明细" }]);
+  const grouped = lines.map(([key, line]) => {
+    const lineNumber = Number(String(key).replace("line", ""));
+    return { key, line, indicators: entries.filter(([, item]) => Number(item.line) === lineNumber || (lineNumber === 1 && item.line == null)) };
+  });
+  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">经济健康温度</span><strong>${isNumber(t.temperature) ? t.temperature.toFixed(1) : "--"}</strong><span>${escapeFallback(t.band || "暂无区间")}</span></div><span class="watch-a500-emoji">${escapeFallback(t.emoji || "")}</span></div><p class="watch-a500-description">${escapeFallback(t.description || "暂无说明")}</p><div class="watch-a500-line-sections">${grouped.map(({ line, indicators }) => `<section class="watch-a500-line-section"><div class="watch-a500-line-heading"><div><strong>${escapeFallback(line.name || "未命名主线")}</strong><span>权重 ${isNumber(line.weight) ? line.weight.toFixed(1) : "--"}%</span></div><b>${isNumber(line.score) ? line.score.toFixed(1) : "--"}</b></div><div class="watch-a500-indicators">${indicators.length ? indicators.map(([key, item]) => { const meta = configIndicators[key] || {}; const unit = meta.unit || ""; const range = meta.reference_range || ""; return `<div class="watch-a500-indicator${item.stale ? " is-stale" : ""}"><div><strong>${escapeFallback(item.name || meta.name || "未命名指标")}</strong><span>${escapeFallback(item.label || "")}</span></div><strong>${isNumber(item.score) ? item.score.toFixed(0) : "--"}</strong><small>${isNumber(item.value) ? item.value.toLocaleString("en-US", { maximumFractionDigits: 4 }) : "--"}${escapeFallback(unit)}${range ? ` · 参考 ${escapeFallback(range)}` : ""} · ${escapeFallback(item.date || "日期未知")} · ${escapeFallback(item.source || meta.data_source || "来源未知")}${item.stale ? ` · 数据较旧${isNumber(item.stale_days) ? ` ${item.stale_days} 天` : ""}` : ""}</small></div>`; }).join("") : `<p class="watch-a500-muted">暂无该主线指标</p>`}</div></section>`).join("")}</div><p class="watch-a500-source">数据日期：${escapeFallback(t.date || "未知")} · 单位与参考区间来自原项目指标配置。</p></div>`;
 }
 
 function a500UnavailableMarkup(reason = "暂不可用") {
   return `<div class="watch-a500-unavailable"><span class="watch-status watch-status-unavailable">${escapeFallback(reason)}</span><p>自有 A500 数据源暂时不可用，暂不展示旧读数。</p></div>`;
 }
 
-function renderA500Panels(data) {
+function renderA500Panels(data, transitionConfig = data?.transitionConfig || null) {
   const available = Boolean(data?.available);
-  const safe = data || {};
+  const safe = { ...(data || {}), transitionConfig: transitionConfig || data?.transitionConfig || {} };
   const temperature = available ? renderMarketTemperatureMarkup(safe.a500) : a500UnavailableMarkup(safe.reason);
   const dividend = available ? renderDividendPanel(safe) : a500UnavailableMarkup(safe.reason);
   const macro = available ? renderTransitionPanel(safe) : a500UnavailableMarkup(safe.reason);
-  return `<section class="section-panel watch-a500 watch-panel" id="watch-panel-temperature" role="tabpanel" aria-labelledby="watch-tab-temperature" data-watch-panel="temperature" hidden><div class="section-head"><h3 class="section-title">市场温度</h3><p class="section-meta">中国A500 · 不展示过期读数</p></div><div data-a500-temperature>${temperature}</div></section>
-    <section class="section-panel watch-a500 watch-panel" id="watch-panel-dividend" role="tabpanel" aria-labelledby="watch-tab-dividend" data-watch-panel="dividend" hidden><div class="section-head"><h3 class="section-title">红利低波</h3><p class="section-meta">估值、股息与 ETF 数据</p></div><div data-a500-dividend>${dividend}</div></section>
-    <section class="section-panel watch-a500 watch-panel" id="watch-panel-macro" role="tabpanel" aria-labelledby="watch-tab-macro" data-watch-panel="macro" hidden><div class="section-head"><h3 class="section-title">宏观数据</h3><p class="section-meta">经济健康 · 指标明细</p></div><div data-a500-macro>${macro}</div></section>`;
+  return `<section class="section-panel watch-a500 watch-panel" id="watch-panel-temperature" role="tabpanel" aria-labelledby="watch-tab-temperature" data-watch-panel="temperature" hidden><div class="section-head"><h3 class="section-title">市场温度</h3><p class="section-meta">中国A500 · 指数与估值趋势</p></div><div data-a500-temperature>${temperature}</div></section>
+    <section class="section-panel watch-a500 watch-panel" id="watch-panel-dividend" role="tabpanel" aria-labelledby="watch-tab-dividend" data-watch-panel="dividend" hidden><div class="section-head"><h3 class="section-title">红利低波</h3><p class="section-meta">563020 · 股息、估值与趋势</p></div><div data-a500-dividend>${dividend}</div></section>
+    <section class="section-panel watch-a500 watch-panel" id="watch-panel-macro" role="tabpanel" aria-labelledby="watch-tab-macro" data-watch-panel="macro" hidden><div class="section-head"><h3 class="section-title">宏观数据</h3><p class="section-meta">经济健康 · 四条主线</p></div><div data-a500-macro>${macro}</div></section>`;
 }
 function targetValue(alert) {
   return alert?.target == null ? "" : String(alert.target);
@@ -233,7 +253,7 @@ export function renderWatchlistMarkup({ items = [], loading = false, error = "",
     <section class="section-panel watch-search-panel" aria-labelledby="watch-search-title">
       <div class="section-head"><h3 class="section-title" id="watch-search-title">添加标的</h3><p class="section-meta">按市场搜索代码或名称，搜索结果来自可用数据源。</p></div>
       <form class="watch-search-form" data-watch-search-form><label class="sr-only" for="watch-market">市场</label><select id="watch-market" class="form-control" data-watch-market><option value="cn">A股</option><option value="hk">港股</option><option value="us">美股</option></select><label class="sr-only" for="watch-search">股票名称或代码</label><input id="watch-search" class="form-control" type="search" autocomplete="off" placeholder="股票名称或代码" data-watch-search><button type="submit" class="btn-normal">搜索</button></form>
-      <p class="watch-search-note">支持按股票名称或代码搜索；搜索结果来自可用数据源。</p><div class="watch-search-results" data-watch-search-results aria-live="polite"></div>
+      <div class="watch-search-results" data-watch-search-results aria-live="polite"></div>
     </section>
     <section class="watchlist-section" aria-labelledby="watch-items-title"><div class="watch-section-heading"><h3 class="section-title" id="watch-items-title">我的自选</h3><span class="watch-list-state" data-watch-list-state>${loading ? "加载中" : error ? "加载失败" : `${list.length} 个标的`}</span></div><div data-watch-list>${listHtml}</div></section>
     </section>
@@ -516,6 +536,15 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = normalizeA500Data(await response.json());
       if (isCurrent(seq) && request === temperatureRequest) updateA500(data);
+      if (!data.available) return;
+      const configResponse = await Promise.resolve(fetchSnapshot(`${A500_CONFIG_URL}?v=${Date.now()}`, { cache: "no-store" })).catch(() => null);
+      if (configResponse?.ok) {
+        const config = await configResponse.json().catch(() => null);
+        if (config) {
+          data.transitionConfig = config;
+          if (isCurrent(seq) && request === temperatureRequest) updateA500(data);
+        }
+      }
     } catch {
       if (isCurrent(seq) && request === temperatureRequest) updateA500({ available: false, reason: "暂不可用" });
     }

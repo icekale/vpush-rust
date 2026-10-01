@@ -1,6 +1,7 @@
 // 全站 SVG 图标常量：线性 lucide 风格，stroke=currentColor，深浅色跟随文字。
 // app.js 统一引入后经依赖注入传给各视图；视图内不要直接 import 平台品牌图。
 export const STAR_SVG = `<svg class="star-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M12 2.5l2.95 5.98 6.6.96-4.78 4.66 1.13 6.58L12 17.6l-5.9 3.1 1.13-6.58L2.45 9.44l6.6-.96L12 2.5z"/></svg>`;
+export const WATCHLIST_ICON = `<svg class="nav-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 19V6M3 19h18M6 15l4-4 3 2 3-4"/><path d="m19 2 .75 1.6 1.75.25-1.26 1.23.3 1.74L19 6l-1.54.82.3-1.74-1.26-1.23 1.75-.25Z"/></svg>`;
 // 次要（降频）铃铛图标：线性风格，与 TRASH_ICON 一致（stroke=currentColor）
 export const BELL_ICON = `<svg class="bell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></svg>`;
 export const BELL_OFF_ICON = `<svg class="bell-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8.7 3A6 6 0 0 1 18 8a21.3 21.3 0 0 0 .6 5"/><path d="M17 17H3s3-2 3-9a4.67 4.67 0 0 1 .3-1.7"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/><path d="m2 2 20 20"/></svg>`;

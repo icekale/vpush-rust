@@ -7,7 +7,7 @@ import {
   GEAR_ICON, GITHUB_ICON, GRID_ICON, HISTORY_ICON, HOME_ICON, KEY_ICON, LIST_ICON,
   MORE_ICON, NEWS_ICON, PAPERCLIP_ICON, PLUS_ICON, REFRESH_ICON, SEARCH_ICON, SEND_ICON, STAR_SVG,
   THEME_AUTO_ICON, THEME_MOON_ICON, THEME_SUN_ICON, TRASH_ICON, USER_ICON, USER_PLUS_ICON, USERS_ICON,
-  V_ICON, WSCN_LIVE_ICON, X_ICON,
+  V_ICON, WATCHLIST_ICON, WSCN_LIVE_ICON, X_ICON,
 } from "./core/icons.js";
 import { trapFocus } from "./core/dialog.js";
 import {
@@ -385,7 +385,7 @@ const NAV = [
     { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
     { route: "knowledge", icon: BOOK_ICON, label: "研报中心" },
     { route: "home", icon: GRID_ICON, label: "订阅广场" },
-    { route: "market", icon: STAR_SVG, label: "自选股" },
+    { route: "market", icon: WATCHLIST_ICON, label: "自选股" },
     { route: "settings", icon: GEAR_ICON, label: "个人设置" },
   ]},
   { group: "管理", admin: true, items: [
@@ -458,7 +458,7 @@ const MOBILE_NAV = [
   { route: "timeline", icon: HOME_ICON, label: "动态" },
   { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
   { route: "home", icon: GRID_ICON, label: "广场" },
-  { route: "market", icon: STAR_SVG, label: "自选股" },
+  { route: "market", icon: WATCHLIST_ICON, label: "自选股" },
   { route: "settings", icon: USER_ICON, label: "个人设置" },
 ];
 

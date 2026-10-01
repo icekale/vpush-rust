@@ -225,6 +225,29 @@ CREATE TABLE IF NOT EXISTS etf_premium_alerts (
     delivery_status TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (user_id, symbol)
 );
+CREATE TABLE IF NOT EXISTS stock_watchlist (
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    market TEXT NOT NULL CHECK (market IN ('cn', 'hk', 'us')),
+    symbol TEXT NOT NULL,
+    PRIMARY KEY (user_id, market, symbol)
+);
+CREATE TABLE IF NOT EXISTS stock_price_alerts (
+    user_id INTEGER NOT NULL,
+    market TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    direction TEXT NOT NULL CHECK (direction IN ('above', 'below')),
+    target REAL NOT NULL CHECK (target > 0),
+    enabled INTEGER NOT NULL DEFAULT 0,
+    baseline_side INTEGER,
+    last_observed_at TEXT,
+    last_triggered_at TEXT,
+    delivery_status TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (user_id, market, symbol, direction),
+    FOREIGN KEY (user_id, market, symbol)
+        REFERENCES stock_watchlist(user_id, market, symbol) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_stock_price_alerts_enabled
+    ON stock_price_alerts (market, symbol, enabled);
 CREATE TABLE IF NOT EXISTS bind_codes (
     code TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,

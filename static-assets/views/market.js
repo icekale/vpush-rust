@@ -155,6 +155,7 @@ export function createMarketView({ api, escapeHtml }) {
       const footerLabel = marketClosed ? "最近交易日" : chartDelayed ? "分时延迟" : "日内分时";
       host.innerHTML = `<div class="market-heading">
           <h3 class="tl-rail-title" id="market-title">市场概览</h3>
+          <a class="market-open-link" href="/market">打开行情</a>
           <span class="market-status" role="status">${status}</span>
         </div>
         <div class="market-toolbar">

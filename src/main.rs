@@ -25,6 +25,7 @@ mod news;
 mod proxy_admin;
 mod push;
 mod reports;
+mod stock_watchlist;
 mod syslogs;
 mod tags;
 mod telegram_adapter;
@@ -74,6 +75,7 @@ const LOGIN_ACCOUNT_DELAY_MAX: u64 = 15;
 const LOGIN_WINDOW_SECS: u64 = 300;
 const SPA: &[&str] = &[
     "timeline",
+    "market",
     "home",
     "combinations",
     "mysubs",
@@ -292,6 +294,7 @@ async fn main() {
     twitter::spawn(state.db.clone());
     maintenance::spawn(state.db.clone());
     etf_premium::spawn(state.db.clone());
+    stock_watchlist::spawn(state.db.clone());
     feishu_admin::spawn_sync(state.db.clone());
     feishu_ws::resume(state.db.clone()).await;
     feishu_ws::spawn_shared(state.db.clone());
@@ -697,6 +700,19 @@ fn router(state: AppState) -> Router {
         .route("/api/live/wscn", get(live_wscn))
         .route("/api/market/indices", get(market_indices))
         .route("/api/market/etf-premiums", get(etf_premiums))
+        .route("/api/market/symbol-search", get(search_market_symbols))
+        .route(
+            "/api/me/watchlist",
+            get(get_watchlist).post(add_watchlist_symbol),
+        )
+        .route(
+            "/api/me/watchlist/{market}/{symbol}",
+            delete(delete_watchlist_symbol),
+        )
+        .route(
+            "/api/me/watchlist/{market}/{symbol}/alerts",
+            put(save_stock_alerts),
+        )
         .route("/api/me/etf-premium-alerts", get(etf_alert_settings))
         .route(
             "/api/me/etf-premium-alerts/{symbol}",
@@ -1034,6 +1050,73 @@ async fn market_indices(
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "无效的分组"));
     }
     Ok(Json(market::snapshot(&state.db, &group).await))
+}
+
+async fn search_market_symbols(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(input): Query<stock_watchlist::SearchInput>,
+) -> Result<Json<Value>, ApiError> {
+    require_user(&state, &headers).await?;
+    stock_watchlist::search(&state.db, input)
+        .await
+        .map(Json)
+        .map_err(stock_watchlist_error)
+}
+
+async fn get_watchlist(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    stock_watchlist::list(&state.db, user.id)
+        .await
+        .map(Json)
+        .map_err(stock_watchlist_error)
+}
+
+async fn add_watchlist_symbol(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<stock_watchlist::AddInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    stock_watchlist::add(&state.db, user.id, input)
+        .await
+        .map(Json)
+        .map_err(stock_watchlist_error)
+}
+
+async fn delete_watchlist_symbol(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath((market, symbol)): UrlPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    stock_watchlist::remove(&state.db, user.id, &market, &symbol)
+        .await
+        .map(Json)
+        .map_err(stock_watchlist_error)
+}
+
+async fn save_stock_alerts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    UrlPath((market, symbol)): UrlPath<(String, String)>,
+    Json(input): Json<stock_watchlist::AlertsInput>,
+) -> Result<Json<Value>, ApiError> {
+    let user = require_user(&state, &headers).await?;
+    stock_watchlist::save_alerts(&state.db, user.id, &market, &symbol, input)
+        .await
+        .map(Json)
+        .map_err(stock_watchlist_error)
+}
+
+fn stock_watchlist_error(error: stock_watchlist::WatchlistError) -> ApiError {
+    ApiError::new(
+        StatusCode::from_u16(error.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+        error.detail,
+    )
 }
 
 async fn etf_premiums(

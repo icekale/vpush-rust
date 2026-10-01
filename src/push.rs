@@ -82,7 +82,7 @@ pub async fn send_user_alert(db: &Db, user_id: i64, text: &str) -> Result<&'stat
     if !user.notify_enabled || quiet_hours(&user.dnd_start, &user.dnd_end, beijing_minutes()) {
         return Ok("suppressed");
     }
-    send_user_text_with_title(db, user_id, text, "ETF高溢价提醒").await?;
+    send_user_text_with_title(db, user_id, text, "行情提醒").await?;
     Ok("sent")
 }
 

@@ -22,6 +22,7 @@ import { createImaView } from "./views/ima.js";
 import { createFeishuPersonalView } from "./views/feishu-personal.js";
 import { createPushSettingsView } from "./views/push-settings.js";
 import { createMarketView } from "./views/market.js";
+import { createWatchlistView } from "./views/watchlist.js";
 import { createEtfPremiumView } from "./views/etf-premium.js";
 import { createPostCardExport } from "./views/post-card-export.js";
 
@@ -54,7 +55,7 @@ const GROK_TRANSLATE_ICON = `<svg class="p-tr-grok" viewBox="0 0 33 32" fill="cu
 const CHANNEL_LABELS = { telegram: "Telegram", feishu: "飞书", wecom: "企业微信", bark: "Bark", webpush: "浏览器通知" };
 const USER_CHANNEL_KEYS = ["telegram", "feishu", "wecom", "bark", "webpush"];
 const APP_VERSION = "1.12.278";
-const STATIC_ASSET_VERSION = "etf-premium-1";
+const STATIC_ASSET_VERSION = "watchlist-1";
 const KEYWORDS_MAX_COUNT = 20;
 const REPORT_WATCH_BLOCKED_TAGS = new Set([
   "中金研报", "宏观经济", "市场策略", "全球研究", "行业研究", "公司研究",
@@ -253,6 +254,7 @@ function isStandalonePwa() {
 
 function clearSessionCaches() {
   stopMarketQuotes();
+  stopWatchlist();
   if (ciccView) ciccView.reset();
   clearImaPdfUrl();
   if (typeof stopTimelinePoll === "function") stopTimelinePoll();
@@ -380,6 +382,7 @@ function avatarHtml(name, url, platform) {
 const NAV = [
   { group: "订阅", items: [
     { route: "timeline", icon: LIST_ICON, label: "最新动态" },
+    { route: "market", icon: DASHBOARD_ICON, label: "行情" },
     { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
     { route: "knowledge", icon: BOOK_ICON, label: "研报中心" },
     { route: "home", icon: GRID_ICON, label: "订阅广场" },
@@ -453,6 +456,7 @@ function renderSidebar(user) {
 
 const MOBILE_NAV = [
   { route: "timeline", icon: HOME_ICON, label: "动态" },
+  { route: "market", icon: DASHBOARD_ICON, label: "行情" },
   { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
   { route: "home", icon: GRID_ICON, label: "广场" },
   { route: "settings", icon: USER_ICON, label: "个人设置" },
@@ -4916,7 +4920,7 @@ if (window.matchMedia) {
 // ---------- 路由 ----------
 let routeRenderSeq = 0; // 每次路由切换递增；异步渲染完成后凭此丢弃过期响应
 const SPA_PREFIXES = new Set([
-  "timeline", "home", "combinations", "mysubs", "settings", "news",
+  "timeline", "home", "combinations", "mysubs", "settings", "news", "market",
   "search", "kol", "more", "admin", "zsxq", "ima-documents", "knowledge", "ticker",
 ]);
 
@@ -5676,6 +5680,7 @@ function migrateHashRoute() {
 
 async function router() {
   stopMarketQuotes();
+  stopWatchlist();
   // admin 视图懒加载：这三个 stop 来自 admin 模块，未加载时没有在跑的轮询要停
   if (adminViewsLoaded) {
     stopCiccPoll();
@@ -5759,6 +5764,7 @@ async function router() {
       return;
     }
     else if (page === "timeline") await renderTimeline(renderSeq);
+    else if (page === "market") await renderWatchlist(renderSeq);
     else if (page === "settings") await renderSettings(renderSeq);
     else if (page === "more") await renderMore(renderSeq);
     else if (page === "search") await renderSearch(renderSeq);
@@ -6362,6 +6368,16 @@ for (const name of Object.keys(INLINE_HANDLERS)) {
 }
 
 const { startMarketQuotes, stopMarketQuotes } = createMarketView({ api, escapeHtml });
+const watchlistView = createWatchlistView({
+  api,
+  escapeHtml,
+  setPageTitle,
+  go,
+  flash,
+  routeStillActive,
+  currentRouteSeq: () => routeRenderSeq,
+});
+const { renderWatchlist, stopWatchlist } = watchlistView;
 createEtfPremiumView({ api, escapeHtml });
 
 applyTheme(); // 与 index.html 防闪脚本同一逻辑，兜底 + 同步 meta theme-color

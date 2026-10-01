@@ -812,6 +812,30 @@ fn quote_status(symbol: &str, quoted_at: Option<&str>, now: i64) -> &'static str
     }
 }
 
+fn is_cn_holiday(year: i32, month: u32, day: u32) -> bool {
+    year == 2026
+        && ((month == 1 && (1..=3).contains(&day))
+            || (month == 2 && (15..=23).contains(&day))
+            || (month == 4 && (4..=6).contains(&day))
+            || (month == 5 && (1..=5).contains(&day))
+            || (month == 6 && day == 19)
+            || (month == 9 && day == 25)
+            || (month == 10 && (1..=7).contains(&day)))
+}
+
+fn is_hk_holiday(year: i32, month: u32, day: u32) -> bool {
+    year == 2026
+        && ((month == 1 && day == 1)
+            || (month == 2 && (17..=19).contains(&day))
+            || (month == 4 && (3..=7).contains(&day))
+            || (month == 5 && (day == 1 || day == 25))
+            || (month == 6 && day == 19)
+            || (month == 7 && day == 1)
+            || (month == 10 && day == 1)
+            || (month == 10 && day == 19)
+            || (month == 12 && (day == 25 || day == 26)))
+}
+
 fn default_group(now: i64) -> &'static str {
     let hour = to_cn(now).hour;
     if (8..20).contains(&hour) {
@@ -1031,6 +1055,62 @@ pub(crate) fn mainland_timestamp(timestamp_ms: i64) -> Option<(String, i64)> {
     let unix = timestamp_ms / 1000;
     let civil = from_unix(unix + 8 * 3600);
     Some((format_iso(&civil, 480), unix))
+}
+
+pub(crate) fn exchange_timestamp(market: &str, timestamp_ms: i64) -> Option<(String, i64)> {
+    if timestamp_ms <= 0 {
+        return None;
+    }
+    let unix = timestamp_ms / 1000;
+    let (civil, offset) = if market == "us" {
+        let civil = to_ny(unix);
+        let offset = ny_offset_wall(&civil);
+        (civil, offset)
+    } else {
+        (from_unix(unix + 8 * 3600), 8 * 60)
+    };
+    Some((format_iso(&civil, offset), unix))
+}
+
+pub(crate) fn exchange_calendar_known(market: &str, now: i64) -> bool {
+    matches!(market, "us") || (matches!(market, "cn" | "hk") && to_cn(now).year == 2026)
+}
+
+pub(crate) fn regular_session_open(market: &str, now: i64) -> bool {
+    let local = if market == "us" {
+        to_ny(now)
+    } else {
+        to_cn(now)
+    };
+    let weekday = weekday(local.year, local.month, local.day);
+    if weekday >= 5 {
+        return false;
+    }
+    if (market == "cn" && is_cn_holiday(local.year, local.month, local.day))
+        || (market == "hk" && is_hk_holiday(local.year, local.month, local.day))
+    {
+        return false;
+    }
+    // ponytail: CN/HK use the verified 2026 exchange calendars; update before accepting another year.
+    if !exchange_calendar_known(market, now) {
+        return false;
+    }
+    let minute = local.hour * 60 + local.minute;
+    let hk_half_day = local.year == 2026
+        && ((local.month == 2 && local.day == 16)
+            || (local.month == 12 && matches!(local.day, 24 | 31)));
+    let us_early_close = (local.month == 11 && local.day == nth_date(local.year, 11, 3, 4).2 + 1)
+        || (local.month == 12 && local.day == 24)
+        || (local.month == 7 && local.day == 3);
+    match market {
+        "cn" => (570..690).contains(&minute) || (780..900).contains(&minute),
+        "hk" => (570..720).contains(&minute) || (!hk_half_day && (780..960).contains(&minute)),
+        "us" => {
+            !is_us_holiday(local.year, local.month, local.day)
+                && (570..if us_early_close { 780 } else { 960 }).contains(&minute)
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn mainland_open(now: i64) -> bool {

@@ -41,9 +41,16 @@ test("renders all A500 project sections from the owned aggregate", () => {
   assert.match(html, /A500 温度/);
   assert.match(html, /红利低波/);
   assert.match(html, /经济健康/);
+  assert.match(html, /settings-tab-panel/);
+  assert.match(html, /a500-panel-temperature/);
   assert.match(html, /就业/);
   assert.match(html, /74/);
+  const unavailableTabs = renderA500Tabs({ available: false, reason: "暂不可用" });
+  assert.match(unavailableTabs, /A500 温度/);
+  assert.match(unavailableTabs, /红利低波/);
+  assert.match(unavailableTabs, /经济健康/);
 });
+
 test("market snapshot renders a fresh A500 temperature card and rejects stale data", () => {
   const snapshot = normalizeMarketSnapshot({
     temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4,

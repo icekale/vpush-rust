@@ -5107,6 +5107,9 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 
 /* ---------- 行情 / 自选股 ---------- */
 .watchlist-page { max-width: 1120px; margin: 0 auto; }
+.watch-workspace-tabs { margin-bottom: var(--space-5, 20px); }
+.watch-panel[hidden] { display: none; }
+.watch-panel > .watchlist-intro-actions { margin-bottom: 14px; }
 .watchlist-intro, .watch-section-heading { display: flex; align-items: end; justify-content: space-between; gap: 16px; }
 .watchlist-intro { margin: 4px 0 20px; }
 .watchlist-intro .section-title, .watch-section-heading .section-title { margin: 0; }
@@ -5166,8 +5169,7 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-state-panel strong { color: var(--color-text-strong); }
 .watch-state-panel .btn-ghost { min-height: 36px; margin-top: 4px; }
 .watch-state-error strong { color: var(--color-danger); }
-.watch-a500 { margin-top: 8px; }
-.watch-a500-tabs .settings-tabs { margin-bottom: var(--space-4); }
+.watch-a500 { margin-top: 0; }
 .watch-a500-panel-body { display: grid; gap: 16px; }
 .watch-a500-score { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .watch-a500-score > div { display: grid; gap: 3px; }
@@ -5227,7 +5229,11 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watchlist-intro, .watch-section-heading { align-items: flex-start; }
   .watchlist-intro { flex-direction: column; gap: 10px; }
   .watchlist-intro-actions { justify-content: flex-start; gap: 12px; }
-  .watch-search-form { grid-template-columns: 1fr auto; }
+  .watch-workspace-tabs { flex-wrap: nowrap; overflow-x: auto; scrollbar-width: none; }
+  .watch-workspace-tabs .settings-tab { padding-inline: 8px; }
+  .watch-workspace-tabs::-webkit-scrollbar { display: none; }
+  .watch-search-form { grid-template-columns: minmax(0, 1fr) auto; }
+  .watch-search-form .btn-normal { min-width: 68px; white-space: nowrap; }
   .watch-search-form select { grid-column: 1 / -1; }
   .watch-list { grid-template-columns: 1fr; }
   .watch-item { padding: 14px; }

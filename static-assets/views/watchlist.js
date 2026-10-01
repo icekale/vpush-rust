@@ -140,13 +140,15 @@ function a500UnavailableMarkup(reason = "暂不可用") {
   return `<div class="watch-a500-unavailable"><span class="watch-status watch-status-unavailable">${escapeFallback(reason)}</span><p>自有 A500 数据源暂时不可用，暂不展示旧读数。</p></div>`;
 }
 
-function renderA500Tabs(data) {
-  const available = Boolean(data?.a500);
+function renderA500Panels(data) {
+  const available = Boolean(data?.available);
   const safe = data || {};
   const temperature = available ? renderMarketTemperatureMarkup(safe.a500) : a500UnavailableMarkup(safe.reason);
   const dividend = available ? renderDividendPanel(safe) : a500UnavailableMarkup(safe.reason);
-  const transition = available ? renderTransitionPanel(safe) : a500UnavailableMarkup(safe.reason);
-  return `<div class="watch-a500-tabs" data-a500-tabs><div class="settings-tabs" role="tablist" aria-label="A500 数据分页"><button type="button" class="settings-tab active" role="tab" id="a500-tab-temperature" aria-selected="true" aria-controls="a500-panel-temperature" data-a500-tab="temperature">A500 温度</button><button type="button" class="settings-tab" role="tab" id="a500-tab-dividend" aria-selected="false" aria-controls="a500-panel-dividend" data-a500-tab="dividend">红利低波</button><button type="button" class="settings-tab" role="tab" id="a500-tab-transition" aria-selected="false" aria-controls="a500-panel-transition" data-a500-tab="transition">经济健康</button></div><section id="a500-panel-temperature" class="settings-tab-panel" role="tabpanel" aria-labelledby="a500-tab-temperature" data-a500-panel="temperature">${temperature}</section><section id="a500-panel-dividend" class="settings-tab-panel" role="tabpanel" aria-labelledby="a500-tab-dividend" data-a500-panel="dividend" hidden>${dividend}</section><section id="a500-panel-transition" class="settings-tab-panel" role="tabpanel" aria-labelledby="a500-tab-transition" data-a500-panel="transition" hidden>${transition}</section></div>`;
+  const macro = available ? renderTransitionPanel(safe) : a500UnavailableMarkup(safe.reason);
+  return `<section class="section-panel watch-a500 watch-panel" id="watch-panel-temperature" role="tabpanel" aria-labelledby="watch-tab-temperature" data-watch-panel="temperature" hidden><div class="section-head"><h3 class="section-title">市场温度</h3><p class="section-meta">中国A500 · 不展示过期读数</p></div><div data-a500-temperature>${temperature}</div></section>
+    <section class="section-panel watch-a500 watch-panel" id="watch-panel-dividend" role="tabpanel" aria-labelledby="watch-tab-dividend" data-watch-panel="dividend" hidden><div class="section-head"><h3 class="section-title">红利低波</h3><p class="section-meta">估值、股息与 ETF 数据</p></div><div data-a500-dividend>${dividend}</div></section>
+    <section class="section-panel watch-a500 watch-panel" id="watch-panel-macro" role="tabpanel" aria-labelledby="watch-tab-macro" data-watch-panel="macro" hidden><div class="section-head"><h3 class="section-title">宏观数据</h3><p class="section-meta">经济健康 · 指标明细</p></div><div data-a500-macro>${macro}</div></section>`;
 }
 function targetValue(alert) {
   return alert?.target == null ? "" : String(alert.target);
@@ -206,7 +208,7 @@ function itemMarkup(item, escapeHtml) {
   </article>`;
 }
 
-export { normalizeA500Data, normalizeMarketSnapshot, parseRealtimeData, renderA500Tabs, renderMarketTemperatureMarkup };
+export { normalizeA500Data, normalizeMarketSnapshot, parseRealtimeData, renderA500Panels, renderMarketTemperatureMarkup };
 
 export function renderWatchlistMarkup({ items = [], loading = false, error = "", a500Data = null, marketTemperature = null, escapeHtml: escape = escapeFallback } = {}) {
   const list = Array.isArray(items) ? items : [];
@@ -218,14 +220,23 @@ export function renderWatchlistMarkup({ items = [], loading = false, error = "",
         ? `<div class="watch-list">${list.map(item => itemMarkup(item, escape)).join("")}</div>`
         : `<div class="watch-state-panel"><strong>还没有自选股</strong><span>用上方搜索添加 A股、港股或美股标的。</span></div>`;
   return `<div class="watchlist-page">
-    <section class="watchlist-intro"><div><h2 class="section-title">自选股</h2><p class="section-meta">行情来自服务器缓存；报价延迟或不可用时不显示可能过时的数字。</p></div><div class="watchlist-intro-actions"><span class="watch-fetch-time" data-watch-fetched>上次获取时间：--</span><a class="watch-settings-link" href="/settings" data-spa-link>推送设置</a></div></section>
+    <header class="watchlist-intro"><div><h2 class="section-title">自选股</h2><p class="section-meta">行情与市场研究</p></div></header>
+    <div class="settings-tabs watch-workspace-tabs" role="tablist" aria-label="自选股板块">
+      <button type="button" class="settings-tab" role="tab" id="watch-tab-temperature" aria-selected="false" aria-controls="watch-panel-temperature" tabindex="-1" data-watch-tab="temperature">市场温度</button>
+      <button type="button" class="settings-tab" role="tab" id="watch-tab-dividend" aria-selected="false" aria-controls="watch-panel-dividend" tabindex="-1" data-watch-tab="dividend">红利低波</button>
+      <button type="button" class="settings-tab" role="tab" id="watch-tab-macro" aria-selected="false" aria-controls="watch-panel-macro" tabindex="-1" data-watch-tab="macro">宏观数据</button>
+      <button type="button" class="settings-tab active" role="tab" id="watch-tab-watchlist" aria-selected="true" aria-controls="watch-panel-watchlist" data-watch-tab="watchlist">自选股</button>
+    </div>
+    <div data-watch-a500-content>${renderA500Panels(a500Data || (marketTemperature ? { available: marketTemperature.available, a500: marketTemperature } : null))}</div>
+    <section class="watch-panel" id="watch-panel-watchlist" role="tabpanel" aria-labelledby="watch-tab-watchlist" data-watch-panel="watchlist">
+    <div class="watchlist-intro-actions"><span class="watch-fetch-time" data-watch-fetched>上次获取时间：--</span><a class="watch-settings-link" href="/settings" data-spa-link>推送设置</a></div>
     <section class="section-panel watch-search-panel" aria-labelledby="watch-search-title">
       <div class="section-head"><h3 class="section-title" id="watch-search-title">添加标的</h3><p class="section-meta">按市场搜索代码或名称，搜索结果来自可用数据源。</p></div>
       <form class="watch-search-form" data-watch-search-form><label class="sr-only" for="watch-market">市场</label><select id="watch-market" class="form-control" data-watch-market><option value="cn">A股</option><option value="hk">港股</option><option value="us">美股</option></select><label class="sr-only" for="watch-search">股票名称或代码</label><input id="watch-search" class="form-control" type="search" autocomplete="off" placeholder="股票名称或代码" data-watch-search><button type="submit" class="btn-normal">搜索</button></form>
       <p class="watch-search-note">支持按股票名称或代码搜索；搜索结果来自可用数据源。</p><div class="watch-search-results" data-watch-search-results aria-live="polite"></div>
     </section>
     <section class="watchlist-section" aria-labelledby="watch-items-title"><div class="watch-section-heading"><h3 class="section-title" id="watch-items-title">我的自选</h3><span class="watch-list-state" data-watch-list-state>${loading ? "加载中" : error ? "加载失败" : `${list.length} 个标的`}</span></div><div data-watch-list>${listHtml}</div></section>
-    <section class="section-panel watch-a500" aria-labelledby="watch-a500-title"><div class="section-head"><h3 class="section-title" id="watch-a500-title">A500 市场研究</h3><p class="section-meta">自有数据源 · 不展示过期读数</p></div><div data-watch-a500-content>${renderA500Tabs(a500Data || (marketTemperature ? { available: marketTemperature.available, a500: marketTemperature } : null))}</div></section>
+    </section>
   </div>`;
 }
 
@@ -456,19 +467,44 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     host.querySelectorAll("[data-delete-watch]").forEach(button => on(button, "click", () => deleteItem(button.dataset.deleteWatch, button)));
     host.querySelectorAll("[data-alert-form]").forEach(form => bindRuleDirty(form, on));
     on(host.querySelector("[data-retry-watch]"), "click", () => refresh(seq, true));
-    removeListeners = () => { listeners.forEach(remove => remove()); };
-  }
-
-  function bindA500Tabs() {
-    host?.querySelectorAll("[data-a500-tab]").forEach(button => button.addEventListener("click", () => {
-      const name = button.dataset.a500Tab;
-      host.querySelectorAll("[data-a500-tab]").forEach(tab => {
+    const tabs = [...host.querySelectorAll("[data-watch-tab]")];
+    const selectTab = button => {
+      tabs.forEach(tab => {
         const selected = tab === button;
         tab.classList.toggle("active", selected);
         tab.setAttribute("aria-selected", String(selected));
+        tab.tabIndex = selected ? 0 : -1;
       });
-      host.querySelectorAll("[data-a500-panel]").forEach(panel => { panel.hidden = panel.dataset.a500Panel !== name; });
-    }));
+      host.querySelectorAll("[data-watch-panel]").forEach(panel => { panel.hidden = panel.dataset.watchPanel !== button.dataset.watchTab; });
+    };
+    tabs.forEach((tab, index) => {
+      on(tab, "click", () => selectTab(tab));
+      on(tab, "keydown", event => {
+        const next = event.key === "ArrowRight" ? index + 1 : event.key === "ArrowLeft" ? index - 1 : event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : null;
+        if (next === null) return;
+        event.preventDefault();
+        const target = tabs[(next + tabs.length) % tabs.length];
+        selectTab(target);
+        target.focus();
+      });
+    });
+    removeListeners = () => { listeners.forEach(remove => remove()); };
+  }
+
+  function updateA500(data) {
+    const content = host?.querySelector("[data-watch-a500-content]");
+    if (!content) return;
+    const available = Boolean(data?.available);
+    const safe = data || {};
+    const sections = {
+      temperature: available ? renderMarketTemperatureMarkup(safe.a500) : a500UnavailableMarkup(safe.reason),
+      dividend: available ? renderDividendPanel(safe) : a500UnavailableMarkup(safe.reason),
+      macro: available ? renderTransitionPanel(safe) : a500UnavailableMarkup(safe.reason),
+    };
+    Object.entries(sections).forEach(([name, markup]) => {
+      const node = content.querySelector(`[data-a500-${name}]`);
+      if (node) node.innerHTML = markup;
+    });
   }
 
   async function loadA500(seq) {
@@ -479,9 +515,9 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
       const response = await fetchSnapshot(`${A500_DATA_URL}?v=${Date.now()}`, { cache: "no-store" });
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
       const data = normalizeA500Data(await response.json());
-      if (isCurrent(seq) && request === temperatureRequest) { content.innerHTML = renderA500Tabs(data); bindA500Tabs(); }
+      if (isCurrent(seq) && request === temperatureRequest) updateA500(data);
     } catch {
-      if (isCurrent(seq) && request === temperatureRequest) content.innerHTML = renderA500Tabs({ available: false, reason: "暂不可用" });
+      if (isCurrent(seq) && request === temperatureRequest) updateA500({ available: false, reason: "暂不可用" });
     }
   }
 

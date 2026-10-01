@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { alertPayloadFromValues, createWatchlistView, normalizeA500Data, normalizeMarketSnapshot, parseRealtimeData, renderA500Tabs, renderMarketTemperatureMarkup, renderWatchlistMarkup } from "../static-assets/views/watchlist.js";
+import { alertPayloadFromValues, createWatchlistView, normalizeA500Data, normalizeMarketSnapshot, parseRealtimeData, renderA500Panels, renderMarketTemperatureMarkup, renderWatchlistMarkup } from "../static-assets/views/watchlist.js";
 
 test("watchlist renders loading, empty, unavailable, and zero states", () => {
   assert.match(renderWatchlistMarkup({ loading: true }), /正在加载自选股/);
@@ -37,18 +37,30 @@ test("renders all A500 project sections from the owned aggregate", () => {
     transition: { date: "2026-09-29", temperature: 61.6, band: "温和区", indicators: [{ name: "就业", score: 70 }] },
   }, new Date("2026-10-01T05:10:00Z"));
   assert.equal(data.a500.available, true);
-  const html = renderA500Tabs(data);
-  assert.match(html, /A500 温度/);
+  const html = renderA500Panels(data);
+  assert.match(html, /市场温度/);
   assert.match(html, /红利低波/);
-  assert.match(html, /经济健康/);
-  assert.match(html, /settings-tab-panel/);
-  assert.match(html, /a500-panel-temperature/);
+  assert.match(html, /宏观数据/);
+  assert.match(html, /role="tabpanel"/);
+  assert.match(html, /watch-panel-temperature/);
   assert.match(html, /就业/);
   assert.match(html, /74/);
-  const unavailableTabs = renderA500Tabs({ available: false, reason: "暂不可用" });
-  assert.match(unavailableTabs, /A500 温度/);
+  const unavailableTabs = renderA500Panels({ available: false, reason: "暂不可用" });
+  assert.match(unavailableTabs, /市场温度/);
   assert.match(unavailableTabs, /红利低波/);
-  assert.match(unavailableTabs, /经济健康/);
+  assert.match(unavailableTabs, /宏观数据/);
+});
+
+test("watchlist has four peer tabs, defaulting to the watchlist and keeping other panels hidden", () => {
+  const html = renderWatchlistMarkup({ loading: true });
+  assert.deepEqual([...html.matchAll(/data-watch-tab="([^"]+)"/g)].map(match => match[1]), ["temperature", "dividend", "macro", "watchlist"]);
+  assert.equal((html.match(/role="tabpanel"/g) || []).length, 4);
+  assert.match(html, /data-watch-panel="temperature" hidden/);
+  assert.match(html, /data-watch-panel="dividend" hidden/);
+  assert.match(html, /data-watch-panel="macro" hidden/);
+  assert.match(html, /aria-selected="true"[^>]*data-watch-tab="watchlist"/);
+  assert.match(html, /data-watch-panel="watchlist"[^>]*>[\s\S]*data-watch-search-form[\s\S]*data-watch-list/);
+  assert.doesNotMatch(html, /data-a500-tab=/);
 });
 
 test("market snapshot renders a fresh A500 temperature card and rejects stale data", () => {

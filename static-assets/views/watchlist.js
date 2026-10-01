@@ -84,6 +84,31 @@ function normalizeMarketSnapshot(payload, now = new Date()) {
   };
 }
 
+function guideValue(value, suffix = "") {
+  return isNumber(value) ? `${number(value)}${suffix}` : "--";
+}
+
+function renderTemperatureGuide(snapshot) {
+  const s = snapshot || {};
+  const pe = guideValue(s.pe);
+  const stockYield = guideValue(isNumber(s.stockYield) ? s.stockYield : (isNumber(s.pe) && s.pe > 0 ? 100 / s.pe : null), "%");
+  const bondYield = guideValue(s.bondYield, "%");
+  const dividendYield = guideValue(s.dividendYield, "%");
+  const spread = guideValue(s.spread, "%");
+  return `<details class="watch-a500-guide">
+    <summary>指标参考指南</summary>
+    <div class="watch-a500-guide-body">
+      <section><h4>温度</h4><div class="watch-a500-guide-table"><div><span>低于 30°C</span><b class="positive">可以买入</b></div><div><span>30–60°C</span><b>持有不动</b></div><div><span>60–80°C</span><b class="warning">关注，可减仓</b></div><div><span>高于 80°C</span><b class="negative">停止买入</b></div></div></section>
+      <section><h4>回本年限（PE）</h4><div class="watch-a500-guide-table"><div><span>低于 13 年</span><b class="positive">可买入</b></div><div><span>13–15 年</span><b>持有不动</b></div><div><span>高于 15 年</span><b class="warning">谨慎</b></div><div><span>高于 17 年</span><b class="negative">避免买入</b></div></div><p>当前 <strong>${pe}</strong></p></section>
+      <section><h4>盈利收益率（1 ÷ PE）</h4><p>假设 500 家公司利润不变且全部分红，每年能拿回投入的百分比，主要用来和国债利率对比。</p><p>当前 <strong>${stockYield}</strong></p></section>
+      <section><h4>10 年国债利率</h4><p>中国政府债券的年利率，近似“无风险收益”基准。越低，股票的相对吸引力越高。</p><p>当前 <strong>${bondYield}</strong></p></section>
+      <section><h4>股息率</h4><div class="watch-a500-guide-table"><div><span>高于 3%</span><b class="positive">分红不错，有安全垫</b></div><div><span>2–3%</span><b>中等，一般</b></div><div><span>低于 2%</span><b>偏低，分红吸引力不足</b></div></div><p>当前 <strong>${dividendYield}</strong></p></section>
+      <section><h4>股票 vs 国债（ERP）</h4><div class="watch-a500-guide-table"><div><span>高于 3%</span><b class="positive">股票明显更划算</b></div><div><span>1.5–3%</span><b>还可以，中等</b></div><div><span>0–1.5%</span><b class="warning">吸引力一般</b></div><div><span>低于 0</span><b class="negative">买债券比股票好</b></div></div><p>当前 <strong>${spread}</strong></p></section>
+      <section><h4>指标之间的关系</h4><ul><li><b>温度</b> = PE 分位 × 60% + 价格分位 × 40%</li><li><b>回本年限（PE）</b>就是估值本身</li><li><b>盈利收益率</b> = 1 ÷ PE，用来和国债利率对比</li><li><b>股债溢价</b> = 盈利收益率 − 国债利率</li><li><b>股息率</b> = 成分股分红 ÷ 指数价格</li></ul></section>
+    </div>
+  </details>`;
+}
+
 function renderMarketTemperatureMarkup(snapshot) {
   if (!snapshot?.available) return `<div class="watch-temperature-unavailable" data-watch-temperature-state><span class="watch-status watch-status-unavailable">${escapeFallback(snapshot?.reason || "暂不可用")}</span><p>${escapeFallback(snapshot?.reason === "数据延迟" ? "a500 数据超过可接受时效，暂不展示旧读数" : "a500 数据暂时不可用，暂不展示未经核验的读数")}</p></div>`;
   const marker = Math.max(0, Math.min(100, Number(snapshot.temperature)));
@@ -92,6 +117,7 @@ function renderMarketTemperatureMarkup(snapshot) {
     <div class="watch-temperature-scale" aria-label="市场温度 ${snapshot.temperature} 度"><span class="watch-temperature-marker" style="left:${marker}%"></span><span class="watch-temperature-scale-label">偏冷</span><span class="watch-temperature-scale-label">正常</span><span class="watch-temperature-scale-label">偏热</span></div>
     <div class="watch-temperature-metrics"><div><span>PE-TTM</span><strong>${number(snapshot.pe)}</strong></div><div><span>PE 分位</span><strong>${number(snapshot.pe_percentile)}%</strong></div><div><span>价格分位</span><strong>${number(snapshot.price_percentile)}%</strong></div><div><span>指数涨跌</span><strong class="${tone(snapshot.change)}">${percent(snapshot.change)}</strong></div><div><span>股债利差</span><strong>${number(snapshot.stockYield)}%</strong></div><div><span>定投比例</span><strong>${number(snapshot.dcaPct)}%</strong></div></div>
     <div class="watch-a500-columns"><div>${trendBlock(snapshot.temperature_history, "temp", "temperature", "温度走势", "°")}</div><div>${trendBlock(snapshot.pe_history, "pe", "pe", "PE-TTM 走势")}</div></div>
+    ${renderTemperatureGuide(snapshot)}
     <div class="watch-temperature-source">数据源：a500 · ${escapeFallback(snapshot.dcaLabel || "定投策略数据")}</div>
   </div>`;
 }

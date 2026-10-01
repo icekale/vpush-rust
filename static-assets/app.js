@@ -385,7 +385,7 @@ const NAV = [
     { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
     { route: "knowledge", icon: BOOK_ICON, label: "研报中心" },
     { route: "home", icon: GRID_ICON, label: "订阅广场" },
-    { route: "market", icon: DASHBOARD_ICON, label: "行情" },
+    { route: "market", icon: STAR_SVG, label: "自选股" },
     { route: "settings", icon: GEAR_ICON, label: "个人设置" },
   ]},
   { group: "管理", admin: true, items: [
@@ -458,7 +458,7 @@ const MOBILE_NAV = [
   { route: "timeline", icon: HOME_ICON, label: "动态" },
   { route: "news", icon: NEWS_ICON, label: "财经资讯", badge: "news" },
   { route: "home", icon: GRID_ICON, label: "广场" },
-  { route: "market", icon: DASHBOARD_ICON, label: "行情" },
+  { route: "market", icon: STAR_SVG, label: "自选股" },
   { route: "settings", icon: USER_ICON, label: "个人设置" },
 ];
 

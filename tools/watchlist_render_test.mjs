@@ -122,11 +122,17 @@ test("watchlist has four peer tabs, defaulting to the watchlist and keeping othe
 test("market snapshot renders a fresh A500 temperature card and rejects stale data", () => {
   const snapshot = normalizeMarketSnapshot({
     temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4,
-    market: false, fresh: true, delayed: false, change: 0.19, ts: "2026-10-01 12:04:49",
+    market: false, fresh: true, delayed: false, change: 0.19, dcaLabel: "正常定投", ts: "2026-10-01 12:04:49",
   }, new Date("2026-10-01T04:05:00Z"));
   assert.equal(snapshot.available, true);
-  assert.match(renderMarketTemperatureMarkup(snapshot), /41/);
-  assert.match(renderMarketTemperatureMarkup(snapshot), /中国A500/);
+  const html = renderMarketTemperatureMarkup(snapshot);
+  assert.match(html, /41/);
+  assert.match(html, /中国A500/);
+  assert.match(html, /watch-temperature-primary[\s\S]*watch-temperature-quote/);
+  assert.match(html, /正常定投/);
+  assert.equal((html.match(/>收盘</g) || []).length, 1);
+  assert.equal(html.split(snapshot.updatedLabel).length - 1, 1);
+  assert.doesNotMatch(html, /更新于/);
 
   const stale = normalizeMarketSnapshot({ temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4, market: false, fresh: true, delayed: false, change: 0.19, ts: "2026-09-30 12:04:49" }, new Date("2026-10-01T04:05:00Z"));
   assert.equal(stale.available, false);

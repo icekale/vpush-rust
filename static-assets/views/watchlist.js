@@ -168,6 +168,69 @@ function renderDividendPanel(data) {
   return `<div class="watch-a500-panel-body"><div class="watch-a500-decision"><div><span class="watch-a500-kicker">红利低波 · 563020</span><strong>${escapeFallback(d.light_score ?? "--")}</strong><span>${escapeFallback(d.light_label || "暂无评级")}</span></div><div class="watch-a500-etf"><span>ETF 最新价</span><strong>${etf}</strong><small>${escapeFallback(d.update_time || "数据日期未知")}</small></div></div><div class="watch-a500-metrics watch-a500-core-metrics">${metrics.map(([label, value, suffix, date]) => `<div><span>${label}</span><strong>${isNumber(value) ? number(value) + suffix : "--"}</strong><small>${escapeFallback(date || "")}</small></div>`).join("")}</div><div class="watch-a500-columns"><div>${trendBlock(d.dividend_history, "v", "dividend", "股息率走势", "%")}</div><div>${trendBlock(d.temp_history, "t", "dividend-temperature", "红利温度走势", "°")}</div></div><p class="watch-a500-source">数据源：a500 红利低波数据 · 权重：${escapeFallback(d.light_weights || "--")} · ${escapeFallback(d.trend_reason || "趋势状态未知")}</p></div>`;
 }
 
+const TRANSITION_INFO = {
+  cpi: ["CPI同比（居民消费价格）", "今年这个月买东西比去年同月贵了多少。", "国家统计局在全国各地采价，对比今年和去年同期的价格变化。", "0.5-3%为温和通胀。太低说明没人消费，太高说明钱不值钱。", "CPI温和正增长说明内需正常。"],
+  ppi: ["PPI同比（工业生产者出厂价格）", "工厂把货卖给下游时的价格，比去年同月贵/便宜了多少。", "国家统计局收集全国工业企业的出厂价。", "-1%到3%。低于-2%说明工业需求不足。", "PPI回升说明工业需求在修复。"],
+  pmi: ["制造业PMI", "每个月对全国采购经理做问卷，问\"你这个月生意比上个月好还是差\"，汇总成一个指数。", "扩散指数。50是荣枯线——>50说明大部分人觉得生意在变好。", ">52说明景气向好，48-50偏弱。", "PMI在扩张区间意味着制造业整体稳定。"],
+  electricity: ["全社会用电量同比", "今年这个月全国用了多少电，比去年同月多了还是少了。", "电表读数没法作假，是衡量真实经济活力最硬的指标。", "2-8%。", "只要电表在转，经济就在运转。"],
+  retail_sales: ["社会消费品零售总额同比", "今年这个月全国卖了多少东西，比去年同月多还是少。", "", "3-10%为正常增长。负增长说明消费收缩。", "社零是内需最直接的指标。"],
+  unemployment: ["城镇调查失业率", "全国城镇劳动力中，正在找工作但没找到的人占多少比例。", "", "4.5-5.5%为正常。", "失业率是民生指标的核心。"],
+  disposable_income: ["居民可支配收入累计同比", "居民拿到手可以花的钱，比去年多了还是少了。", "", "4-7%为正常增长。", "收入增速跟不上GDP，内需就很难起来。"],
+  m2: ["M2同比", "全社会一共有多少钱。", "", "8-10%为适度。", "适度宽松的货币环境是企业正常经营的前提。"],
+  rmb_loan: ["人民币贷款余额同比", "银行借出去的所有人民币贷款余额，比去年同月多了多少。", "", "8-14%为正常。", "贷款增速是\"宽信用\"的直接度量。"],
+  bond_yield: ["10年国债收益率", "你买10年期国债，国家每年给你多少利息。", "", "1.8-3%。过低说明避险情绪高。", "低利率降低企业融资成本，但过低也反映经济信心不足。"],
+  lpr: ["1年期LPR", "银行给最优质客户贷款的基准利率。", "", "3.0-4.5%。利率越低说明货币政策越宽松。", "LPR持续下调说明央行在主动宽松。"],
+  industrial_output: ["规模以上工业增加值同比", "全国规模以上工业企业这个月生产了多少东西，比去年同月多了还是少了。", "", "5-8%为正常。", "工业增加值是实体经济供给端的核心指标。"],
+  export: ["出口同比增速", "今年这个月卖到国外的商品总额，比去年同月多了还是少了。", "", "3-10%为正常。", "出口稳定说明制造业有竞争力。"],
+  currency_index: ["人民币CFETS汇率指数", "人民币对一篮子货币的整体强弱。", "", "95-102为稳定。", "汇率稳定有利于进出口贸易。"],
+  ai_market_share: ["中国AI模型海外调用份额", "全球开发者在OpenRouter平台上调用AI模型时，中国模型占了多少比例。", "", "", "这是新经济竞争力的直接体现。"],
+  new_energy_penetration: ["新能源汽车渗透率", "全国新卖出的汽车中，新能源车占了多少比例。", "", "30-50%。越高说明新能源替代越快。", "这是中国新质生产力最具标志性的指标。"],
+};
+
+function transitionIndicatorInfo(key) {
+  const info = TRANSITION_INFO[key];
+  if (!info) return "";
+  return `<details class="watch-transition-info"><summary>指标解读</summary><div><h5>${escapeFallback(info[0])}</h5>${["这是什么", key === "electricity" ? "为什么可靠" : "怎么算的", "正常范围", "反映的经济状况"].map((label, index) => info[index + 1] ? `<p><b>${label}：</b>${escapeFallback(info[index + 1])}</p>` : "").join("")}</div></details>`;
+}
+
+function transitionJudgment(key, score) {
+  const judgments = {
+    line1: ["需求不振", "内需偏弱", "内需正常"], line2: ["就业承压", "就业正常", "就业良好"],
+    line3: ["信用偏紧", "货币适度", "信用扩张"], line4: ["动力不足", "转型推进", "转型加速"],
+  };
+  return judgments[key]?.[score < 40 ? 0 : score < 70 ? 1 : 2] || "";
+}
+
+function transitionTakeaway(lineScore, indicators) {
+  if (lineScore >= 70) return "整体向好";
+  const scored = indicators.filter(([, item]) => isNumber(item.score));
+  const best = scored.reduce((a, b) => !a || b[1].score > a[1].score ? b : a, null)?.[1];
+  const worst = scored.reduce((a, b) => !a || b[1].score < a[1].score ? b : a, null)?.[1];
+  return [worst?.score < 40 ? `${worst.name}偏弱` : "", best?.score >= 70 ? `${best.name}有支撑` : ""].filter(Boolean).join("，") || "表现中等";
+}
+
+function renderTransitionGuide(transition, config) {
+  const t = transition || {};
+  const lines = config?.lines || {};
+  const lineScores = t.lineScores || {};
+  const indicators = Object.entries(t.indicators || {});
+  const lineRows = ["line1", "line2", "line3", "line4"].map(key => {
+    const line = lines[key] || {};
+    const score = lineScores[key] || {};
+    const weight = isNumber(score.weight) ? score.weight : isNumber(line.weight) ? line.weight * 100 : null;
+    return `<div><span>${escapeFallback(line.emoji || "")} ${escapeFallback(score.name || line.name || key)}</span><b>${isNumber(weight) ? `${weight.toFixed(0)}%` : "--"}</b></div>`;
+  }).join("");
+  const indicatorRows = indicators.map(([key, item]) => `<div class="watch-transition-guide-indicator"><span><strong>${escapeFallback(item.name || key)}</strong> <small>${item.auto ? "✅自动" : "⚠️手动"}</small></span><span>当前 ${isNumber(item.value) ? item.value : "--"} → ${isNumber(item.score) ? Math.round(item.score) : "--"}分（${escapeFallback(item.label || "--")}）· 权重${isNumber(item.weight) ? Math.round(item.weight * 100) : "--"}%</span><small>${escapeFallback(item.source || "来源未知")} · 截至 ${escapeFallback(item.date || "未知")}${item.stale ? " · ⚠️过期" : ""}</small></div>`).join("");
+  return `<details class="watch-a500-guide watch-transition-guide">
+    <summary>经济健康指南 · 权重与解读</summary>
+    <div class="watch-a500-guide-body">
+      <section><h4>🌡️ 经济健康度怎么算？</h4><p>综合温度 = 各指标得分 × 权重的加权总和。四条主线：</p><div class="watch-a500-guide-table">${lineRows}</div><p>每个指标按当前值 vs 阈值映射到 0–100 分。</p></section>
+      <section><h4>📊 温度区间解读</h4><div class="watch-a500-guide-table"><div><span>❄️ &lt; 40</span><b>低温区 · 整体偏冷</b></div><div><span>🌤️ 40–69</span><b>温和区 · 正常运转</b></div><div><span>🔥 ≥ 70</span><b>升温区 · 整体向好</b></div></div></section>
+      <section class="watch-transition-guide-indicators"><h4>📈 各指标详情</h4>${indicatorRows || '<p>暂无指标数据</p>'}</section>
+    </div>
+  </details>`;
+}
+
 function renderTransitionPanel(data) {
   const t = data.transition || {};
   const config = data.transitionConfig || {};
@@ -179,7 +242,30 @@ function renderTransitionPanel(data) {
     const lineNumber = Number(String(key).replace("line", ""));
     return { key, line, indicators: entries.filter(([, item]) => Number(item.line) === lineNumber || (lineNumber === 1 && item.line == null)) };
   });
-  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">经济健康温度</span><strong>${isNumber(t.temperature) ? t.temperature.toFixed(1) : "--"}</strong><span>${escapeFallback(t.band || "暂无区间")}</span></div><span class="watch-a500-emoji">${escapeFallback(t.emoji || "")}</span></div><p class="watch-a500-description">${escapeFallback(t.description || "暂无说明")}</p><div class="watch-a500-line-sections">${grouped.map(({ line, indicators }) => `<section class="watch-a500-line-section"><div class="watch-a500-line-heading"><div><strong>${escapeFallback(line.name || "未命名主线")}</strong><span>权重 ${isNumber(line.weight) ? line.weight.toFixed(1) : "--"}%</span></div><b>${isNumber(line.score) ? line.score.toFixed(1) : "--"}</b></div><div class="watch-a500-indicators">${indicators.length ? indicators.map(([key, item]) => { const meta = configIndicators[key] || {}; const unit = meta.unit || ""; const range = meta.reference_range || ""; return `<div class="watch-a500-indicator${item.stale ? " is-stale" : ""}"><div><strong>${escapeFallback(item.name || meta.name || "未命名指标")}</strong><span>${escapeFallback(item.label || "")}</span></div><strong>${isNumber(item.score) ? item.score.toFixed(0) : "--"}</strong><small>${isNumber(item.value) ? item.value.toLocaleString("en-US", { maximumFractionDigits: 4 }) : "--"}${escapeFallback(unit)}${range ? ` · 参考 ${escapeFallback(range)}` : ""} · ${escapeFallback(item.date || "日期未知")} · ${escapeFallback(item.source || meta.data_source || "来源未知")}${item.stale ? ` · 数据较旧${isNumber(item.stale_days) ? ` ${item.stale_days} 天` : ""}` : ""}</small></div>`; }).join("") : `<p class="watch-a500-muted">暂无该主线指标</p>`}</div></section>`).join("")}</div><p class="watch-a500-source">数据日期：${escapeFallback(t.date || "未知")} · 单位与参考区间来自原项目指标配置。</p></div>`;
+  const judgments = { line1: "内需", line2: "就业", line3: "信用", line4: "转型" };
+  const overview = grouped.map(({ key, line, indicators }) => {
+    const score = line.score;
+    const best = indicators.filter(([, item]) => isNumber(item.score)).reduce((a, b) => !a || b[1].score > a[1].score ? b : a, null)?.[1];
+    const worst = indicators.filter(([, item]) => isNumber(item.score)).reduce((a, b) => !a || b[1].score < a[1].score ? b : a, null)?.[1];
+    const weight = isNumber(line.weight) ? `${Math.round(line.weight)}%` : "--";
+    const short = name => String(name || "").replace("同比", "").replace("累计", "").replace("规模以上", "");
+    return `<div class="watch-transition-line"><div><strong>${escapeFallback(line.name || judgments[key] || "未命名主线")}</strong><small>${weight}</small></div><b>${isNumber(score) ? Math.round(score) : "--"}</b><span>${escapeFallback(isNumber(score) ? transitionJudgment(key, score) : "暂无评级")}</span><div class="watch-transition-bar"><i style="width:${isNumber(score) ? Math.max(0, Math.min(100, score)) : 0}%"></i></div><small>${best && worst && best !== worst ? `▲ ${escapeFallback(short(best.name))} ${Math.round(best.score)} · ▼ ${escapeFallback(short(worst.name))} ${Math.round(worst.score)} · ` : ""}${escapeFallback(isNumber(score) ? transitionTakeaway(score, indicators) : "暂无说明")}</small></div>`;
+  }).join("");
+  const stale = entries.filter(([, item]) => item.stale).map(([, item]) => item.name);
+  const manual = entries.filter(([, item]) => !item.auto).map(([, item]) => item.name);
+  const warnings = [stale.length ? `数据过期(${stale.length}): ${stale.join("、")}` : "", manual.length ? `手动录入: ${manual.join("、")}` : ""].filter(Boolean);
+  const sections = grouped.map(({ key, line, indicators }) => {
+    const metaLine = config.lines?.[key] || {};
+    const weight = isNumber(line.weight) ? line.weight.toFixed(1) : isNumber(metaLine.weight) ? (metaLine.weight * 100).toFixed(1) : "--";
+    const items = indicators.map(([indicatorKey, item]) => {
+      const meta = configIndicators[indicatorKey] || {};
+      const unit = meta.unit || "";
+      const range = meta.reference_range || "";
+      return `<div class="watch-a500-indicator${item.stale ? " is-stale" : ""}"><div><strong>${escapeFallback(item.name || meta.name || "未命名指标")}</strong><span>${item.stale ? "⚠️过期" : item.auto ? "✅自动" : "⚠️手动"}</span></div><strong>${isNumber(item.value) ? item.value.toLocaleString("en-US", { maximumFractionDigits: 4 }) : "--"}${escapeFallback(unit)}</strong><small>${escapeFallback(item.label || "")} · ${isNumber(item.score) ? Math.round(item.score) : "--"}分 · ${range ? `参考 ${escapeFallback(range)} · ` : ""}${escapeFallback(item.date || "日期未知")} · ${escapeFallback(item.source || meta.data_source || "来源未知")}${item.stale ? ` · 数据较旧${isNumber(item.stale_days) ? ` ${item.stale_days} 天` : ""}` : ""}</small>${transitionIndicatorInfo(indicatorKey)}</div>`;
+    }).join("");
+    return `<section class="watch-a500-line-section"><div class="watch-a500-line-heading"><div><strong>${escapeFallback(metaLine.emoji || "")} ${escapeFallback(line.name || metaLine.name || "未命名主线")}</strong><span>权重 ${weight}% · ${escapeFallback(metaLine.description || "")}</span></div><b>${isNumber(line.score) ? line.score.toFixed(1) : "--"}</b></div><div class="watch-a500-indicators">${items || `<p class="watch-a500-muted">暂无该主线指标</p>`}</div></section>`;
+  }).join("");
+  return `<div class="watch-a500-panel-body"><div class="watch-a500-score"><div><span class="watch-a500-kicker">经济健康温度</span><strong>${isNumber(t.temperature) ? t.temperature.toFixed(1) : "--"}</strong><span>${escapeFallback(t.band || "暂无区间")}</span></div><span class="watch-a500-emoji">${escapeFallback(t.emoji || "")}</span></div><p class="watch-a500-description">${escapeFallback(t.description || "暂无说明")}</p><div class="watch-transition-overview">${overview}</div><div class="watch-a500-line-sections">${sections}</div>${warnings.length ? `<p class="watch-transition-warning">${warnings.map(escapeFallback).join("<br>")}</p>` : ""}${renderTransitionGuide(t, config)}<p class="watch-a500-source">数据日期：${escapeFallback(t.date || "未知")} · ✅ 自动 · ⚠️ 手动 · ⚠️过期 · 月频更新 · 仅供参考</p></div>`;
 }
 
 function a500UnavailableMarkup(reason = "暂不可用") {

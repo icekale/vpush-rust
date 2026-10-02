@@ -4,6 +4,13 @@ export function escapeHtml(text) {
   }[c]));
 }
 
+export function shellRevision(doc) {
+  const imports = doc.querySelector('script[type="importmap"]')?.textContent;
+  const style = doc.querySelector('link[rel="stylesheet"][href^="/style."]')?.getAttribute("href");
+  const app = doc.querySelector('script[type="module"][src^="/app."]')?.getAttribute("src");
+  return imports && style && app ? `${imports}|${style}|${app}` : "";
+}
+
 export function jsString(text) {
   return escapeHtml(JSON.stringify(String(text ?? "")));
 }

@@ -1,11 +1,11 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-market-ui-polish-1";
+const CACHE = "dav-shell-1.12.279";
 const SHELL = [
   "/",
-  "/app.94a55957d7c4.js",
+  "/app.5d0237645ca7.js",
   // asset-modules:start
   "/core/dialog.b2db015b3a5e.js",
-  "/core/html.be440515d828.js",
+  "/core/html.98867022c29c.js",
   "/core/icons.7e8a5a25d922.js",
   "/core/lightbox.63db409ddbd8.js",
   "/core/platforms.e3f9b30aa971.js",

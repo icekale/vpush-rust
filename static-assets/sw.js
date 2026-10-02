@@ -1,5 +1,5 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-market-ui-repair-2";
+const CACHE = "dav-shell-market-ui-repair-3";
 const SHELL = [
   "/",
   "/app.94a55957d7c4.js",
@@ -25,9 +25,9 @@ const SHELL = [
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.147a37ee9001.js",
   "/views/etf-premium.b096b76ff531.js",
-  "/views/watchlist.734aef6cc8a6.js",
+  "/views/watchlist.6061bbada4dc.js",
   // asset-modules:end
-  "/style.99027d245da5.css",
+  "/style.fb12836f8d20.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",

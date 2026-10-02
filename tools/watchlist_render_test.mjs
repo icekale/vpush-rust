@@ -143,6 +143,11 @@ test("market snapshot renders a fresh A500 temperature card and rejects stale da
   assert.equal(snapshot.available, true);
   const html = renderMarketTemperatureMarkup(snapshot);
   assert.match(html, /41/);
+  assert.match(html, /watch-temperature-segment-cold/);
+  assert.match(html, /低估<\/b><small>&lt;30°C/);
+  assert.match(html, /过热<\/b><small>&gt;80°C/);
+  assert.match(html, /watch-temperature-actions/);
+  assert.match(html, /考虑减仓/);
   assert.match(html, /中国A500/);
   assert.match(html, /watch-temperature-primary[\s\S]*watch-temperature-quote/);
   assert.match(html, /正常定投/);

@@ -1,5 +1,5 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-market-polish-4";
+const CACHE = "dav-shell-etf-alerts-macro-health-1";
 const SHELL = [
   "/",
   "/app.94a55957d7c4.js",
@@ -25,9 +25,9 @@ const SHELL = [
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.147a37ee9001.js",
   "/views/etf-premium.b096b76ff531.js",
-  "/views/watchlist.43a61c25aa24.js",
+  "/views/watchlist.72db3737f2ac.js",
   // asset-modules:end
-  "/style.6463258c2b93.css",
+  "/style.9496e1f2fe74.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",

@@ -78,10 +78,13 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
         line3: { name: "货币与信用", score: 39.8, weight: 25 },
         line4: { name: "转型与开放", score: 87.2, weight: 30 },
       },
-      indicators: { cpi: { name: "CPI同比", line: 1, value: 1.2, score: 70, label: "温和", source: "<unsafe>", date: "2026-05-31", stale: true, stale_days: 121 } },
+      indicators: {
+        cpi: { name: "CPI同比", line: 1, value: 1.2, score: 70, weight: 0.07, auto: true, label: "温和", source: "<unsafe>", date: "2026-05-31", stale: true, stale_days: 121 },
+        ppi: { name: "PPI同比", line: 1, value: -2, score: 20, weight: 0.06, auto: false, label: "偏弱", source: "国家统计局", date: "2026-06-30", stale: false },
+      },
     },
   }, new Date("2026-10-01T05:10:00Z"));
-  const config = { indicators: { cpi: { unit: "%", reference_range: "0.5%~3.0%" } } };
+  const config = { indicators: { cpi: { unit: "%", reference_range: "0.5%~3.0%" } }, lines: { line1: { name: "内需与物价", weight: 0.30, emoji: "💚", description: "消费需求与价格水平" } } };
   const html = renderA500Panels(data, config);
   assert.match(html, /5,370\.30/);
   assert.match(html, /正常定投/);
@@ -96,6 +99,19 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   for (const name of ["内需与物价", "就业与收入", "货币与信用", "转型与开放"]) assert.match(html, new RegExp(name));
   assert.match(html, /1\.2%/);
   assert.match(html, /0\.5%~3\.0%/);
+  assert.match(html, /经济健康指南 · 权重与解读/);
+  assert.match(html, /💚 内需与物价/);
+  assert.match(html, /消费需求与价格水平/);
+  assert.match(html, /温和区 · 正常运转/);
+  assert.match(html, /内需偏弱/);
+  assert.match(html, /数据过期\(1\)/);
+  assert.match(html, /手动录入/);
+  assert.match(html, /CPI同比有支撑/);
+  assert.match(html, /PPI同比偏弱/);
+  assert.match(html, /📈 各指标详情/);
+  assert.match(html, /权重7%/);
+  assert.match(html, /⚠️手动/);
+  assert.match(html, /CPI同比（居民消费价格）/);
   assert.match(html, /数据较旧/);
   assert.match(html, /&lt;unsafe&gt;/);
   assert.doesNotMatch(html, /<unsafe>/);

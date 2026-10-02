@@ -5281,6 +5281,8 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-a500-guide-table .negative { color: var(--color-data-negative); }
 .watch-a500-guide-body ul { margin: 0; padding-left: 18px; }
 .watch-a500-guide-body li b { color: var(--color-text); }
+.watch-transition-guide-lines .watch-a500-guide-table > div { align-items: flex-start; }
+.watch-transition-guide-lines .watch-a500-guide-table b { flex: 1; line-height: 1.5; }
 @media (max-width: 640px) { .watch-a500-guide-body { grid-template-columns: 1fr; } }
 
 .watch-a500-decision { display: flex; align-items: flex-start; justify-content: space-between; gap: 20px; padding-bottom: 14px; border-bottom: var(--border-soft); }

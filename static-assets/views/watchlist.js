@@ -79,6 +79,13 @@ function normalizeMarketSnapshot(payload, now = new Date()) {
     pe_percentile: payload.pePercentile,
     price_percentile: payload.pricePercentile,
     change: payload.change,
+    stockYield: payload.stockYield,
+    bondYield: payload.bondYield,
+    dividendYield: payload.dividendYield,
+    premium: isNumber(payload.premium) ? payload.premium : isNumber(payload.stockYield) && isNumber(payload.bondYield) ? payload.stockYield - payload.bondYield : null,
+    spread: isNumber(payload.premium) ? payload.premium : isNumber(payload.stockYield) && isNumber(payload.bondYield) ? payload.stockYield - payload.bondYield : null,
+    priceStale: payload.priceStale === true,
+    priceFallback: payload.priceFallback === true,
     updatedLabel: updated && Number.isFinite(updated.getTime()) ? quoteTime(updated.toISOString()) : "更新时间未知",
     reason: available ? "" : age > MARKET_TEMPERATURE_MAX_AGE_MS || payload.delayed ? "数据延迟" : "暂不可用",
   };
@@ -109,16 +116,47 @@ function renderTemperatureGuide(snapshot) {
   </details>`;
 }
 
+function metricInfo(title, body) {
+  return `<details class="watch-a500-metric-info"><summary>${escapeFallback(title)}</summary><p>${escapeFallback(body)}</p></details>`;
+}
+
+function dividendGuide(d) {
+  const spread = isNumber(d.spread) ? `${number(d.spread)}%` : "--";
+  return `<details class="watch-a500-guide"><summary>💡 红利低波参考指南</summary><div class="watch-a500-guide-body">
+    <section><h4>🚦 红绿灯理解</h4><p>🟢 <b>适合买入</b>：股息率高 + PE低 + 没溢价，三重信号共振。适合分批建仓。</p><p>🟡 <b>适合持有</b>：当前性价比中等。已持有的继续拿分红，等更好的买点再加仓。</p><p>🟡 <b>🔒 趋势保护</b>：PE从近期高点回撤超过10%时强制黄色，避免单边下跌中无脑接盘。</p><p>🔴 <b>观望/减仓</b>：股息率不够吸引人或PE太高，耐心等待。</p><p class="watch-a500-muted">公式：综合 = 股息率分位得分 × 60% + PE分位反向得分 × 30% + 折溢价得分 × 10%（连续打分，无断点跳跃）。</p></section>
+    <section><h4>📊 各因子含义</h4><div class="watch-a500-guide-table"><div><span>股息率分位</span><b>历史位置，高=性价比高</b></div><div><span>PE分位</span><b>历史位置，低=便宜，反向打分</b></div><div><span>折溢价</span><b>ETF价格 vs 净值，溢价高不划算</b></div></div></section>
+    <section><h4>💰 股息率 vs 国债利差</h4><p>红利低波的安全垫来自股息率 − 10年国债利率。当前利差约 <b>${spread}</b>，利差越高，票息优势越突出。</p></section>
+    <section><h4>⏰ 什么时候卖？</h4><p>这是配置型品种，正常长期持有吃分红；股息率跌破3.5%且 PE 分位超过80%同时出现时，再考虑减仓。</p></section>
+    <section><h4>🔗 相关指标</h4><p><b>PE</b> = 指数价格 ÷ 成分股总利润；<b>PB</b> = 指数价格 ÷ 成分股净资产；<b>ROE</b> = 净利润 ÷ 净资产；ETF规模越大通常流动性越好。</p></section>
+  </div></details>`;
+}
+
+function dividendFactor(label, value, tag, toneName = "") {
+  const width = isNumber(value) ? Math.max(0, Math.min(100, Math.abs(value))) : 0;
+  return `<div class="watch-dividend-factor"><span>${escapeFallback(label)}</span><strong class="${toneName}">${escapeFallback(isNumber(value) ? `${value}${label === "折溢价" ? "%" : "%"}` : "--")}</strong><b class="${toneName}">${escapeFallback(tag)}</b><i><em class="${toneName}" style="width:${width}%"></em></i></div>`;
+}
+
+function dividendMetric(label, value, desc, info) {
+  return `<div class="watch-dividend-metric"><div><span>${escapeFallback(label)}</span><strong>${escapeFallback(value)}</strong></div><span class="watch-dividend-metric-desc">${escapeFallback(desc)}</span>${metricInfo("i", info)}</div>`;
+}
 function renderMarketTemperatureMarkup(snapshot) {
   if (!snapshot?.available) return `<div class="watch-temperature-unavailable" data-watch-temperature-state><span class="watch-status watch-status-unavailable">${escapeFallback(snapshot?.reason || "暂不可用")}</span><p>${escapeFallback(snapshot?.reason === "数据延迟" ? "a500 数据超过可接受时效，暂不展示旧读数" : "a500 数据暂时不可用，暂不展示未经核验的读数")}</p></div>`;
   const marker = Math.max(0, Math.min(100, Number(snapshot.temperature)));
   return `<div class="watch-temperature-card" data-watch-temperature-state>
     <div class="watch-temperature-hero"><div class="watch-temperature-primary"><div class="watch-temperature-score"><strong class="watch-temperature-value">${snapshot.temperature}<small>°</small></strong><span class="watch-temperature-label">${escapeFallback(snapshot.temperatureLabel)}</span></div><span class="watch-temperature-advice">${escapeFallback(snapshot.dcaLabel || "定投策略数据")}</span></div><div class="watch-temperature-quote"><span class="watch-temperature-kicker">中国A500 · 沪深全指</span><div class="watch-temperature-index-row"><strong class="watch-temperature-index">${number(snapshot.price)}</strong><span class="watch-temperature-change ${tone(snapshot.change)}">${percent(snapshot.change)}</span></div><div class="watch-temperature-meta"><span class="watch-status watch-status-${snapshot.market_status === "live" ? "live" : "stale"}">${snapshot.market_status === "live" ? "交易中" : "收盘"}</span><span>${escapeFallback(snapshot.updatedLabel)}</span></div></div></div>
-    <div class="watch-temperature-scale" aria-label="市场温度 ${snapshot.temperature} 度"><span class="watch-temperature-marker" style="left:${marker}%"></span><span class="watch-temperature-scale-label">偏冷</span><span class="watch-temperature-scale-label">正常</span><span class="watch-temperature-scale-label">偏热</span></div>
-    <div class="watch-temperature-metrics"><div><span>PE-TTM</span><strong>${number(snapshot.pe)}</strong></div><div><span>PE 分位</span><strong>${number(snapshot.pe_percentile)}%</strong></div><div><span>价格分位</span><strong>${number(snapshot.price_percentile)}%</strong></div><div><span>指数涨跌</span><strong class="${tone(snapshot.change)}">${percent(snapshot.change)}</strong></div><div><span>股债利差</span><strong>${number(snapshot.stockYield)}%</strong></div><div><span>定投比例</span><strong>${number(snapshot.dcaPct)}%</strong></div></div>
-    <div class="watch-a500-columns"><div>${trendBlock(snapshot.temperature_history, "temp", "temperature", "温度走势", "°")}</div><div>${trendBlock(snapshot.pe_history, "pe", "pe", "PE-TTM 走势")}</div></div>
+    <div class="watch-temperature-scale" aria-label="市场温度 ${snapshot.temperature} 度"><span class="watch-temperature-marker" style="left:${marker}%"></span><span class="watch-temperature-scale-label">低估</span><span class="watch-temperature-scale-label">合理</span><span class="watch-temperature-scale-label">偏高</span><span class="watch-temperature-scale-label">过热</span></div>
+    <div class="watch-temperature-legend"><span><i class="positive"></i>0–30°C · 适合买入</span><span><i></i>30–60°C · 继续定投</span><span><i class="warning"></i>60–80°C · 暂停买入</span><span><i class="negative"></i>80–100°C · 考虑卖出</span></div>
+    <div class="watch-temperature-metrics">
+      <div><span>回本年限（PE）</span><strong>${number(snapshot.pe)} 年</strong>${metricInfo("i", "PE 是指数价格 ÷ 成分股利润，表示假设利润不变时的回本年限。低于13年偏便宜，高于17年偏贵。")}</div>
+      <div><span>盈利收益率</span><strong>${number(snapshot.stockYield)}%</strong>${metricInfo("i", "盈利收益率约等于 1 ÷ PE，用来和10年国债利率比较。")}</div>
+      <div><span>10年国债</span><strong>${number(snapshot.bondYield)}%</strong>${metricInfo("i", "中国政府债券的年利率，近似无风险收益基准。")}</div>
+      <div><span>股息率</span><strong>${number(snapshot.dividendYield)}%</strong>${metricInfo("i", "成分股分红 ÷ 指数价格，反映现金分红的安全垫。")}</div>
+      <div><span>股债利差</span><strong>${number(snapshot.spread)}%</strong></div>
+      <div><span>定投比例</span><strong>${number(snapshot.dcaPct)}%</strong></div>
+    </div>
+    <div class="watch-a500-columns"><div>${trendBlock(snapshot.temperature_history, "temp", "temperature", "温度走势（0–100）", "°")}</div><div>${trendBlock(snapshot.pe_history, "pe", "pe", "PE-TTM 走势")}</div></div>
     ${renderTemperatureGuide(snapshot)}
-    <div class="watch-temperature-source">数据源：a500 · ${escapeFallback(snapshot.dcaLabel || "定投策略数据")}</div>
+    <div class="watch-temperature-source">数据源：a500 · ${escapeFallback(snapshot.dcaLabel || "定投策略数据")} · ${snapshot.priceFallback ? "点位使用最近收盘" : snapshot.priceStale ? "点位略有延迟" : snapshot.market_status === "live" ? "盘中实时" : "盘后数据"} · PE截至 ${escapeFallback(snapshot.pe_last_calibrated || "估值日期未知")} · 仅供参考</div>
   </div>`;
 }
 function normalizeA500Data(payload, now = new Date()) {
@@ -163,9 +201,36 @@ function trendBlock(items, valueKey, dataName, title, suffix = "") {
 
 function renderDividendPanel(data) {
   const d = data.dividend || {};
-  const metrics = [["PE", d.pe, "", d.pe_date], ["PE 分位", d.pe_percentile, "%", "估值位置"], ["股息率", d.dividend_yield, "%", d.dividend_yield_date], ["股息率分位", d.dividend_yield_percentile, "%", "股息位置"], ["PB", d.pb, "", ""], ["ROE", d.roe, "%", ""], ["10Y 国债", d.bond_yield, "%", ""], ["股债利差", d.spread, "%", ""]];
-  const etf = isNumber(d.etf_price) ? `${number(d.etf_price)} · ${escapeFallback(d.etf_update_time || "时间未知")}` : "暂无行情";
-  return `<div class="watch-a500-panel-body"><div class="watch-a500-decision"><div><span class="watch-a500-kicker">红利低波 · 563020</span><strong>${escapeFallback(d.light_score ?? "--")}</strong><span>${escapeFallback(d.light_label || "暂无评级")}</span></div><div class="watch-a500-etf"><span>ETF 最新价</span><strong>${etf}</strong><small>${escapeFallback(d.update_time || "数据日期未知")}</small></div></div><div class="watch-a500-metrics watch-a500-core-metrics">${metrics.map(([label, value, suffix, date]) => `<div><span>${label}</span><strong>${isNumber(value) ? number(value) + suffix : "--"}</strong><small>${escapeFallback(date || "")}</small></div>`).join("")}</div><div class="watch-a500-columns"><div>${trendBlock(d.dividend_history, "v", "dividend", "股息率走势", "%")}</div><div>${trendBlock(d.temp_history, "t", "dividend-temperature", "红利温度走势", "°")}</div></div><p class="watch-a500-source">数据源：a500 红利低波数据 · 权重：${escapeFallback(d.light_weights || "--")} · ${escapeFallback(d.trend_reason || "趋势状态未知")}</p></div>`;
+  const light = d.trend_blocked ? "yellow" : d.light || "yellow";
+  const lightIcon = light === "green" ? "🟢" : light === "red" ? "🔴" : "🟡";
+  const lightLabel = `${d.trend_blocked ? "🔒 " : ""}${d.light_label || "暂无评级"}`;
+  const etfPrice = isNumber(d.etf_price) ? number(d.etf_price) : "--";
+  const premium = isNumber(d.etf_premium) ? `${d.etf_premium >= 0 ? "+" : ""}${number(d.etf_premium)}%` : "--";
+  const volume = isNumber(d.etf_volume) ? d.etf_volume >= 1e8 ? `${number(d.etf_volume / 1e8)}亿` : `${number(d.etf_volume / 1e4)}万` : "--";
+  const size = isNumber(d.etf_size) ? `${number(d.etf_size)}亿` : "--";
+  const dp = isNumber(d.dividend_yield_percentile) ? d.dividend_yield_percentile : null;
+  const pp = isNumber(d.pe_percentile) ? d.pe_percentile : null;
+  const pm = isNumber(d.etf_premium) ? d.etf_premium : null;
+  const dpTone = dp >= 80 ? "positive" : dp >= 50 ? "warning" : "negative";
+  const ppTone = pp < 30 ? "positive" : pp < 60 ? "warning" : "negative";
+  const pmTone = pm <= 0.3 ? "positive" : pm <= 0.8 ? "warning" : "negative";
+  const pe = isNumber(d.pe) ? number(d.pe) : "--";
+  const pb = isNumber(d.pb) ? number(d.pb) : "--";
+  const roe = isNumber(d.roe) ? `${number(d.roe)}%` : "--";
+  const peDesc = pp == null ? "--" : `${pp}% ${pp >= 80 ? "偏高" : pp >= 50 ? "中等" : "偏低"}`;
+  const pbDesc = !isNumber(d.pb) ? "--" : d.pb < 0.7 ? "偏低" : d.pb < 1.2 ? "正常" : "偏高";
+  const roeDesc = !isNumber(d.roe) ? "--" : d.roe >= 15 ? "优秀" : d.roe >= 8 ? "中等" : "偏低";
+  const sizeDesc = !isNumber(d.etf_size) ? "--" : d.etf_size > 50 ? "充裕" : d.etf_size > 10 ? "正常" : "偏小";
+  const spreadStatus = d.spread >= 3 ? "高位✅" : d.spread >= 2 ? "中等" : d.spread == null ? "--" : "偏低⚠️";
+  return `<div class="watch-a500-panel-body watch-dividend-panel">
+    <div class="watch-a500-decision"><div class="watch-dividend-light watch-dividend-light-${light}"><span>${lightIcon}</span><strong>${escapeFallback(lightLabel)}</strong><small>综合 ${isNumber(d.light_score) ? Math.round(d.light_score) : "--"} 分</small></div><div class="watch-a500-etf"><span>563020 易方达红利低波</span><strong>${etfPrice}</strong><small>${escapeFallback(d.etf_update_time || d.update_time || "数据日期未知")} · ${d.etf_price == null ? "暂无实时行情" : "ETF 行情"}</small></div></div>
+    ${d.trend_blocked ? `<p class="watch-dividend-trend-warning">🔒 ${escapeFallback(d.trend_reason || "趋势保护已触发")}</p>` : ""}
+    <div class="watch-dividend-etf-meta"><span>折溢率 <b>${premium}</b></span><span>成交量 <b>${volume}</b></span><span>规模 <b>${size}</b></span><span>股息率 <b>${isNumber(d.dividend_yield) ? `${number(d.dividend_yield)}%` : "--"}</b></span><span>股息率分位 <b>${isNumber(dp) ? `${number(dp)}%` : "--"}</b></span><span>股息率 vs 国债 <b>${isNumber(d.spread) ? `${number(d.spread)}%` : "--"} · ${spreadStatus}</b></span></div>
+    <div class="watch-dividend-factors">${dividendFactor("股息率分位", dp, dp >= 80 ? "高" : dp >= 50 ? "中" : "低", dpTone)}${dividendFactor("PE分位", pp, pp < 30 ? "低" : pp < 60 ? "中" : "偏高", ppTone)}${dividendFactor("折溢价", pm, pm == null ? "--" : pm <= 0 ? "折价" : pm <= 0.3 ? "正常" : "偏高", pmTone)}</div>
+    <div class="watch-dividend-metrics">${dividendMetric("市盈率", pe, peDesc, "PE 是指数价格除以成分股总利润，红利低波通常在6–10倍。")}${dividendMetric("市净率", pb, pbDesc, "PB 是指数价格除以成分股净资产，反映资产估值。")}${dividendMetric("ROE", roe, roeDesc, "ROE 是净利润除以净资产，衡量成分股盈利能力。")}${dividendMetric("ETF规模", size, sizeDesc, "规模越大通常流动性越好，日成交低于5000万时注意滑点。")}</div>
+    <div class="watch-a500-columns"><div>${trendBlock(d.dividend_history, "v", "dividend", "股息率走势", "%")}</div><div>${trendBlock(d.temp_history, "t", "dividend-temperature", "温度走势（基于PE分位）", "°")}</div></div>
+    ${dividendGuide(d)}<p class="watch-a500-source">数据源：a500 红利低波数据 · 权重：${escapeFallback(d.light_weights || "6:3:1")} · ${escapeFallback(d.trend_reason || "趋势状态未知")} · 股息率实时，PE/估值可能滞后 · 仅供参考</p>
+  </div>`;
 }
 
 const TRANSITION_INFO = {

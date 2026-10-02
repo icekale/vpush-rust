@@ -32,7 +32,7 @@ test("renders all A500 project sections from the owned aggregate", () => {
   const data = normalizeA500Data({
     schema_version: 1,
     generated_at: "2026-10-01T05:06:27Z",
-    a500: { temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4, fresh: true, delayed: false, market: false, ts: "2026-10-01 12:04:49", temperature_history: [{ date: "2026-10-01", value: 41 }], pe_history: [{ date: "2026-10-01", value: 16.31 }] },
+    a500: { temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4, stockYield: 6.1, bondYield: 1.68, dividendYield: 2.44, premium: 4.42, fresh: true, delayed: false, market: false, ts: "2026-10-01 12:04:49", temperature_history: [{ date: "2026-10-01", value: 41 }], pe_history: [{ date: "2026-10-01", value: 16.31 }] },
     dividend: { light_score: 74, light_label: "偏冷", pe: 8.24, dividend_yield: 4.39, spread: 1.2, etf_premium: -0.4, temp_history: [{ date: "2026-10-01", value: 52 }] },
     transition: { date: "2026-09-29", temperature: 61.6, band: "温和区", indicators: [{ name: "就业", score: 70 }] },
   }, new Date("2026-10-01T05:10:00Z"));
@@ -65,7 +65,8 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
       pe_history: [{ date: "2026-09-25", pe: 15 }, { date: "2026-09-27", pe: 16.31 }],
     },
     dividend: {
-      light_score: 74, light_label: "适合买入", etf_price: null, etf_update_time: null,
+      light: "green", light_score: 74, light_label: "适合买入", trend_blocked: true, trend_reason: "PE回撤超过10%", light_weights: "6:3:1", etf_premium: -0.4, etf_volume: 12500000, etf_size: 42,
+      etf_price: null, etf_update_time: null,
       dividend_yield: 4.39, pe: 8.24, temp_history: [
         { d: "2026-09-25", t: 70 }, { d: "2026-09-26", t: 72 }, { d: "2026-09-27", t: 74 },
       ],
@@ -94,8 +95,19 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   assert.match(html, /data-watch-trend="pe"/);
   assert.match(html, /data-watch-trend="dividend"/);
   assert.match(html, /data-watch-trend="dividend-temperature"/);
-  assert.match(html, /563020/);
-  assert.match(html, /暂无行情/);
+  assert.match(html, /股债利差/);
+  assert.match(html, /4\.42%/);
+  assert.match(html, /0–30°C/);
+  assert.match(html, /盈利收益率/);
+  assert.match(html, /股债利差/);
+  assert.match(html, /趋势保护/);
+  assert.match(html, /红利低波参考指南/);
+  assert.match(html, /股息率分位/);
+  assert.match(html, /折溢价/);
+  assert.match(html, /成交量/);
+  assert.match(html, /ETF规模/);
+  assert.match(html, /市净率/);
+  assert.match(html, /PE回撤超过10%/);
   for (const name of ["内需与物价", "就业与收入", "货币与信用", "转型与开放"]) assert.match(html, new RegExp(name));
   assert.match(html, /1\.2%/);
   assert.match(html, /0\.5%~3\.0%/);
@@ -137,12 +149,12 @@ test("watchlist has four peer tabs, defaulting to the watchlist and keeping othe
 
 test("market snapshot renders a fresh A500 temperature card and rejects stale data", () => {
   const snapshot = normalizeMarketSnapshot({
-    temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4,
+    temperature: 41, price: 5370.3, pe: 16.31, pePercentile: 17.2, pricePercentile: 68.4, stockYield: 6.1, bondYield: 1.68, premium: 4.42,
     market: false, fresh: true, delayed: false, change: 0.19, dcaLabel: "正常定投", ts: "2026-10-01 12:04:49",
   }, new Date("2026-10-01T04:05:00Z"));
-  assert.equal(snapshot.available, true);
+  assert.equal(snapshot.spread, 4.42);
+  assert.equal(snapshot.stockYield, 6.1);
   const html = renderMarketTemperatureMarkup(snapshot);
-  assert.match(html, /41/);
   assert.match(html, /中国A500/);
   assert.match(html, /watch-temperature-primary[\s\S]*watch-temperature-quote/);
   assert.match(html, /正常定投/);

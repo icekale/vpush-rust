@@ -5336,3 +5336,43 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watch-rule-actions { align-items: flex-start; flex-direction: column; }
   .watch-rule-note { max-width: 100%; }
 }
+
+.watch-temperature-legend { display: flex; flex-wrap: wrap; gap: 6px 14px; color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-temperature-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.watch-temperature-legend i { width: 7px; height: 7px; border-radius: 50%; background: #d6ad42; }
+.watch-temperature-legend i.positive { background: var(--color-data-positive); }
+.watch-temperature-legend i.warning { background: #d87644; }
+.watch-temperature-legend i.negative { background: var(--color-data-negative); }
+.watch-a500-metric-info { display: inline; margin-top: 2px; color: var(--color-accent-text); font-size: 11px; }
+.watch-a500-metric-info summary { width: fit-content; cursor: pointer; list-style: none; }
+.watch-a500-metric-info summary::-webkit-details-marker { display: none; }
+.watch-a500-metric-info p { margin: 5px 0 0; color: var(--color-text-muted); font-size: var(--text-xs); line-height: 1.5; }
+.watch-dividend-panel { gap: 16px; }
+.watch-dividend-light { display: grid; grid-template-columns: auto 1fr; align-items: center; column-gap: 8px; row-gap: 2px; padding: 10px 12px; border-left: 3px solid var(--color-warning-strong); background: var(--color-warning-soft); }
+.watch-dividend-light > span { grid-row: span 2; font-size: 24px; }
+.watch-dividend-light strong { color: var(--color-text-strong); font-size: var(--text-body); }
+.watch-dividend-light small { color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-dividend-light-green { border-color: var(--color-data-positive); background: var(--color-success-soft, #ecfdf5); }
+.watch-dividend-light-red { border-color: var(--color-data-negative); background: var(--color-danger-soft, #fef2f2); }
+.watch-dividend-trend-warning { margin: -5px 0 0; padding: 8px 10px; border-left: 3px solid var(--color-warning-strong); background: var(--color-warning-soft); color: var(--color-text); font-size: var(--text-xs); }
+.watch-dividend-etf-meta { display: flex; flex-wrap: wrap; gap: 7px 14px; color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-dividend-etf-meta b { color: var(--color-text-strong); font-variant-numeric: tabular-nums; }
+.watch-dividend-factors { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.watch-dividend-factor { display: grid; gap: 4px; padding: 10px 12px; border: var(--border-soft); border-radius: var(--radius-sm); background: var(--color-bg-muted); }
+.watch-dividend-factor > span { color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-dividend-factor strong, .watch-dividend-factor b { font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.watch-dividend-factor .positive { color: var(--color-data-positive); }
+.watch-dividend-factor .warning { color: var(--color-warning-text, #b7791f); }
+.watch-dividend-factor .negative { color: var(--color-data-negative); }
+.watch-dividend-factor i { height: 5px; overflow: hidden; border-radius: var(--radius-pill); background: var(--color-line); }
+.watch-dividend-factor em { display: block; height: 100%; border-radius: inherit; background: var(--color-accent); }
+.watch-dividend-factor em.positive { background: var(--color-data-positive); }
+.watch-dividend-factor em.warning { background: #d6ad42; }
+.watch-dividend-factor em.negative { background: var(--color-data-negative); }
+.watch-dividend-metrics { display: grid; gap: 1px; }
+.watch-dividend-metric { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 10px; padding: 9px 0; border-top: var(--border-soft); }
+.watch-dividend-metric > div { display: grid; gap: 3px; }
+.watch-dividend-metric > div span, .watch-dividend-metric-desc { color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-dividend-metric > div strong { color: var(--color-text-strong); font-size: var(--text-sm); font-variant-numeric: tabular-nums; }
+.watch-dividend-metric .watch-a500-metric-info { margin: 0; }
+@media (max-width: 640px) { .watch-dividend-factors { grid-template-columns: 1fr; } .watch-dividend-metric { grid-template-columns: minmax(0, 1fr) auto; } .watch-dividend-metric-desc { grid-column: 1 / -1; } }

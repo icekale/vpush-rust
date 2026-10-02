@@ -5369,11 +5369,13 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watch-temperature-primary, .watch-temperature-quote { padding: 13px 14px; }
   .watch-temperature-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .watch-a500-core-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .watch-a500-etf { padding-left: 0; border-left: 0; }
+}
 
 /* Shared research surface: one VPush rhythm across all four tabs. */
-.watch-temperature-scale { display: grid; gap: 8px; padding-top: 0; }
+.watch-temperature-scale { display: grid; grid-template-columns: minmax(0, 1fr); gap: 8px; padding-top: 0; }
 .watch-temperature-scale::before { display: none; }
-.watch-temperature-scale-bar { position: relative; display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 2px; height: 10px; }
+.watch-temperature-scale-bar { position: relative; display: grid; grid-template-columns: 30fr 30fr 20fr 20fr; gap: 2px; height: 10px; }
 .watch-temperature-segment { display: block; height: 10px; }
 .watch-temperature-segment:first-child { border-radius: var(--radius-pill) 0 0 var(--radius-pill); }
 .watch-temperature-segment:last-of-type { border-radius: 0 var(--radius-pill) var(--radius-pill) 0; }
@@ -5383,8 +5385,9 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-temperature-segment-overheated { background: #ff5a5a; }
 .watch-temperature-marker { top: -7px; width: 24px; height: 24px; margin-left: -12px; border: 3px solid var(--color-surface); background: var(--color-text-strong); box-shadow: 0 1px 0 1px var(--color-border-strong); }
 .watch-temperature-marker b { position: absolute; top: 28px; left: 50%; transform: translateX(-50%); white-space: nowrap; color: var(--color-text-strong); font-size: var(--text-xs); font-weight: var(--font-weight-semibold); font-variant-numeric: tabular-nums; }
-.watch-temperature-scale-ticks { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-.watch-temperature-scale-ticks span { display: grid; gap: 2px; color: var(--color-text-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.watch-temperature-scale-ticks { display: grid; grid-template-columns: 30fr 30fr 20fr 20fr; gap: 0; padding-top: 22px; }
+.watch-temperature-scale-ticks span { display: grid; min-width: 0; gap: 2px; color: var(--color-text-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
+.watch-temperature-scale-ticks b, .watch-temperature-scale-ticks small { display: block; min-width: 0; white-space: nowrap; }
 .watch-temperature-scale-ticks span:nth-child(2), .watch-temperature-scale-ticks span:nth-child(3) { text-align: center; }
 .watch-temperature-scale-ticks span:last-child { text-align: right; }
 .watch-temperature-scale-ticks b { color: var(--color-text); font-weight: var(--font-weight-medium); }
@@ -5407,9 +5410,10 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watch-temperature-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 9px; }
 }
 @media (max-width: 640px) {
-  .watch-temperature-scale-ticks, .watch-temperature-actions { gap: 6px; }
+  .watch-temperature-actions { gap: 6px; }
+  .watch-temperature-scale-ticks { padding-top: 20px; }
   .watch-temperature-scale-ticks span { font-size: 11px; }
-  .watch-temperature-marker b { top: 27px; }
+  .watch-temperature-marker b { top: 24px; font-size: 11px; }
   .watch-temperature-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .watch-a500-metrics > div, .watch-a500-line-grid > div, .watch-temperature-metrics > div { min-height: 48px; }
 }

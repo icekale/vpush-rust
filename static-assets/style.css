@@ -5177,10 +5177,9 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-a500-panel-body { display: grid; gap: 16px; }
 .watch-a500-score { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .watch-a500-score > div { display: grid; gap: 3px; }
-.watch-a500-kicker, .watch-a500-score > div > span:last-child, .watch-a500-source, .watch-a500-muted, .watch-a500-description, .watch-a500-metrics span, .watch-a500-line-grid span, .watch-a500-line-grid small, .watch-a500-indicator span, .watch-a500-indicator small { color: var(--color-text-muted); font-size: var(--text-xs); }
+.watch-a500-kicker, .watch-a500-score > div > span:last-child, .watch-a500-source, .watch-a500-muted, .watch-a500-description, .watch-a500-metrics span, .watch-a500-line-grid span, .watch-a500-line-grid small, .watch-a500-indicator small { color: var(--color-text-muted); font-size: var(--text-xs); }
 .watch-a500-score > div > strong { color: var(--color-text-strong); font-size: 40px; line-height: 1; font-variant-numeric: tabular-nums; }
 .watch-a500-score > div > span:last-child { color: var(--color-text); font-size: var(--text-sm); }
-.watch-a500-emoji { font-size: 28px; }
 .watch-a500-description, .watch-a500-source { margin: 0; }
 .watch-a500-metrics, .watch-a500-line-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
 .watch-a500-metrics > div, .watch-a500-line-grid > div { display: grid; gap: 4px; min-width: 0; padding: 10px 12px; border: var(--border-soft); border-radius: var(--radius-sm); background: var(--color-bg-muted); }
@@ -5193,16 +5192,18 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-a500-history-row b { display: block; height: 100%; border-radius: inherit; background: var(--color-accent); }
 .watch-a500-history-row strong { color: var(--color-text); text-align: right; }
 .watch-a500-indicators { display: grid; gap: 1px; }
-.watch-a500-indicator { display: grid; grid-template-columns: minmax(0, 1fr) 90px minmax(130px, .8fr); align-items: center; gap: 8px; padding: 8px 0; border-top: var(--border-soft); }
-.watch-a500-indicator > div { display: grid; gap: 2px; min-width: 0; }
+.watch-a500-indicator { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: start; gap: 6px 12px; padding: 8px 0; border-top: var(--border-soft); }
+.watch-a500-indicator > div { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; min-width: 0; }
+.watch-a500-indicator > div strong { min-width: 0; overflow-wrap: anywhere; }
+.watch-data-status { display: inline-flex; align-items: center; flex: 0 0 auto; width: fit-content; padding: 2px 6px; border-radius: var(--radius-sm); background: var(--color-bg-muted); color: var(--color-text-muted); font-size: var(--text-xs); line-height: 1.4; white-space: nowrap; }
+.watch-data-status.is-auto { color: var(--color-success); background: var(--color-success-soft); }
+.watch-data-status.is-stale { color: var(--color-warning-text, var(--color-text-muted)); background: var(--color-warning-soft); }
 .watch-a500-indicator > strong { color: var(--color-text-strong); text-align: right; font-variant-numeric: tabular-nums; }
-.watch-a500-indicator small { text-align: right; }
+.watch-a500-indicator > small { grid-column: 1 / -1; text-align: left; line-height: 1.5; overflow-wrap: anywhere; }
 .watch-a500-unavailable { display: flex; align-items: center; gap: 12px; }
 .watch-a500-unavailable p { margin: 0; color: var(--color-text-muted); font-size: var(--text-sm); }
 @media (max-width: 640px) {
   .watch-a500-columns, .watch-a500-metrics, .watch-a500-line-grid { grid-template-columns: 1fr 1fr; }
-  .watch-a500-indicator { grid-template-columns: minmax(0, 1fr) 90px; }
-  .watch-a500-indicator small { grid-column: 1 / -1; text-align: left; }
 }
 
 .watch-temperature-card { display: grid; gap: 16px; }
@@ -5298,17 +5299,17 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-a500-trend-meta { display: flex; justify-content: space-between; gap: 8px; color: var(--color-text-muted); font-size: var(--text-xs); font-variant-numeric: tabular-nums; }
 .watch-a500-line-sections { display: grid; gap: 16px; }
 .watch-a500-line-section { padding-top: 12px; border-top: var(--border-default); }
-.watch-a500-line-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.watch-a500-line-heading { display: flex; align-items: start; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
 .watch-a500-line-heading > div { display: grid; gap: 3px; }
 .watch-a500-line-heading strong { color: var(--color-text-strong); font-size: var(--text-sm); }
 .watch-a500-line-heading span { color: var(--color-text-muted); font-size: var(--text-xs); }
 .watch-a500-line-heading > b { color: var(--color-text-strong); font-size: var(--text-body); font-variant-numeric: tabular-nums; }
-.watch-a500-indicator.is-stale { background: var(--color-warning-soft); }
-.watch-transition-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-.watch-transition-line { display: grid; align-content: start; gap: 5px; min-width: 0; padding: 12px; border: var(--border-soft); border-radius: var(--radius-sm); background: var(--color-bg-muted); }
+.watch-transition-overview { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0 16px; }
+.watch-transition-line { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-content: start; gap: 5px 8px; min-width: 0; padding: 12px 0; border-top: var(--border-soft); }
 .watch-transition-line > div:first-child { display: flex; justify-content: space-between; gap: 5px; color: var(--color-text-strong); font-size: var(--text-sm); }
 .watch-transition-line > div:first-child small, .watch-transition-line > small { color: var(--color-text-muted); font-size: var(--text-xs); line-height: 1.5; }
 .watch-transition-line > b { color: var(--color-text-strong); font-size: var(--text-lg); font-variant-numeric: tabular-nums; }
+.watch-transition-line > span, .watch-transition-line > .watch-transition-bar, .watch-transition-line > small { grid-column: 1 / -1; }
 .watch-transition-line > span { color: var(--color-text); font-size: var(--text-xs); }
 .watch-transition-bar { height: 5px; border-radius: var(--radius-pill); background: var(--color-line); }
 .watch-transition-bar i { display: block; height: 100%; border-radius: inherit; background: var(--color-accent); }
@@ -5321,6 +5322,7 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-transition-guide-indicators { grid-column: 1 / -1; }
 .watch-transition-guide-indicator { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr); gap: 2px 12px; padding: 8px 0; border-top: var(--border-soft); color: var(--color-text-muted); font-size: var(--text-xs); }
 .watch-transition-guide-indicator > * { min-width: 0; }
+.watch-transition-guide-indicator > span:first-child { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .watch-transition-guide-indicator strong { color: var(--color-text); }
 .watch-transition-guide-indicator > small { grid-column: 1 / -1; overflow-wrap: anywhere; }
 @media (max-width: 900px) { .watch-transition-overview { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
@@ -5355,10 +5357,8 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .watch-a500-decision { padding: 16px 18px; border: 1px solid var(--color-line); border-radius: var(--radius-sm); background: var(--color-bg-muted); }
 .watch-a500-decision > div:first-child > strong { font-size: 44px; }
 .watch-a500-etf { padding-left: 18px; border-left: 1px solid var(--color-line); }
-.watch-transition-overview { gap: 10px; }
-.watch-transition-line { border-color: var(--color-line); background: var(--color-bg-muted); }
+.watch-transition-overview { gap: 0 16px; }
 .watch-a500-indicator { padding: 10px 0; }
-.watch-a500-indicator.is-stale { border-radius: var(--radius-sm); padding-inline: 10px; }
 @media (max-width: 900px) {
   .watch-temperature-metrics { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .watch-a500-core-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -5410,6 +5410,7 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watch-temperature-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); row-gap: 9px; }
 }
 @media (max-width: 640px) {
+  .watch-workspace-tabs .settings-tab { min-height: 44px; }
   .watch-temperature-actions { gap: 6px; }
   .watch-temperature-scale-ticks { padding-top: 20px; }
   .watch-temperature-scale-ticks span { font-size: 11px; }

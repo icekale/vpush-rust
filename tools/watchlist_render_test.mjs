@@ -57,7 +57,7 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
     a500: {
       temperature: 41, price: 5370.3, change: 0.19, pe: 16.31, pePercentile: 17.2,
       pricePercentile: 68.4, stockYield: 6.1, bondYield: 1.68, dcaPct: 75,
-      dcaLabel: "正常定投", market: false, fresh: true, delayed: false, ts: "2026-10-01 12:04:49",
+      dcaLabel: "👍 正常定投", market: false, fresh: true, delayed: false, ts: "2026-10-01 12:04:49",
       temperature_history: [
         { date: "2026-09-25", temp: 30 }, { date: "2026-09-26", temp: 35 },
         { date: "2026-09-27", temp: 41 },
@@ -86,6 +86,7 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   }, new Date("2026-10-01T05:10:00Z"));
   const config = { indicators: { cpi: { unit: "%", reference_range: "0.5%~3.0%" } }, lines: { line1: { name: "内需与物价", weight: 0.30, emoji: "💚", description: "消费需求与价格水平" } } };
   const html = renderA500Panels(data, config);
+  assert.doesNotMatch(html, /[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u);
   assert.match(html, /5,370\.30/);
   assert.match(html, /正常定投/);
   assert.match(html, /data-watch-trend="temperature"[\s\S]*?<polyline/);
@@ -100,7 +101,7 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   assert.match(html, /1\.2%/);
   assert.match(html, /0\.5%~3\.0%/);
   assert.match(html, /经济健康指南 · 权重与解读/);
-  assert.match(html, /💚 内需与物价/);
+  assert.match(html, /<strong>内需与物价<\/strong>/);
   assert.match(html, /消费需求与价格水平/);
   assert.match(html, /温和区 · 正常运转/);
   assert.match(html, /内需偏弱/);
@@ -108,9 +109,10 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   assert.match(html, /手动录入/);
   assert.match(html, /CPI同比有支撑/);
   assert.match(html, /PPI同比偏弱/);
-  assert.match(html, /📈 各指标详情/);
+  assert.match(html, /<h4>各指标详情<\/h4>/);
   assert.match(html, /权重7%/);
-  assert.match(html, /⚠️手动/);
+  assert.match(html, /watch-data-status is-manual">手动/);
+  assert.match(html, /watch-data-status is-stale">过期/);
   assert.match(html, /CPI同比（居民消费价格）/);
   assert.match(html, /数据较旧/);
   assert.match(html, /&lt;unsafe&gt;/);

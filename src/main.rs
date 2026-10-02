@@ -1145,9 +1145,15 @@ async fn etf_alert_settings(
 }
 
 #[derive(Deserialize)]
-struct EtfAlertIn {
+struct EtfAlertDirectionIn {
     enabled: bool,
     threshold_pct: f64,
+}
+
+#[derive(Deserialize)]
+struct EtfAlertIn {
+    above: EtfAlertDirectionIn,
+    below: EtfAlertDirectionIn,
 }
 
 async fn save_etf_alert_settings(
@@ -1157,10 +1163,16 @@ async fn save_etf_alert_settings(
     Json(body): Json<EtfAlertIn>,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_user(&state, &headers).await?;
-    if !etf_premium::valid_setting(&symbol, body.threshold_pct) {
+    if !etf_premium::valid_settings(
+        &symbol,
+        body.above.enabled,
+        body.above.threshold_pct,
+        body.below.enabled,
+        body.below.threshold_pct,
+    ) {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
-            "ETF代码或提醒阈值无效（0～100%）",
+            "ETF代码或提醒阈值无效",
         ));
     }
     Ok(Json(
@@ -1168,8 +1180,10 @@ async fn save_etf_alert_settings(
             &state.db,
             user.id,
             &symbol,
-            body.enabled,
-            body.threshold_pct,
+            body.above.enabled,
+            body.above.threshold_pct,
+            body.below.enabled,
+            body.below.threshold_pct,
         )
         .await
         .map_err(db_err)?,
@@ -7140,22 +7154,27 @@ mod tests {
         for (symbol, body, expected) in [
             (
                 "513100",
-                r#"{"enabled":true,"threshold_pct":13.58}"#,
+                r#"{"above":{"enabled":true,"threshold_pct":13.58},"below":{"enabled":false,"threshold_pct":0}}"#,
                 StatusCode::OK,
             ),
             (
                 "999999",
-                r#"{"enabled":true,"threshold_pct":5}"#,
+                r#"{"above":{"enabled":true,"threshold_pct":5},"below":{"enabled":false,"threshold_pct":0}}"#,
                 StatusCode::BAD_REQUEST,
             ),
             (
                 "513100",
-                r#"{"enabled":true,"threshold_pct":-1}"#,
+                r#"{"above":{"enabled":true,"threshold_pct":0},"below":{"enabled":true,"threshold_pct":-101}}"#,
                 StatusCode::BAD_REQUEST,
             ),
             (
                 "513100",
-                r#"{"enabled":true,"threshold_pct":101}"#,
+                r#"{"above":{"enabled":true,"threshold_pct":101},"below":{"enabled":false,"threshold_pct":0}}"#,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "513100",
+                r#"{"above":{"enabled":true,"threshold_pct":2},"below":{"enabled":true,"threshold_pct":3}}"#,
                 StatusCode::BAD_REQUEST,
             ),
         ] {
@@ -7174,7 +7193,8 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status(), expected);
         }
-        for (token, enabled, threshold) in [(admin_token, true, 13.58), (reader_token, false, 5.0)]
+        for (token, above_enabled, above_threshold) in
+            [(admin_token, true, 13.58), (reader_token, false, 5.0)]
         {
             let response = app
                 .clone()
@@ -7191,9 +7211,90 @@ mod tests {
             let body: Value =
                 serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap())
                     .unwrap();
-            assert_eq!(body["items"][0]["enabled"], enabled);
-            assert_eq!(body["items"][0]["threshold_pct"], threshold);
+            assert_eq!(body["items"][0]["above"]["enabled"], above_enabled);
+            assert_eq!(body["items"][0]["above"]["threshold_pct"], above_threshold);
+            assert_eq!(body["items"][0]["below"]["enabled"], false);
+            assert_eq!(body["items"][0]["below"]["threshold_pct"], 0.0);
         }
+    }
+
+    #[tokio::test]
+    async fn etf_alert_api_returns_bidirectional_shape_and_preserves_saved_rows() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        sqlx::query(
+            "INSERT INTO etf_premium_alerts
+             (user_id, symbol, enabled, threshold_pct, above_enabled, above_threshold_pct)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(admin.id)
+        .bind("513100")
+        .bind(true)
+        .bind(13.58)
+        .bind(true)
+        .bind(13.58)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let state = AppState {
+            db,
+            secret: "etf-shape-test".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let token = auth::create_token(
+            admin.id,
+            &admin.username,
+            &state.secret,
+            admin.token_version,
+            now_secs(),
+            &admin.created_at,
+        );
+        let app = router(state);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me/etf-premium-alerts")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(body["items"][0]["above"]["enabled"], true);
+        assert_eq!(body["items"][0]["above"]["threshold_pct"], 13.58);
+        assert_eq!(body["items"][0]["below"]["enabled"], false);
+        assert_eq!(body["items"][0]["below"]["threshold_pct"], 0.0);
+        assert!(body["items"][0].get("enabled").is_none());
+        assert!(body["items"][0].get("threshold_pct").is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/me/etf-premium-alerts/513100")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"above":{"enabled":true,"threshold_pct":8.0},"below":{"enabled":true,"threshold_pct":-2.0}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let saved: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 16384).await.unwrap()).unwrap();
+        assert_eq!(saved["above"]["enabled"], true);
+        assert_eq!(saved["above"]["threshold_pct"], 8.0);
+        assert_eq!(saved["below"]["enabled"], true);
+        assert_eq!(saved["below"]["threshold_pct"], -2.0);
     }
 
     #[tokio::test]

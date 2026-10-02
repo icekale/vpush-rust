@@ -218,7 +218,15 @@ CREATE TABLE IF NOT EXISTS etf_premium_alerts (
     symbol TEXT NOT NULL CHECK (symbol IN ('513100', '513500')),
     enabled INTEGER NOT NULL DEFAULT 0,
     threshold_pct REAL NOT NULL DEFAULT 5.0 CHECK (threshold_pct BETWEEN 0 AND 100),
+    above_enabled INTEGER NOT NULL DEFAULT 0,
+    above_threshold_pct REAL NOT NULL DEFAULT 5.0 CHECK (above_threshold_pct BETWEEN 0 AND 100),
+    below_enabled INTEGER NOT NULL DEFAULT 0,
+    below_threshold_pct REAL NOT NULL DEFAULT 0.0 CHECK (below_threshold_pct BETWEEN -100 AND 100),
     above_threshold INTEGER NOT NULL DEFAULT 0,
+    below_threshold INTEGER NOT NULL DEFAULT 0,
+    above_baseline INTEGER,
+    below_baseline INTEGER,
+    direction TEXT NOT NULL DEFAULT 'above' CHECK (direction IN ('above', 'below')),
     last_triggered_pct REAL,
     last_threshold_pct REAL,
     last_triggered_at TEXT,
@@ -672,6 +680,7 @@ impl Db {
         ensure_register_code_columns(&pool).await?;
         ensure_feishu_columns(&pool).await?;
         ensure_news_admin_columns(&pool).await?;
+        ensure_etf_premium_columns(&pool).await?;
         ensure_hot_indexes(&pool).await?;
         Ok(Self { pool })
     }
@@ -8518,6 +8527,83 @@ async fn ensure_user_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_wechat_openid ON users(wechat_openid) WHERE wechat_openid != ''")
         .execute(pool)
         .await?;
+    Ok(())
+}
+
+async fn ensure_etf_premium_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let existing: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('etf_premium_alerts')")
+            .fetch_all(pool)
+            .await?;
+    if existing.is_empty() {
+        return Ok(());
+    }
+    let had_above_enabled = existing.iter().any(|column| column == "above_enabled");
+    let had_above_threshold = existing
+        .iter()
+        .any(|column| column == "above_threshold_pct");
+    let had_above_baseline = existing.iter().any(|column| column == "above_baseline");
+    let had_direction = existing.iter().any(|column| column == "direction");
+    let columns = [
+        ("above_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "above_threshold_pct",
+            "REAL NOT NULL DEFAULT 5.0 CHECK (above_threshold_pct BETWEEN 0 AND 100)",
+        ),
+        ("below_enabled", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "below_threshold_pct",
+            "REAL NOT NULL DEFAULT 0.0 CHECK (below_threshold_pct BETWEEN -100 AND 100)",
+        ),
+        ("below_threshold", "INTEGER NOT NULL DEFAULT 0"),
+        ("above_baseline", "INTEGER"),
+        ("below_baseline", "INTEGER"),
+        ("direction", "TEXT NOT NULL DEFAULT 'above'"),
+    ];
+    for (name, def) in columns {
+        if existing.iter().any(|column| column == name) {
+            continue;
+        }
+        add_column(
+            pool,
+            &format!("ALTER TABLE etf_premium_alerts ADD COLUMN {name} {def}"),
+        )
+        .await?;
+    }
+    // Existing installations have one rule per symbol. Preserve it as the
+    // above-direction rule and leave the new below direction disabled.
+    if !had_above_enabled {
+        sqlx::query(
+            "UPDATE etf_premium_alerts
+             SET above_enabled = enabled, above_threshold_pct = threshold_pct",
+        )
+        .execute(pool)
+        .await?;
+    }
+    if !had_above_threshold {
+        sqlx::query("UPDATE etf_premium_alerts SET above_threshold_pct = threshold_pct")
+            .execute(pool)
+            .await?;
+    }
+    if !had_above_baseline {
+        sqlx::query(
+            "UPDATE etf_premium_alerts
+             SET above_baseline = CASE WHEN above_threshold != 0 THEN 1 ELSE NULL END",
+        )
+        .execute(pool)
+        .await?;
+    }
+    if !had_direction {
+        sqlx::query("UPDATE etf_premium_alerts SET direction = 'above'")
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE etf_premium_alerts SET direction = 'above'
+         WHERE direction IS NULL OR direction NOT IN ('above', 'below')",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

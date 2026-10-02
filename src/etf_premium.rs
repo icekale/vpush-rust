@@ -24,13 +24,25 @@ fn premium(price: f64, reference: f64) -> Option<f64> {
     rate.is_finite().then_some(rate)
 }
 
-pub fn valid_setting(symbol: &str, threshold: f64) -> bool {
-    fund_name(symbol).is_some() && threshold.is_finite() && (0.0..=100.0).contains(&threshold)
+pub fn valid_settings(
+    symbol: &str,
+    above_enabled: bool,
+    above_threshold: f64,
+    below_enabled: bool,
+    below_threshold: f64,
+) -> bool {
+    fund_name(symbol).is_some()
+        && above_threshold.is_finite()
+        && (0.0..=100.0).contains(&above_threshold)
+        && below_threshold.is_finite()
+        && (-100.0..=100.0).contains(&below_threshold)
+        && (!above_enabled || !below_enabled || above_threshold > below_threshold)
 }
 
 pub async fn settings(db: &Db, user_id: i64) -> Result<Value, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT symbol, enabled, threshold_pct FROM etf_premium_alerts WHERE user_id = ?",
+        "SELECT symbol, above_enabled, above_threshold_pct, below_enabled, below_threshold_pct
+         FROM etf_premium_alerts WHERE user_id = ?",
     )
     .bind(user_id)
     .fetch_all(db.pool())
@@ -41,9 +53,18 @@ pub async fn settings(db: &Db, user_id: i64) -> Result<Value, sqlx::Error> {
             let row = rows
                 .iter()
                 .find(|row| row.get::<String, _>("symbol") == *symbol);
-            json!({"symbol": symbol, "name": name,
-            "enabled": row.is_some_and(|row| row.get::<bool, _>("enabled")),
-            "threshold_pct": row.map(|row| row.get::<f64, _>("threshold_pct")).unwrap_or(5.0)})
+            json!({
+                "symbol": symbol,
+                "name": name,
+                "above": {
+                    "enabled": row.is_some_and(|row| row.get::<i64, _>("above_enabled") != 0),
+                    "threshold_pct": row.map(|row| row.get::<f64, _>("above_threshold_pct")).unwrap_or(5.0),
+                },
+                "below": {
+                    "enabled": row.is_some_and(|row| row.get::<i64, _>("below_enabled") != 0),
+                    "threshold_pct": row.map(|row| row.get::<f64, _>("below_threshold_pct")).unwrap_or(0.0),
+                },
+            })
         })
         .collect::<Vec<_>>();
     let enabled: bool = sqlx::query_scalar("SELECT notify_enabled FROM users WHERE id = ?")
@@ -57,18 +78,48 @@ pub async fn save_setting(
     db: &Db,
     user_id: i64,
     symbol: &str,
-    enabled: bool,
-    threshold: f64,
+    above_enabled: bool,
+    above_threshold: f64,
+    below_enabled: bool,
+    below_threshold: f64,
 ) -> Result<Value, sqlx::Error> {
-    sqlx::query("INSERT INTO etf_premium_alerts (user_id, symbol, enabled, threshold_pct)
-        VALUES (?, ?, ?, ?) ON CONFLICT(user_id, symbol) DO UPDATE SET
-        above_threshold = CASE WHEN enabled != excluded.enabled OR threshold_pct != excluded.threshold_pct
-            THEN 0 ELSE above_threshold END,
-        enabled = excluded.enabled, threshold_pct = excluded.threshold_pct")
-        .bind(user_id).bind(symbol).bind(enabled).bind(threshold).execute(db.pool()).await?;
-    Ok(
-        json!({"symbol": symbol, "name": fund_name(symbol), "enabled": enabled, "threshold_pct": threshold}),
+    sqlx::query(
+        "INSERT INTO etf_premium_alerts
+            (user_id, symbol, enabled, threshold_pct, above_enabled, above_threshold_pct,
+             below_enabled, below_threshold_pct)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, symbol) DO UPDATE SET
+            above_threshold = CASE WHEN above_enabled != excluded.above_enabled
+                OR above_threshold_pct != excluded.above_threshold_pct THEN 0 ELSE above_threshold END,
+            below_threshold = CASE WHEN below_enabled != excluded.below_enabled
+                OR below_threshold_pct != excluded.below_threshold_pct THEN 0 ELSE below_threshold END,
+            above_baseline = CASE WHEN above_enabled != excluded.above_enabled
+                OR above_threshold_pct != excluded.above_threshold_pct THEN NULL ELSE above_baseline END,
+            below_baseline = CASE WHEN below_enabled != excluded.below_enabled
+                OR below_threshold_pct != excluded.below_threshold_pct THEN NULL ELSE below_baseline END,
+            enabled = excluded.enabled,
+            threshold_pct = excluded.threshold_pct,
+            above_enabled = excluded.above_enabled,
+            above_threshold_pct = excluded.above_threshold_pct,
+            below_enabled = excluded.below_enabled,
+            below_threshold_pct = excluded.below_threshold_pct",
     )
+    .bind(user_id)
+    .bind(symbol)
+    .bind(above_enabled)
+    .bind(above_threshold)
+    .bind(above_enabled)
+    .bind(above_threshold)
+    .bind(below_enabled)
+    .bind(below_threshold)
+    .execute(db.pool())
+    .await?;
+    Ok(json!({
+        "symbol": symbol,
+        "name": fund_name(symbol),
+        "above": {"enabled": above_enabled, "threshold_pct": above_threshold},
+        "below": {"enabled": below_enabled, "threshold_pct": below_threshold},
+    }))
 }
 
 // SQLite 的条件更新同时保存触发快照和去重状态，重启不会重复提醒。
@@ -76,53 +127,106 @@ async fn claim(
     db: &Db,
     user_id: i64,
     symbol: &str,
+    direction: &str,
     rate: f64,
     at: &str,
 ) -> Result<bool, sqlx::Error> {
-    sqlx::query(
-        "UPDATE etf_premium_alerts SET above_threshold = 0
-        WHERE user_id = ? AND symbol = ? AND threshold_pct > ?",
-    )
-    .bind(user_id)
-    .bind(symbol)
-    .bind(rate)
-    .execute(db.pool())
-    .await?;
-    let result = sqlx::query("UPDATE etf_premium_alerts SET above_threshold = 1,
-        last_triggered_pct = ?, last_threshold_pct = threshold_pct, last_triggered_at = ?, delivery_status = 'pending'
-        WHERE user_id = ? AND symbol = ? AND enabled = 1 AND above_threshold = 0 AND threshold_pct <= ?")
-        .bind(rate).bind(at).bind(user_id).bind(symbol).bind(rate).execute(db.pool()).await?;
-    Ok(result.rows_affected() == 1)
+    let (reset_sql, claim_sql, baseline_sql) = match direction {
+        "above" => (
+            "UPDATE etf_premium_alerts SET above_threshold = 0, above_baseline = 0
+             WHERE user_id = ? AND symbol = ? AND above_threshold_pct > ?",
+            "UPDATE etf_premium_alerts SET above_threshold = 1, above_baseline = 1,
+                last_triggered_pct = ?, last_threshold_pct = above_threshold_pct,
+                last_triggered_at = ?, delivery_status = 'pending', direction = 'above'
+             WHERE user_id = ? AND symbol = ? AND above_enabled = 1
+               AND above_baseline = 0 AND above_threshold_pct < ?",
+            "UPDATE etf_premium_alerts SET above_baseline = CASE
+                WHEN ? > above_threshold_pct THEN 1 ELSE 0 END
+             WHERE user_id = ? AND symbol = ?",
+        ),
+        "below" => (
+            "UPDATE etf_premium_alerts SET below_threshold = 0, below_baseline = 0
+             WHERE user_id = ? AND symbol = ? AND below_threshold_pct < ?",
+            "UPDATE etf_premium_alerts SET below_threshold = 1, below_baseline = 1,
+                last_triggered_pct = ?, last_threshold_pct = below_threshold_pct,
+                last_triggered_at = ?, delivery_status = 'pending', direction = 'below'
+             WHERE user_id = ? AND symbol = ? AND below_enabled = 1
+               AND below_baseline = 0 AND below_threshold_pct > ?",
+            "UPDATE etf_premium_alerts SET below_baseline = CASE
+                WHEN ? < below_threshold_pct THEN 1 ELSE 0 END
+             WHERE user_id = ? AND symbol = ?",
+        ),
+        _ => return Ok(false),
+    };
+    sqlx::query(reset_sql)
+        .bind(user_id)
+        .bind(symbol)
+        .bind(rate)
+        .execute(db.pool())
+        .await?;
+    let result = sqlx::query(claim_sql)
+        .bind(rate)
+        .bind(at)
+        .bind(user_id)
+        .bind(symbol)
+        .bind(rate)
+        .execute(db.pool())
+        .await?;
+    if result.rows_affected() == 1 {
+        return Ok(true);
+    }
+    sqlx::query(baseline_sql)
+        .bind(rate)
+        .bind(user_id)
+        .bind(symbol)
+        .execute(db.pool())
+        .await?;
+    Ok(false)
 }
 
 async fn mark_delivery(
     db: &Db,
     user_id: i64,
     symbol: &str,
+    direction: &str,
     at: &str,
     status: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE etf_premium_alerts SET delivery_status = ? WHERE user_id = ? AND symbol = ? AND last_triggered_at = ?")
-        .bind(status).bind(user_id).bind(symbol).bind(at).execute(db.pool()).await?;
+    sqlx::query(
+        "UPDATE etf_premium_alerts SET delivery_status = ?
+         WHERE user_id = ? AND symbol = ? AND direction = ? AND last_triggered_at = ?",
+    )
+    .bind(status)
+    .bind(user_id)
+    .bind(symbol)
+    .bind(direction)
+    .bind(at)
+    .execute(db.pool())
+    .await?;
     Ok(())
 }
 
 pub async fn latest_alert(db: &Db, user_id: i64) -> Result<Option<Value>, sqlx::Error> {
     let row = sqlx::query(
-        "SELECT symbol, last_triggered_pct, last_threshold_pct, last_triggered_at, delivery_status
-        FROM etf_premium_alerts WHERE user_id = ? AND last_triggered_at IS NOT NULL
-        ORDER BY last_triggered_at DESC, symbol LIMIT 1",
+        "SELECT symbol, direction, last_triggered_pct, last_threshold_pct, last_triggered_at,
+                delivery_status
+         FROM etf_premium_alerts WHERE user_id = ? AND last_triggered_at IS NOT NULL
+         ORDER BY last_triggered_at DESC, symbol LIMIT 1",
     )
     .bind(user_id)
     .fetch_optional(db.pool())
     .await?;
     Ok(row.map(|row| {
         let symbol: String = row.get("symbol");
-        json!({"symbol": symbol, "name": fund_name(&symbol),
+        json!({
+            "symbol": symbol,
+            "name": fund_name(&symbol),
+            "direction": row.get::<String, _>("direction"),
             "triggered_pct": row.get::<f64, _>("last_triggered_pct"),
             "threshold_pct": row.get::<f64, _>("last_threshold_pct"),
             "triggered_at": row.get::<String, _>("last_triggered_at"),
-            "delivery_status": row.get::<String, _>("delivery_status")})
+            "delivery_status": row.get::<String, _>("delivery_status")
+        })
     }))
 }
 
@@ -145,8 +249,13 @@ impl Quote {
             .all(|at| at.is_some_and(|at| (0..=120).contains(&(now - at))))
     }
 
-    fn alertable(&self, _now: i64) -> bool {
-        false
+    fn alertable(&self, now: i64) -> bool {
+        self.fresh(now)
+            && self
+                .price
+                .zip(self.iopv)
+                .and_then(|(price, iopv)| premium(price, iopv))
+                .is_some()
     }
 
     fn render(&self, now: i64, fetch_ok: bool) -> Value {
@@ -361,7 +470,8 @@ async fn evaluate(db: &Db, quote: &Quote, now: i64) -> Result<(), sqlx::Error> {
     }
     let rate = premium(quote.price.unwrap(), quote.iopv.unwrap()).unwrap();
     let users: Vec<i64> = sqlx::query_scalar(
-        "SELECT user_id FROM etf_premium_alerts WHERE symbol = ? AND enabled = 1",
+        "SELECT user_id FROM etf_premium_alerts WHERE symbol = ?
+         AND (above_enabled = 1 OR below_enabled = 1)",
     )
     .bind(quote.symbol)
     .fetch_all(db.pool())
@@ -373,27 +483,35 @@ async fn evaluate(db: &Db, quote: &Quote, now: i64) -> Result<(), sqlx::Error> {
             break;
         }
         let at = quote.market_at.as_deref().unwrap();
-        if !claim(db, user_id, quote.symbol, rate, at).await? {
-            continue;
-        }
-        let threshold: f64 = sqlx::query_scalar(
-            "SELECT last_threshold_pct FROM etf_premium_alerts WHERE user_id = ? AND symbol = ?",
-        )
-        .bind(user_id)
-        .bind(quote.symbol)
-        .fetch_one(db.pool())
-        .await?;
-        let text = format!("【ETF高溢价提醒】\n\n{} {}\n当前溢价率：{rate:.2}%\n提醒水位：{threshold:.2}%\n触发时间：{}\n\n参考价值：雪球行情IOPV（{:.4}）\nIOPV更新时间：{}",
-            quote.symbol, fund_name(quote.symbol).unwrap(), at.replace('T', " ").replace("+08:00", ""), quote.iopv.unwrap(),
-            quote.reference_at.as_deref().unwrap().replace('T', " ").replace("+08:00", ""));
-        let status = match crate::push::send_user_alert(db, user_id, &text).await {
-            Ok(status) => status,
-            Err(err) => {
-                tracing::warn!(user_id, symbol = quote.symbol, "ETF提醒投递失败: {err}");
-                "failed"
+        for direction in ["above", "below"] {
+            if !claim(db, user_id, quote.symbol, direction, rate, at).await? {
+                continue;
             }
-        };
-        mark_delivery(db, user_id, quote.symbol, at, status).await?;
+            let threshold: f64 = sqlx::query_scalar(
+                "SELECT last_threshold_pct FROM etf_premium_alerts
+                 WHERE user_id = ? AND symbol = ?",
+            )
+            .bind(user_id)
+            .bind(quote.symbol)
+            .fetch_one(db.pool())
+            .await?;
+            let label = if direction == "above" {
+                "高溢价"
+            } else {
+                "低溢价"
+            };
+            let text = format!("【ETF{label}提醒】\n\n{} {}\n当前溢价率：{rate:.2}%\n提醒水位：{threshold:.2}%\n触发时间：{}\n\n参考价值：雪球行情IOPV（{:.4}）\nIOPV更新时间：{}",
+                quote.symbol, fund_name(quote.symbol).unwrap(), at.replace('T', " ").replace("+08:00", ""), quote.iopv.unwrap(),
+                quote.reference_at.as_deref().unwrap().replace('T', " ").replace("+08:00", ""));
+            let status = match crate::push::send_user_alert(db, user_id, &text).await {
+                Ok(status) => status,
+                Err(err) => {
+                    tracing::warn!(user_id, symbol = quote.symbol, "ETF提醒投递失败: {err}");
+                    "failed"
+                }
+            };
+            mark_delivery(db, user_id, quote.symbol, direction, at, status).await?;
+        }
     }
     Ok(())
 }
@@ -515,7 +633,7 @@ mod tests {
             (premium(quote.price.unwrap(), quote.iopv.unwrap()).unwrap() - 15.4015995).abs()
                 < 0.00001
         );
-        assert!(!quote.alertable(now));
+        assert!(quote.alertable(now));
         assert!(!quote.alertable(now + 121));
         assert!(!quote.alertable(now - 1));
         assert_eq!(quote.render(now, false)["status"], "unavailable");
@@ -534,7 +652,7 @@ mod tests {
             .unwrap();
         db.ensure_admin("hash").await.unwrap();
         let user = db.user_by_username("admin").await.unwrap().unwrap();
-        save_setting(&db, user.id, "513100", true, 5.0)
+        save_setting(&db, user.id, "513100", true, 5.0, false, 0.0)
             .await
             .unwrap();
         let quote = sample_quote();
@@ -543,7 +661,7 @@ mod tests {
         assert!(latest_alert(&db, user.id).await.unwrap().is_none());
         evaluate(&db, &quote, now).await.unwrap();
         assert!(latest_alert(&db, user.id).await.unwrap().is_none());
-        save_setting(&db, user.id, "513100", true, 6.0)
+        save_setting(&db, user.id, "513100", true, 6.0, false, 0.0)
             .await
             .unwrap();
         sqlx::query("UPDATE users SET notify_enabled = 0 WHERE id = ?")
@@ -578,17 +696,116 @@ mod tests {
     }
 
     #[test]
+    fn valid_settings_covers_bidirectional_ranges_and_relationships() {
+        assert!(valid_settings("513100", true, 8.0, true, -2.0));
+        assert!(!valid_settings("513100", true, 101.0, false, 0.0));
+        assert!(!valid_settings("513100", false, 8.0, true, -101.0));
+        assert!(!valid_settings("513100", true, 2.0, true, 3.0));
+        assert!(valid_settings("513100", false, 0.0, true, -2.0));
+        assert!(!valid_settings("000001", true, 8.0, false, 0.0));
+    }
+
+    #[test]
     fn premium_requires_positive_finite_values() {
         assert!((premium(1.1, 1.0).unwrap() - 10.0).abs() < 1e-10);
         for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
             assert_eq!(premium(1.1, value), None);
             assert_eq!(premium(value, 1.0), None);
         }
-        assert!(valid_setting("513100", 13.58));
-        assert!(!valid_setting("unknown", 5.0));
+        assert!(valid_settings("513100", true, 13.58, false, 0.0));
+        assert!(!valid_settings("unknown", true, 5.0, false, 0.0));
         for value in [-0.01, 100.01, f64::NAN] {
-            assert!(!valid_setting("513500", value));
+            assert!(!valid_settings("513500", true, value, false, 0.0));
         }
+        for value in [-100.01, 100.01, f64::NAN] {
+            assert!(!valid_settings("513500", false, 0.0, true, value));
+        }
+    }
+
+    #[tokio::test]
+    async fn bidirectional_crossings_baseline_deduplicate_rearm_and_respect_disabled_sides() {
+        let db = crate::db::Db::open(std::path::Path::new(":memory:"))
+            .await
+            .unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        sqlx::query("INSERT INTO users (username) VALUES ('reader')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let reader = db.user_by_username("reader").await.unwrap().unwrap();
+        save_setting(&db, user.id, "513100", true, 8.0, true, -2.0)
+            .await
+            .unwrap();
+        save_setting(&db, reader.id, "513500", true, 8.0, false, 0.0)
+            .await
+            .unwrap();
+
+        let at = "2026-09-30T14:30:31+08:00";
+        assert!(!claim(&db, user.id, "513100", "above", 7.0, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "above", 8.0, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "above", 8.01, at)
+            .await
+            .unwrap());
+        let last = latest_alert(&db, user.id).await.unwrap().unwrap();
+        assert_eq!(last["direction"], "above");
+        assert_eq!(last["triggered_pct"], 8.01);
+        assert_eq!(last["threshold_pct"], 8.0);
+        assert!(!claim(&db, user.id, "513100", "above", 9.0, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "above", 7.99, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "above", 8.01, at)
+            .await
+            .unwrap());
+
+        assert!(!claim(&db, user.id, "513100", "below", -1.0, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "below", -2.0, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "below", -2.01, at)
+            .await
+            .unwrap());
+        let last = latest_alert(&db, user.id).await.unwrap().unwrap();
+        assert_eq!(last["direction"], "below");
+        assert_eq!(last["triggered_pct"], -2.01);
+        assert_eq!(last["threshold_pct"], -2.0);
+        assert!(!claim(&db, user.id, "513100", "below", -3.0, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "below", -1.99, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "below", -2.01, at)
+            .await
+            .unwrap());
+
+        // An initial observation outside the threshold establishes the baseline only.
+        assert!(!claim(&db, reader.id, "513500", "above", 9.0, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, reader.id, "513500", "above", 7.0, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, reader.id, "513500", "above", 8.01, at)
+            .await
+            .unwrap());
+
+        // The disabled below direction must not claim even when it crosses.
+        assert!(!claim(&db, reader.id, "513500", "below", -1.0, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, reader.id, "513500", "below", -2.01, at)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -604,35 +821,58 @@ mod tests {
             .unwrap();
         let reader = db.user_by_username("reader").await.unwrap().unwrap();
         assert_eq!(
-            settings(&db, user.id).await.unwrap()["items"][0]["enabled"],
+            settings(&db, user.id).await.unwrap()["items"][0]["above"]["enabled"],
             false
         );
-        save_setting(&db, user.id, "513100", true, 13.58)
+        save_setting(&db, user.id, "513100", true, 13.58, false, 0.0)
             .await
             .unwrap();
-        save_setting(&db, reader.id, "513100", true, 20.0)
+        save_setting(&db, reader.id, "513100", true, 20.0, false, 0.0)
             .await
             .unwrap();
         let at = "2026-09-30T14:30:31+08:00";
-        assert!(claim(&db, user.id, "513100", 13.73, at).await.unwrap());
-        assert!(!claim(&db, user.id, "513100", 14.2, at).await.unwrap());
-        assert!(!claim(&db, reader.id, "513100", 13.73, at).await.unwrap());
-        assert!(!claim(&db, user.id, "513100", 13.2, at).await.unwrap());
-        assert!(claim(&db, user.id, "513100", 13.58, at).await.unwrap());
-        mark_delivery(&db, user.id, "513100", at, "sent")
+        assert!(!claim(&db, user.id, "513100", "above", 13.2, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "above", 13.58, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "above", 13.73, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "above", 14.2, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, reader.id, "513100", "above", 13.73, at)
+            .await
+            .unwrap());
+        assert!(!claim(&db, user.id, "513100", "above", 13.2, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "above", 13.73, at)
+            .await
+            .unwrap());
+        mark_delivery(&db, user.id, "513100", "above", at, "sent")
             .await
             .unwrap();
-        save_setting(&db, user.id, "513100", true, 10.0)
+        save_setting(&db, user.id, "513100", true, 10.0, false, 0.0)
             .await
             .unwrap();
         let last = latest_alert(&db, user.id).await.unwrap().unwrap();
         assert_eq!(last["threshold_pct"], 13.58);
         assert_eq!(last["delivery_status"], "sent");
-        assert!(claim(&db, user.id, "513100", 11.0, at).await.unwrap());
-        save_setting(&db, user.id, "513100", false, 10.0)
+        assert!(!claim(&db, user.id, "513100", "above", 9.0, at)
+            .await
+            .unwrap());
+        assert!(claim(&db, user.id, "513100", "above", 11.0, at)
+            .await
+            .unwrap());
+        save_setting(&db, user.id, "513100", false, 10.0, false, 0.0)
             .await
             .unwrap();
-        assert!(!claim(&db, user.id, "513100", 30.0, at).await.unwrap());
+        assert!(!claim(&db, user.id, "513100", "above", 30.0, at)
+            .await
+            .unwrap());
         assert!(latest_alert(&db, reader.id).await.unwrap().is_none());
     }
 }

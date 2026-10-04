@@ -1,5 +1,5 @@
-//! 后台维护，分四条互不等待的循环，每轮结束后歇 60 秒：
-//! 告警与重试、LLM 批处理、清理与备份、日报与提醒。
+//! 后台维护，分五条互不等待的循环，每轮结束后歇 60 秒：
+//! 告警与重试、LLM 批处理、本地库文档入库、清理与备份、日报与提醒。
 //! 每步单独计时、单独记错，一步失败不影响同轮后面的步骤。
 
 use std::future::Future;
@@ -19,6 +19,7 @@ pub fn spawn(db: Db) {
     every_round(db.clone(), |db| Box::pin(alerts_and_retries(db)));
     every_round(db.clone(), |db| Box::pin(llm_batches(db)));
     every_round(db.clone(), |db| Box::pin(cleanup_and_backup(db)));
+    every_round(db.clone(), |db| Box::pin(local_library_documents(db)));
     every_round(db, |db| Box::pin(daily_reports(db)));
 }
 
@@ -430,6 +431,39 @@ async fn translate_backfill(db: &Db) {
             tracing::info!(platform, "翻译回填达到时间预算，剩余留到下一轮");
         }
     }
+}
+
+/// 本地库 PDF 入库。切到 Rust 后这一步一直没人做，研报中心从 9/27 起停更。
+async fn local_library_documents(db: &Db) {
+    const GROUP: &str = "研报与文档";
+    timed(GROUP, "本地库入库", async {
+        let Ok(archive) = crate::ima_admin::archive_root() else {
+            return;
+        };
+        let last = db
+            .setting("ima_local_documents_at")
+            .await
+            .ok()
+            .flatten()
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        let now = unix_now();
+        if last > 0 && now.saturating_sub(last) < 3600 {
+            return;
+        }
+        match crate::ima_admin::sync_documents(db, &archive).await {
+            Ok(written) => {
+                let _ = db
+                    .set_setting("ima_local_documents_at", &now.to_string())
+                    .await;
+                if written > 0 {
+                    tracing::info!(written, "本地库文档入库");
+                }
+            }
+            Err(err) => tracing::warn!("本地库文档入库失败: {}", err.detail),
+        }
+    })
+    .await;
 }
 
 async fn cleanup_and_backup(db: &Db) {

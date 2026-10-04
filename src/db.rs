@@ -953,6 +953,43 @@ impl Db {
         Ok(())
     }
 
+    /// 本地库文档（`<archive>/local/<slug>/**/*.pdf`）入库，返回写入行数。
+    /// 文件大小没变就不改写，否则每轮扫描都会把 downloaded_at 刷成当前时间。
+    pub async fn upsert_local_ima_document(
+        &self,
+        group_id: &str,
+        media_id: &str,
+        day: &str,
+        sort_date: &str,
+        name: &str,
+        group_name: &str,
+        abstract_text: &str,
+        size: i64,
+        pdf_path: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "INSERT INTO ima_document_index (group_id, media_id, day, sort_date, name, group_name, abstract, size, pdf_path, downloaded_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(group_id, media_id) DO UPDATE SET
+               day = excluded.day, sort_date = excluded.sort_date, name = excluded.name,
+               group_name = excluded.group_name, abstract = excluded.abstract, size = excluded.size,
+               pdf_path = excluded.pdf_path
+             WHERE excluded.size != ima_document_index.size",
+        )
+        .bind(group_id)
+        .bind(media_id)
+        .bind(day)
+        .bind(sort_date)
+        .bind(name)
+        .bind(group_name)
+        .bind(abstract_text)
+        .bind(size)
+        .bind(pdf_path)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     pub async fn ima_document_count(&self) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar("SELECT COUNT(*) FROM ima_document_index")
             .fetch_one(&self.pool)

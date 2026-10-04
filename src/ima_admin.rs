@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::db::Db;
 
@@ -140,6 +141,154 @@ pub async fn scan(db: &Db, archive: &Path) -> Result<Value, AdminError> {
     let mut payload = payload;
     attach_acl(db, &mut payload).await?;
     Ok(payload)
+}
+
+/// 把 `<archive>/local/<slug>/**/*.pdf` 收进 ima_document_index，返回写入行数。
+/// 不动 ima_local_libraries；名称优先取登记值，其次 marker，最后退化成 slug。
+/// 目录里没有 marker 也照收：标记文件丢过一次，不能让整库就此停摆。
+pub async fn sync_documents(db: &Db, archive: &Path) -> Result<u64, AdminError> {
+    let Ok(entries) = fs::read_dir(archive.join("local")) else {
+        return Ok(0);
+    };
+    let libraries = stored(db).await?["libraries"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let mut written = 0_u64;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        let slug = entry.file_name().to_string_lossy().to_string();
+        if !kind.is_dir() || kind.is_symlink() || slug.starts_with('.') || !slug_ok(&slug) {
+            continue;
+        }
+        let group_id = format!("local-{slug}");
+        let record = libraries
+            .iter()
+            .find(|item| item["group_id"].as_str() == Some(group_id.as_str()));
+        let marker = read_marker(&entry.path()).ok();
+        let disabled = match record {
+            Some(item) => item["enabled"] != true,
+            None => marker
+                .as_ref()
+                .is_some_and(|value| value["enabled"] != true),
+        };
+        if disabled {
+            continue;
+        }
+        let name = record
+            .and_then(|item| item["name"].as_str())
+            .filter(|name| !name.trim().is_empty())
+            .or_else(|| marker.as_ref().and_then(|value| value["name"].as_str()))
+            .unwrap_or(&slug)
+            .to_string();
+        written += sync_library(db, archive, &entry.path(), &group_id, &name).await?;
+    }
+    Ok(written)
+}
+
+async fn sync_library(
+    db: &Db,
+    archive: &Path,
+    root: &Path,
+    group_id: &str,
+    group_name: &str,
+) -> Result<u64, AdminError> {
+    let mut written = 0_u64;
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_symlink() {
+                continue;
+            }
+            if kind.is_dir() {
+                if !entry.file_name().to_string_lossy().starts_with('.') {
+                    pending.push(path);
+                }
+                continue;
+            }
+            let file_name = entry.file_name().to_string_lossy().to_string();
+            if !file_name.to_ascii_lowercase().ends_with(".pdf") {
+                continue;
+            }
+            let Ok(size) = entry.metadata().map(|meta| meta.len()) else {
+                continue;
+            };
+            let Ok(rel) = path.strip_prefix(archive) else {
+                continue;
+            };
+            let pdf_path = rel.to_string_lossy().replace('\\', "/");
+            // 与旧实现同一条 id 公式，保证重扫时命中原来的行而不是插重复。
+            let media_id = format!(
+                "loc{}",
+                &hex::encode(Sha256::digest(pdf_path.as_bytes()))[..20]
+            );
+            let sidecar = sidecar(&path);
+            let day = sidecar["day"]
+                .as_str()
+                .map(str::trim)
+                .filter(|day| !day.is_empty())
+                .map(str::to_string)
+                .or_else(|| {
+                    path.parent()
+                        .and_then(|dir| dir.file_name())
+                        .map(|dir| dir.to_string_lossy().to_string())
+                })
+                .unwrap_or_default();
+            let sort_date = sidecar["publish"]
+                .as_str()
+                .map(str::trim)
+                .and_then(|publish| publish.get(..10))
+                .map(str::to_string)
+                // 没有 publish 就退回文件时间，新文件才不会掉到列表最底下
+                .unwrap_or_else(|| date_of(&path));
+            let abstract_text = sidecar["summary"].as_str().unwrap_or("");
+            let name = &file_name[..file_name.len() - 4];
+            match db
+                .upsert_local_ima_document(
+                    group_id,
+                    &media_id,
+                    &day,
+                    &sort_date,
+                    name,
+                    group_name,
+                    abstract_text,
+                    size as i64,
+                    &pdf_path,
+                )
+                .await
+            {
+                Ok(rows) => written += rows,
+                Err(err) => tracing::warn!(%pdf_path, "本地库文档入库失败: {err}"),
+            }
+        }
+    }
+    Ok(written)
+}
+
+fn sidecar(path: &Path) -> Value {
+    fs::read_to_string(path.with_extension("json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .unwrap_or_else(|| json!({}))
+}
+
+fn date_of(path: &Path) -> String {
+    let secs = fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or_else(now_secs);
+    chrono_lite(secs)[..10].to_string()
 }
 
 pub async fn create(
@@ -560,6 +709,58 @@ mod tests {
         let enabled = set_enabled(&db, &root, "my-papers", true).await.unwrap();
         assert_eq!(enabled["libraries"][0]["enabled"], true);
         assert!(create(&db, &root, "my-papers", "重复", &[]).await.is_err());
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_file(db_path);
+    }
+
+    #[tokio::test]
+    async fn local_library_documents_are_indexed_once() {
+        let (db, db_path) = db().await;
+        let root = std::env::temp_dir().join(format!(
+            "vpush-ima-docs-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        create(&db, &root, "cicc-research", "中金点睛", &[])
+            .await
+            .unwrap();
+        set_enabled(&db, &root, "cicc-research", true)
+            .await
+            .unwrap();
+        let dir = root.join("local/cicc-research/市场策略/0930");
+        fs::create_dir_all(&dir).unwrap();
+        let pdf = dir.join("中国策略简评：稳增长政策助力信心修复_401231.pdf");
+        fs::write(&pdf, vec![0_u8; 1024]).unwrap();
+        fs::write(
+            pdf.with_extension("json"),
+            json!({"id": 401231, "summary": "稳增长政策", "day": "0930", "publish": "2026-09-30"})
+                .to_string(),
+        )
+        .unwrap();
+        // 生产上 marker 丢过一次导致整库停摆：没有 marker 也必须入库
+        fs::remove_file(root.join("local/cicc-research").join(MARKER)).unwrap();
+
+        assert_eq!(sync_documents(&db, &root).await.unwrap(), 1);
+        let path =
+            "local/cicc-research/市场策略/0930/中国策略简评：稳增长政策助力信心修复_401231.pdf";
+        let media_id = format!("loc{}", &hex::encode(Sha256::digest(path.as_bytes()))[..20]);
+        let row: (String, String, String, String, String, i64) = sqlx::query_as(
+            "SELECT name, group_name, day, sort_date, abstract, size FROM ima_document_index
+             WHERE group_id = 'local-cicc-research' AND media_id = ?",
+        )
+        .bind(&media_id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(row.0, "中国策略简评：稳增长政策助力信心修复_401231");
+        assert_eq!(row.1, "中金点睛");
+        assert_eq!(row.2, "0930");
+        assert_eq!(row.3, "2026-09-30");
+        assert_eq!(row.4, "稳增长政策");
+        assert_eq!(row.5, 1024);
+
+        // 大小没变就不重写，否则 downloaded_at 每轮都会被刷成当前时间
+        assert_eq!(sync_documents(&db, &root).await.unwrap(), 0);
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(db_path);
     }

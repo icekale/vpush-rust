@@ -193,26 +193,84 @@ pub async fn list_pdfs_deep(
 ) -> Result<Vec<File>, String> {
     let mut files = list_pdfs(http, base, session, knowledge_base_id, roots).await?;
     let mut seen: HashSet<String> = roots.iter().cloned().collect();
-    let mut level: Vec<String> = roots.to_vec();
+    // (目录 id, 该目录下生效的 4 位月日)
+    let mut level = child_folders(http, base, session, knowledge_base_id, roots, None).await?;
     // seen 同时挡环形 parent，所以不需要深度上限
     while !level.is_empty() {
         let mut next = Vec::new();
-        for folder in &level {
-            for item in list_folders(http, base, session, knowledge_base_id, folder).await? {
-                if let Some(id) = item["id"].as_str() {
-                    if !id.is_empty() && seen.insert(id.to_string()) {
-                        next.push(id.to_string());
-                    }
-                }
+        for (id, day) in level {
+            if !seen.insert(id.clone()) {
+                continue;
             }
+            let ids = [id];
+            for mut file in list_pdfs(http, base, session, knowledge_base_id, &ids).await? {
+                if let Some(day) = day.as_deref() {
+                    stamp_day(&mut file, day);
+                }
+                files.push(file);
+            }
+            next.extend(
+                child_folders(http, base, session, knowledge_base_id, &ids, day.as_deref()).await?,
+            );
         }
-        if next.is_empty() {
-            break;
-        }
-        files.extend(list_pdfs(http, base, session, knowledge_base_id, &next).await?);
         level = next;
     }
     Ok(files)
+}
+
+/// 列一层子目录，并带上从祖先继承下来的 4 位月日（0929 这类目录名）。
+async fn child_folders(
+    http: &impl Transport,
+    base: &str,
+    session: &Session,
+    knowledge_base_id: &str,
+    parents: &[String],
+    inherited: Option<&str>,
+) -> Result<Vec<(String, Option<String>)>, String> {
+    let mut found = Vec::new();
+    for parent in parents {
+        for item in list_folders(http, base, session, knowledge_base_id, parent).await? {
+            let Some(id) = item["id"].as_str().filter(|id| !id.is_empty()) else {
+                continue;
+            };
+            let day = item["name"]
+                .as_str()
+                .and_then(mmdd)
+                .map(str::to_string)
+                .or_else(|| inherited.map(str::to_string));
+            found.push((id.to_string(), day));
+        }
+    }
+    Ok(found)
+}
+
+/// 4 位纯数字目录名（0929）= 那一天的归档目录。
+fn mmdd(name: &str) -> Option<&str> {
+    (name.len() == 4 && name.bytes().all(|byte| byte.is_ascii_digit())).then_some(name)
+}
+
+/// 目录给出的月日优先，create_time 只负责年份。
+/// 上游 create_time 经常是 0，以前这种行会写成 day='unknown'/sort_date='' 而沉在列表最底。
+fn stamp_day(file: &mut File, day: &str) {
+    let year = file
+        .sort_date
+        .get(..4)
+        .filter(|year| year.bytes().all(|byte| byte.is_ascii_digit()))
+        .map(str::to_string)
+        .unwrap_or_else(current_year);
+    file.day = day.to_string();
+    file.sort_date = format!("{year}-{}-{}", &day[..2], &day[2..]);
+}
+
+/// 当前年份（北京时区，与上面 MMDD 同一套换算）。
+fn current_year() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or(0);
+    civil(ms)
+        .map(|(year, _, _)| format!("{year:04}"))
+        .unwrap_or_else(|| "1970".to_string())
 }
 
 pub async fn list_folders(
@@ -769,11 +827,11 @@ mod tests {
             let list = match folder.as_str() {
                 "root" => json!([
                     {"media_id": "f-root", "title": "根目录报告.pdf", "media_type": 1},
-                    {"folder_info": {"folder_id": "A", "name": "目录A"}}
+                    {"folder_info": {"folder_id": "A", "name": "2026年9月"}}
                 ]),
                 "A" => json!([
                     {"media_id": "f-a", "title": "报告A.pdf", "media_type": 1},
-                    {"folder_info": {"folder_id": "B", "name": "目录B"}}
+                    {"folder_info": {"folder_id": "B", "name": "0929"}}
                 ]),
                 // B 里放一个指回 root 的目录项：环形 parent 不能把递归绕死
                 "B" => json!([
@@ -804,5 +862,10 @@ mod tests {
         let mut ids: Vec<String> = files.iter().map(|file| file.media_id.clone()).collect();
         ids.sort();
         assert_eq!(ids, ["f-a", "f-b", "f-root"]);
+        // 0929 目录下的文档用目录名当日期，create_time 缺失也不再沉底
+        let by_id = |wanted: &str| files.iter().find(|file| file.media_id == wanted).unwrap();
+        assert_eq!(by_id("f-b").day, "0929");
+        assert!(by_id("f-b").sort_date.ends_with("-09-29"), "{}", by_id("f-b").sort_date);
+        assert_eq!(by_id("f-a").day, "unknown");
     }
 }

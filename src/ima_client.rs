@@ -8,6 +8,7 @@ use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
 use serde_json::{json, Value};
 use sha2::Sha256;
+use std::collections::HashSet;
 
 const PUB_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAx9h6SY1LO88wRVKdOC5U\n\
@@ -177,6 +178,39 @@ pub async fn list_pdfs(
             }
             cursor = next.to_string();
         }
+    }
+    Ok(files)
+}
+
+/// 递归列出根目录下所有 PDF。原来只调 list_pdfs 列挂载根目录的直接文件，
+/// 上游三万个研报就只能看到两个 —— 子目录得自己走下去。
+pub async fn list_pdfs_deep(
+    http: &impl Transport,
+    base: &str,
+    session: &Session,
+    knowledge_base_id: &str,
+    roots: &[String],
+) -> Result<Vec<File>, String> {
+    let mut files = list_pdfs(http, base, session, knowledge_base_id, roots).await?;
+    let mut seen: HashSet<String> = roots.iter().cloned().collect();
+    let mut level: Vec<String> = roots.to_vec();
+    // seen 同时挡环形 parent，所以不需要深度上限
+    while !level.is_empty() {
+        let mut next = Vec::new();
+        for folder in &level {
+            for item in list_folders(http, base, session, knowledge_base_id, folder).await? {
+                if let Some(id) = item["id"].as_str() {
+                    if !id.is_empty() && seen.insert(id.to_string()) {
+                        next.push(id.to_string());
+                    }
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        files.extend(list_pdfs(http, base, session, knowledge_base_id, &next).await?);
+        level = next;
     }
     Ok(files)
 }
@@ -721,5 +755,54 @@ mod tests {
         assert_eq!(items[0]["folder_count"], 1);
         assert_eq!(items[0]["file_count"], 2);
         assert_eq!(http.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    struct Tree;
+
+    impl Transport for Tree {
+        async fn post(&self, url: &str, _: &[(&str, String)], body: &str) -> Result<Value, String> {
+            assert!(url.ends_with("/get_knowledge_list"));
+            let folder = serde_json::from_str::<Value>(body).unwrap()["folder_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            let list = match folder.as_str() {
+                "root" => json!([
+                    {"media_id": "f-root", "title": "根目录报告.pdf", "media_type": 1},
+                    {"folder_info": {"folder_id": "A", "name": "目录A"}}
+                ]),
+                "A" => json!([
+                    {"media_id": "f-a", "title": "报告A.pdf", "media_type": 1},
+                    {"folder_info": {"folder_id": "B", "name": "目录B"}}
+                ]),
+                // B 里放一个指回 root 的目录项：环形 parent 不能把递归绕死
+                "B" => json!([
+                    {"media_id": "f-b", "title": "报告B.pdf", "media_type": 1},
+                    {"folder_info": {"folder_id": "root", "name": "根"}}
+                ]),
+                _ => json!([]),
+            };
+            Ok(json!({"knowledge_list": list}))
+        }
+    }
+
+    #[tokio::test]
+    async fn lists_pdfs_in_subfolders_and_survives_a_cycle() {
+        let session = Session {
+            token: "t".into(),
+            uid: "u".into(),
+        };
+        let files = list_pdfs_deep(
+            &Tree,
+            "https://ima.test",
+            &session,
+            "kb",
+            &["root".to_string()],
+        )
+        .await
+        .unwrap();
+        let mut ids: Vec<String> = files.iter().map(|file| file.media_id.clone()).collect();
+        ids.sort();
+        assert_eq!(ids, ["f-a", "f-b", "f-root"]);
     }
 }

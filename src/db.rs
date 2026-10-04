@@ -886,6 +886,18 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// 已经下载过 PDF 的 media_id，用来跳过重复下载。
+    /// ponytail: 只看 pdf_path 有没有值，上游换掉同名文件不会重下；要跟内容就得再比 size。
+    pub async fn ima_downloaded_ids(&self, group_id: &str) -> Result<HashSet<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT media_id FROM ima_document_index WHERE group_id = ? AND pdf_path != ''",
+        )
+        .bind(group_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
     pub async fn record_ima_listing(
         &self,
         group_id: &str,

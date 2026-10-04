@@ -312,10 +312,11 @@ async fn sync_groups(
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 登录失败"))?;
     let mut listed = 0_i64;
+    let mut pending = 0_i64;
     let mut downloaded = 0_i64;
     let mut done = Vec::new();
     for group in targets {
-        let files = ima_client::list_pdfs(
+        let files = ima_client::list_pdfs_deep(
             http,
             &ima_client::base(),
             &session,
@@ -324,28 +325,35 @@ async fn sync_groups(
         )
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 知识库列表读取失败"))?;
+        let have = db.ima_downloaded_ids(&group.id).await.unwrap_or_default();
         for file in &files {
             db.record_ima_listing(&group.id, &group.name, file)
                 .await
                 .map_err(|_| CollectorError::Unavailable("IMA 索引写入失败"))?;
-            if let Some(root) = root {
-                if let Ok(bytes) = ima_client::fetch_pdf(
-                    http,
-                    &ima_client::base(),
-                    &session,
-                    &group.knowledge_base_id,
-                    &file.media_id,
-                )
-                .await
-                {
-                    if let Ok(relative) = save_pdf(root, file, &bytes) {
-                        if db
-                            .mark_ima_pdf(&group.id, &file.media_id, &relative)
-                            .await
-                            .is_ok()
-                        {
-                            downloaded += 1;
-                        }
+            // 以前对列到的每个文件都直接 fetch_pdf，递归一开就是三万个 PDF
+            if have.contains(&file.media_id) {
+                continue;
+            }
+            pending += 1;
+            let Some(root) = root else {
+                continue;
+            };
+            if let Ok(bytes) = ima_client::fetch_pdf(
+                http,
+                &ima_client::base(),
+                &session,
+                &group.knowledge_base_id,
+                &file.media_id,
+            )
+            .await
+            {
+                if let Ok(relative) = save_pdf(root, file, &bytes) {
+                    if db
+                        .mark_ima_pdf(&group.id, &file.media_id, &relative)
+                        .await
+                        .is_ok()
+                    {
+                        downloaded += 1;
                     }
                 }
             }
@@ -354,8 +362,13 @@ async fn sync_groups(
         done.push(group.id.clone());
     }
     let finished = now_secs();
-    let result =
-        json!({"status": "ok", "listed": listed, "groups": done, "downloaded": downloaded});
+    let result = json!({
+        "status": "ok",
+        "listed": listed,
+        "pending": pending,
+        "groups": done,
+        "downloaded": downloaded
+    });
     db.set_setting(FINISHED_KEY, &finished.to_string())
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 同步状态写入失败"))?;

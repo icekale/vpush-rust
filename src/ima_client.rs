@@ -273,6 +273,20 @@ fn current_year() -> String {
         .unwrap_or_else(|| "1970".to_string())
 }
 
+/// 排序键是否落在最近 `days` 天内（北京时区，与 MMDD 同一套换算）。
+/// 用来判断「新研报」：老研报只建档、不下载。
+pub fn fresh_sort_date(sort_date: &str, days: i64) -> bool {
+    let Ok(since_epoch) = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) else {
+        return false;
+    };
+    let ms = since_epoch.as_millis() as i64 - days * 86_400_000;
+    let Some((year, month, day)) = civil(ms) else {
+        return false;
+    };
+    // 都是 YYYY-MM-DD，字典序就是时间序
+    sort_date >= format!("{year:04}-{month:02}-{day:02}").as_str()
+}
+
 pub async fn list_folders(
     http: &impl Transport,
     base: &str,

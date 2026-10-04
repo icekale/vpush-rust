@@ -330,8 +330,9 @@ async fn sync_groups(
             db.record_ima_listing(&group.id, &group.name, file)
                 .await
                 .map_err(|_| CollectorError::Unavailable("IMA 索引写入失败"))?;
-            // 以前对列到的每个文件都直接 fetch_pdf，递归一开就是三万个 PDF
-            if have.contains(&file.media_id) {
+            // 以前对列到的每个文件都直接 fetch_pdf。库里 legacy 一万七千行只下过 311 个，
+            // 全量补档一轮要十几小时（上游每个请求 4 秒），所以只看最近几天的新研报。
+            if have.contains(&file.media_id) || !ima_client::fresh_sort_date(&file.sort_date, 3) {
                 continue;
             }
             pending += 1;

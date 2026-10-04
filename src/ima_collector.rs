@@ -314,6 +314,8 @@ async fn sync_groups(
     let mut listed = 0_i64;
     let mut pending = 0_i64;
     let mut downloaded = 0_i64;
+    let mut download_errors = 0_i64;
+    let mut first_download_error = String::new();
     let mut done = Vec::new();
     for group in targets {
         let files = ima_client::list_pdfs_deep(
@@ -339,7 +341,7 @@ async fn sync_groups(
             let Some(root) = root else {
                 continue;
             };
-            if let Ok(bytes) = ima_client::fetch_pdf(
+            match ima_client::fetch_pdf(
                 http,
                 &ima_client::base(),
                 &session,
@@ -348,15 +350,34 @@ async fn sync_groups(
             )
             .await
             {
-                if let Ok(relative) = save_pdf(root, file, &bytes) {
-                    if db
-                        .mark_ima_pdf(&group.id, &file.media_id, &relative)
-                        .await
-                        .is_ok()
-                    {
-                        downloaded += 1;
+                Err(err) => {
+                    download_errors += 1;
+                    if first_download_error.is_empty() {
+                        first_download_error = safe_ima(&err);
                     }
                 }
+                Ok(bytes) => match save_pdf(root, file, &bytes) {
+                    Err(err) => {
+                        download_errors += 1;
+                        if first_download_error.is_empty() {
+                            first_download_error = err;
+                        }
+                    }
+                    Ok(relative) => {
+                        if db
+                            .mark_ima_pdf(&group.id, &file.media_id, &relative)
+                            .await
+                            .is_ok()
+                        {
+                            downloaded += 1;
+                        } else {
+                            download_errors += 1;
+                            if first_download_error.is_empty() {
+                                first_download_error = "PDF 索引写入失败".into();
+                            }
+                        }
+                    }
+                },
             }
         }
         listed += files.len() as i64;
@@ -368,7 +389,9 @@ async fn sync_groups(
         "listed": listed,
         "pending": pending,
         "groups": done,
-        "downloaded": downloaded
+        "downloaded": downloaded,
+        "download_errors": download_errors,
+        "download_error": first_download_error
     });
     db.set_setting(FINISHED_KEY, &finished.to_string())
         .await

@@ -50,7 +50,8 @@ struct GroupIn {
 
 #[derive(Deserialize)]
 pub struct SyncBody {
-    group_id: Option<String>,
+    /// None 或空串 = 同步所有已启用且挂载了的库（维护循环走这条）。
+    pub group_id: Option<String>,
 }
 
 #[derive(Clone)]

@@ -1,5 +1,5 @@
-//! 后台维护，分五条互不等待的循环，每轮结束后歇 60 秒：
-//! 告警与重试、LLM 批处理、本地库文档入库、清理与备份、日报与提醒。
+//! 后台维护，分六条互不等待的循环，每轮结束后歇 60 秒：
+//! 告警与重试、LLM 批处理、IMA 知识库增量、本地库文档入库、清理与备份、日报与提醒。
 //! 每步单独计时、单独记错，一步失败不影响同轮后面的步骤。
 
 use std::future::Future;
@@ -19,6 +19,7 @@ pub fn spawn(db: Db) {
     every_round(db.clone(), |db| Box::pin(alerts_and_retries(db)));
     every_round(db.clone(), |db| Box::pin(llm_batches(db)));
     every_round(db.clone(), |db| Box::pin(cleanup_and_backup(db)));
+    every_round(db.clone(), |db| Box::pin(ima_knowledge_sync(db)));
     every_round(db.clone(), |db| Box::pin(local_library_documents(db)));
     every_round(db, |db| Box::pin(daily_reports(db)));
 }
@@ -431,6 +432,22 @@ async fn translate_backfill(db: &Db) {
             tracing::info!(platform, "翻译回填达到时间预算，剩余留到下一轮");
         }
     }
+}
+
+/// IMA 知识库增量。切流到 Rust 后没人调度，只剩 admin 手动点，几个投行研报库就断在 9/27。
+/// sync 自己按 ima_pure_interval_seconds 判到期，没到就返回 TooSoon，所以每轮都能调。
+async fn ima_knowledge_sync(db: &Db) {
+    const GROUP: &str = "研报与文档";
+    timed(GROUP, "IMA 知识库增量", async {
+        let body = crate::ima_collector::SyncBody { group_id: None };
+        match crate::ima_collector::sync(db, &body).await {
+            Ok(_) => {}
+            // 没到间隔就是正常状态
+            Err(crate::ima_collector::CollectorError::TooSoon) => {}
+            Err(err) => tracing::warn!("IMA 知识库增量失败: {err:?}"),
+        }
+    })
+    .await;
 }
 
 /// 本地库 PDF 入库。切到 Rust 后这一步一直没人做，研报中心从 9/27 起停更。

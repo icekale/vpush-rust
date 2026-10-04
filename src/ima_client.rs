@@ -6,6 +6,7 @@ use base64::Engine;
 use rand::rngs::OsRng;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
+use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashSet;
@@ -193,29 +194,56 @@ pub async fn list_pdfs_deep(
 ) -> Result<Vec<File>, String> {
     let mut files = list_pdfs(http, base, session, knowledge_base_id, roots).await?;
     let mut seen: HashSet<String> = roots.iter().cloned().collect();
-    // (目录 id, 该目录下生效的 4 位月日)
     let mut level = child_folders(http, base, session, knowledge_base_id, roots, None).await?;
     // seen 同时挡环形 parent，所以不需要深度上限
     while !level.is_empty() {
+        let results = stream::iter(level.into_iter().map(|(id, day)| async move {
+            scan_folder(
+                http,
+                base,
+                session,
+                knowledge_base_id,
+                id,
+                day,
+            )
+            .await
+        }))
+        .buffer_unordered(8)
+        .try_collect::<Vec<_>>()
+        .await?;
         let mut next = Vec::new();
-        for (id, day) in level {
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            let ids = [id];
-            for mut file in list_pdfs(http, base, session, knowledge_base_id, &ids).await? {
-                if let Some(day) = day.as_deref() {
-                    stamp_day(&mut file, day);
-                }
-                files.push(file);
-            }
-            next.extend(
-                child_folders(http, base, session, knowledge_base_id, &ids, day.as_deref()).await?,
-            );
+        for (mut folder_files, children) in results {
+            files.append(&mut folder_files);
+            next.extend(children);
         }
-        level = next;
+        level = next
+            .into_iter()
+            .filter(|(id, _)| seen.insert(id.clone()))
+            .collect();
     }
     Ok(files)
+}
+
+async fn scan_folder(
+    http: &impl Transport,
+    base: &str,
+    session: &Session,
+    knowledge_base_id: &str,
+    id: String,
+    day: Option<String>,
+) -> Result<(Vec<File>, Vec<(String, Option<String>)>), String> {
+    let ids = [id.clone()];
+    let (files, children) = tokio::join!(
+        list_pdfs(http, base, session, knowledge_base_id, &ids),
+        child_folders(http, base, session, knowledge_base_id, &ids, day.as_deref()),
+    );
+    let mut files = files?;
+    if let Some(day) = day.as_deref() {
+        for file in &mut files {
+            stamp_day(file, day);
+        }
+    }
+    Ok((files, children?))
 }
 
 /// 列一层子目录，并带上从祖先继承下来的 4 位月日（0929 这类目录名）。
@@ -827,6 +855,24 @@ mod tests {
         assert_eq!(items[0]["folder_count"], 1);
         assert_eq!(items[0]["file_count"], 2);
         assert_eq!(http.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn fresh_sort_date_keeps_only_recent_days() {
+        let days_ago = |offset: i64| {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64;
+            let (year, month, day) = civil(now - offset * 86_400_000).unwrap();
+            format!("{year:04}-{month:02}-{day:02}")
+        };
+        assert!(fresh_sort_date(&days_ago(0), 3));
+        assert!(fresh_sort_date(&days_ago(2), 3));
+        assert!(!fresh_sort_date(&days_ago(4), 3));
+        assert!(!fresh_sort_date("2026-09-27", 3));
+        // 没有日期的行（day='unknown'）不能进下载队列
+        assert!(!fresh_sort_date("", 3));
     }
 
     struct Tree;

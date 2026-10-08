@@ -647,8 +647,16 @@ pub async fn read_meta(db: &Db, url_or_token: &str, source_type: &str) -> Result
     Ok(json!({
         "document_id": document_id,
         "title": clip(document["title"].as_str().unwrap_or("飞书文档"), 200),
-        "revision_id": document["revision_id"].as_str().unwrap_or("-1"),
+        "revision_id": revision_text(&document["revision_id"]),
     }))
+}
+
+fn revision_text(value: &Value) -> String {
+    match value {
+        Value::String(text) if !text.trim().is_empty() => text.trim().to_string(),
+        Value::Number(number) => number.to_string(),
+        _ => "-1".to_string(),
+    }
 }
 
 fn fetch_blocks(document_id: &str, token: &str) -> Result<Vec<Value>, Fail> {
@@ -1765,6 +1773,13 @@ mod tests {
         assert!(valid_archive_key(&"ab".repeat(32)));
         assert!(!valid_archive_key(&"g".repeat(64)));
         assert!(!valid_archive_key(&"../".repeat(8)));
+    }
+
+    #[test]
+    fn numeric_document_revision_is_kept() {
+        assert_eq!(revision_text(&json!(128)), "128");
+        assert_eq!(revision_text(&json!("128")), "128");
+        assert_eq!(revision_text(&Value::Null), "-1");
     }
 
     #[test]

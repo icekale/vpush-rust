@@ -25,7 +25,7 @@ const SHELL = [
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.147a37ee9001.js",
   "/views/etf-premium.b096b76ff531.js",
-  "/views/watchlist.b702598a2459.js",
+  "/views/watchlist.91cdf29cd916.js",
   // asset-modules:end
   "/style.876c609de15d.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",

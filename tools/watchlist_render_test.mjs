@@ -89,7 +89,7 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   assert.doesNotMatch(html, /[\u{1F300}-\u{1FAFF}\u2600-\u27BF]/u);
   assert.match(html, /5,370\.30/);
   assert.match(html, /正常定投/);
-  assert.match(html, /data-watch-trend="temperature"[\s\S]*?<polyline/);
+  assert.match(html, /data-watch-trend="temperature"[\s\S]*?watch-a500-trend-line/);
   assert.match(html, /2026-09-25/);
   assert.match(html, /2026-09-27/);
   assert.match(html, /data-watch-trend="pe"/);
@@ -123,6 +123,24 @@ test("research tabs render full trends, ETF state, and grouped macro indicators"
   assert.doesNotMatch(noConfig, /0\.5%~3\.0%/);
   data.a500.temperature_history = [];
   assert.match(renderMarketTemperatureMarkup(data.a500), /暂无历史数据/);
+});
+
+test("trend charts use upstream scales, zones and reject missing values", () => {
+  const a500 = { available: true, temperature: 41, temperature_history: [{ date: "2026-09-25", temp: 30 }, { date: "2026-09-27", temp: 41 }, { date: "bad", temp: null }], pe_history: [{ date: "2026-09-25", pe: 16.31 }] };
+  const html = renderA500Panels({ available: true, a500, dividend: { temp_history: [{ d: "2026-09-25", t: 90 }], dividend_history: [{ d: "2026-09-25", v: 4.1 }, { d: "2026-09-27", v: 4.39 }] } });
+  assert.match(html, /100°C/);
+  assert.match(html, /aria-label="温度走势，2026-09-25 30\.00°，至 2026-09-27 41\.00°"/);
+  assert.match(html, /0°C/);
+  assert.match(html, /100分位/);
+  assert.match(html, /watch-a500-trend-zone-cold/);
+  assert.match(html, /watch-a500-trend-area/);
+  assert.match(html, /watch-a500-trend-line/);
+  assert.match(html, /d="M0\.00,77\.00 C[^\"]+ 500\.00,64\.90"/);
+  assert.match(html, /watch-a500-trend-point" cx="250" cy="11"/);
+  assert.match(html, /09-25/);
+  assert.match(html, /4\.4%/);
+  assert.doesNotMatch(html, /NaN|Infinity|bad/);
+  assert.match(renderMarketTemperatureMarkup({ ...a500, temperature_history: [{ temp: null }, { temp: "" }, { temp: "bad" }] }), /暂无历史数据/);
 });
 
 test("watchlist has four peer tabs, defaulting to the watchlist and keeping other panels hidden", () => {

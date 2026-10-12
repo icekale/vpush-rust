@@ -25,9 +25,9 @@ const SHELL = [
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.147a37ee9001.js",
   "/views/etf-premium.b096b76ff531.js",
-  "/views/watchlist.91cdf29cd916.js",
+  "/views/watchlist.d834e2e4bb37.js",
   // asset-modules:end
-  "/style.876c609de15d.css",
+  "/style.306c8d1de381.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",

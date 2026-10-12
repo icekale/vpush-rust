@@ -141,21 +141,47 @@ function normalizeA500Data(payload, now = new Date()) {
 }
 
 function trendMarkup(items, valueKey, dataName, label, suffix = "") {
-  const rows = (Array.isArray(items) ? items : []).map(row => ({
-    date: row?.d || row?.date || "--", value: Number(row?.[valueKey]),
-  })).filter(row => Number.isFinite(row.value));
+  const rows = (Array.isArray(items) ? items : []).filter(row => isNumber(row?.[valueKey])).map(row => ({
+    date: String(row.d || row.date || "--"), value: row[valueKey],
+  }));
   if (!rows.length) return `<p class="watch-a500-muted">暂无历史数据</p>`;
+  const temperature = dataName === "temperature" || dataName === "dividend-temperature";
   const values = rows.map(row => row.value);
-  const min = Math.min(...values);
-  const max = Math.max(...values);
-  const spread = max - min || 1;
-  const points = rows.map((row, index) => `${(index / Math.max(1, rows.length - 1) * 100).toFixed(2)},${(94 - (row.value - min) / spread * 82).toFixed(2)}`).join(" ");
-  const first = rows[0];
-  const last = rows.at(-1);
+  const low = Math.min(...values), high = Math.max(...values);
+  const range = high - low || Math.max(Math.abs(low) * .1, 1);
+  const roughStep = range / 4;
+  const power = 10 ** Math.floor(Math.log10(roughStep));
+  const step = [1, 2, 5, 10].find(n => n * power >= roughStep) * power;
+  const min = temperature ? 0 : Math.floor((low - range * .05) / step) * step;
+  const max = temperature ? 100 : Math.ceil((high + range * .05) / step) * step;
+  const y = value => Math.max(0, Math.min(110, (max - value) / (max - min) * 110));
+  const coordinates = rows.map((row, index) => [rows.length === 1 ? 250 : index / (rows.length - 1) * 500, y(row.value)]);
+  const point = ([x, y]) => `${x.toFixed(2)},${y.toFixed(2)}`;
+  // Smooth each segment without overshooting its endpoint values.
+  const curve = coordinates.map((p, i) => {
+    if (!i) return `M${point(p)}`;
+    const previous = coordinates[i - 1], dx = (p[0] - previous[0]) * .4;
+    return `C${point([previous[0] + dx, previous[1]])} ${point([p[0] - dx, p[1]])} ${point(p)}`;
+  }).join(" ");
+  const ticks = temperature ? [0, 20, 40, 60, 80, 100] : Array.from({ length: Math.round((max - min) / step) + 1 }, (_, i) => min + i * step);
+  const precision = Math.max(dataName === "dividend" ? 1 : 0, -Math.floor(Math.log10(step)));
+  const tickLabel = value => temperature ? `${value}${dataName === "temperature" ? "°C" : "分位"}` : `${value.toFixed(precision)}${suffix}`;
+  const zones = temperature ? [[0, 30, "cold"], [30, 60, "normal"], [60, 80, "hot"], [80, 100, "overheated"]].map(([from, to, name]) => `<rect class="watch-a500-trend-zone-${name}" x="0" y="${y(to)}" width="500" height="${y(from) - y(to)}"/>`).join("") : "";
+  const dateCount = Math.min(7, rows.length);
+  const dates = [...new Set(Array.from({ length: dateCount }, (_, i) => Math.round(i * (rows.length - 1) / Math.max(1, dateCount - 1))))];
+  const first = rows[0], last = rows.at(-1);
   return `<div class="watch-a500-trend" data-watch-trend="${escapeFallback(dataName)}">
-    <svg viewBox="0 0 100 100" preserveAspectRatio="none" role="img" aria-label="${escapeFallback(label)}，${escapeFallback(first.date)} 至 ${escapeFallback(last.date)}，${number(last.value)}${escapeFallback(suffix)}">
-      <path class="watch-a500-trend-grid" d="M0 12H100M0 53H100M0 94H100"></path><polyline points="${points}"></polyline>
-    </svg><div class="watch-a500-trend-meta"><span>${escapeFallback(first.date)} · ${number(first.value)}${escapeFallback(suffix)}</span><span>${escapeFallback(last.date)} · ${number(last.value)}${escapeFallback(suffix)}</span></div>
+    <div class="watch-a500-trend-chart" role="img" aria-label="${escapeFallback(label)}，${escapeFallback(first.date)} ${number(first.value)}${escapeFallback(suffix)}，至 ${escapeFallback(last.date)} ${number(last.value)}${escapeFallback(suffix)}">
+      <div class="watch-a500-trend-axis" aria-hidden="true">${ticks.map(value => `<span style="top:${y(value) / 110 * 100}%">${tickLabel(value)}</span>`).join("")}</div>
+      <svg viewBox="0 0 500 110" preserveAspectRatio="none" aria-hidden="true">${zones}
+        <path class="watch-a500-trend-grid" d="${ticks.map(value => `M0 ${y(value)}H500`).join(" ")}"/>
+        <path class="watch-a500-trend-area" d="${curve} L${coordinates.at(-1)[0]},110 L${coordinates[0][0]},110 Z"/>
+        <path class="watch-a500-trend-line" d="${curve}"/>
+        ${rows.length === 1 ? `<circle class="watch-a500-trend-point" cx="250" cy="${coordinates[0][1]}" r="2"/>` : ""}
+        ${rows.map((row, i) => `<circle class="watch-a500-trend-hit" cx="${coordinates[i][0]}" cy="${coordinates[i][1]}" r="4"><title>${escapeFallback(row.date)} · ${number(row.value)}${escapeFallback(suffix)}</title></circle>`).join("")}
+      </svg>
+      <div class="watch-a500-trend-dates" aria-hidden="true">${dates.map(i => `<span style="left:${rows.length === 1 ? 50 : i / (rows.length - 1) * 100}%">${escapeFallback(rows[i].date.slice(5))}</span>`).join("")}</div>
+    </div>
   </div>`;
 }
 

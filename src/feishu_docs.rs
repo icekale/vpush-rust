@@ -326,7 +326,7 @@ async fn latest_document_page(
                 "group_name": row.get::<String, _>("group_name"),
                 "day": row.get::<String, _>("day"),
                 "sort_date": row.get::<String, _>("sort_date"),
-                "abstract": row.get::<String, _>("abstract"),
+                "abstract": crate::ima_client::usable_abstract(&row.get::<String, _>("abstract")),
                 "downloaded_at": row.get::<String, _>("downloaded_at"),
             });
             if !pdf.is_empty() || !txt.is_empty() {
@@ -652,7 +652,7 @@ async fn document_page(
                 "group_name": row.get::<String, _>("group_name"),
                 "day": row.get::<String, _>("day"),
                 "sort_date": row.get::<String, _>("sort_date"),
-                "abstract": row.get::<String, _>("abstract"),
+                "abstract": crate::ima_client::usable_abstract(&row.get::<String, _>("abstract")),
                 "downloaded_at": row.get::<String, _>("downloaded_at"),
             });
             if has_pdf != 0 || has_txt != 0 {
@@ -695,9 +695,10 @@ pub async fn document_meta(
             .as_str()
             .filter(|text| !text.is_empty())
             .unwrap_or("文档");
-        let abstract_text = doc["abstract"].as_str().unwrap_or("");
+        let abstract_text =
+            crate::ima_client::usable_abstract(doc["abstract"].as_str().unwrap_or(""));
         let (abstract_zh, needs_translation) =
-            translation_fields(db, &gid, media_id, abstract_text).await?;
+            translation_fields(db, &gid, media_id, &abstract_text).await?;
         return Ok(json!({
             "media_id": doc["media_id"],
             "name": name,
@@ -1484,6 +1485,42 @@ mod tests {
             "不会用到".into()
         });
         assert!(kept.await.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn placeholder_abstracts_are_blank_and_skip_translation() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-ph-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.insert_ima_document("reports", "ph1", "Note", "2024-01-02", "", "")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ima_document_index SET abstract = ? WHERE media_id = 'ph1'")
+            .bind("AI摘要生成中")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let root = PathBuf::new();
+        let meta = document_meta(&db, 1, true, "ph1", "reports", &root)
+            .await
+            .unwrap();
+        assert_eq!(meta["abstract"], "");
+        assert_eq!(meta["needs_translation"], false);
+        let listed = list_documents(&db, 1, true, "reports", "", "", "", 50, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(listed["items"][0]["abstract"], "");
+        let searched = list_documents(&db, 1, true, "reports", "note", "", "", 50, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(searched["items"][0]["abstract"], "");
         let _ = std::fs::remove_file(&path);
     }
 

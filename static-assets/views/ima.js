@@ -377,6 +377,12 @@ export function createImaView(dependencies) {
       : "";
   }
 
+  const IMA_ABSTRACT_PLACEHOLDERS = new Set(["AI摘要生成中", "该内容暂未生成摘要"]);
+  function imaUsableAbstract(text) {
+    const value = String(text || "").trim();
+    return IMA_ABSTRACT_PLACEHOLDERS.has(value) ? "" : value;
+  }
+
   function imaDocumentRow(item) {
     const day = fmtImaDayShort(item.sort_date || item.day) || "—";
     const source = String(item.group_name || "");
@@ -387,11 +393,12 @@ export function createImaView(dependencies) {
     const thesis = item.extraction?.status === "ok" && !hasExtractionBadges
       ? item.extraction?.thesis
       : "";
+    const abstract = imaUsableAbstract(item.abstract);
     const snippet = item.search_snippet ? `<span class="ima-report-snippet">${escapeHtml(item.search_snippet)}</span>`
       : thesis
         ? `<span class="ima-report-snippet">${escapeHtml(thesis)}</span>`
-        : item.abstract
-          ? `<span class="ima-report-snippet">${escapeHtml(item.abstract)}</span>`
+        : abstract
+          ? `<span class="ima-report-snippet">${escapeHtml(abstract)}</span>`
           : "";
     return `
       <article class="ima-doc-row" role="button" tabindex="0" data-media-id="${escapeHtml(item.media_id)}" data-group-id="${escapeHtml(item.group_id || "")}" onclick="openImaDocument(this.dataset.mediaId, this.dataset.groupId)" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();openImaDocument(this.dataset.mediaId, this.dataset.groupId)}">
@@ -1426,7 +1433,7 @@ export function createImaView(dependencies) {
       const dayContext = !isFeishuTimeline && (item.sort_date || item.day)
         ? `<span class="ima-reader-day ima-reader-meta-item">${escapeHtml(fmtImaDay(item.sort_date || item.day))}</span>`
         : "";
-      const abstractText = isFeishuTimeline ? "" : (item.abstract_zh || item.abstract || "");
+      const abstractText = isFeishuTimeline ? "" : (imaUsableAbstract(item.abstract_zh) || imaUsableAbstract(item.abstract));
       const abstractLong = abstractText.length > IMA_ABSTRACT_CLAMP_CHARS;
       const abstractMore = abstractLong
         ? `<button type="button" class="ima-abstract-more" aria-expanded="false" onclick="toggleImaAbstract(this)">展开</button>`
@@ -1492,7 +1499,7 @@ export function createImaView(dependencies) {
         try {
           const translated = await api(`/api/ima-documents/${encodeURIComponent(mediaId)}/translate${groupQuery}`, { method: "POST" });
           if (!routeStillActive(seq) || readerSeq !== currentImaReaderSeq()) return;
-          const zh = translated && translated.abstract_zh;
+          const zh = imaUsableAbstract(translated && translated.abstract_zh);
           const el = $("#ima-reader-abstract");
           if (el && zh) el.textContent = zh;
         } catch {

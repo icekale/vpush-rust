@@ -143,14 +143,16 @@ test("trend charts use upstream scales, zones and reject missing values", () => 
   assert.match(renderMarketTemperatureMarkup({ ...a500, temperature_history: [{ temp: null }, { temp: "" }, { temp: "bad" }] }), /暂无历史数据/);
 });
 
-test("watchlist has four peer tabs, defaulting to the watchlist and keeping other panels hidden", () => {
+test("watchlist has four peer tabs, defaulting to market temperature and keeping other panels hidden", () => {
   const html = renderWatchlistMarkup({ loading: true });
   assert.deepEqual([...html.matchAll(/data-watch-tab="([^"]+)"/g)].map(match => match[1]), ["temperature", "dividend", "macro", "watchlist"]);
   assert.equal((html.match(/role="tabpanel"/g) || []).length, 4);
-  assert.match(html, /data-watch-panel="temperature" hidden/);
+  assert.match(html, /id="watch-tab-temperature"[^>]*aria-selected="true"[^>]*tabindex="0"/);
+  assert.doesNotMatch(html, /data-watch-panel="temperature" hidden/);
   assert.match(html, /data-watch-panel="dividend" hidden/);
   assert.match(html, /data-watch-panel="macro" hidden/);
-  assert.match(html, /aria-selected="true"[^>]*data-watch-tab="watchlist"/);
+  assert.match(html, /data-watch-panel="watchlist" hidden/);
+  assert.match(html, /aria-selected="false"[^>]*data-watch-tab="watchlist"/);
   assert.match(html, /data-watch-panel="watchlist"[^>]*>[\s\S]*data-watch-search-form[\s\S]*data-watch-list/);
   assert.doesNotMatch(html, /data-a500-tab=/);
 });

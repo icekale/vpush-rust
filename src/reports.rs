@@ -824,7 +824,7 @@ fn symbol_like(code: &str) -> bool {
         })
 }
 
-fn rating_zh(raw: &str) -> String {
+pub(crate) fn rating_zh(raw: &str) -> String {
     let key = raw.trim().to_lowercase().replace(['_', '-'], " ");
     let key = key.split_whitespace().collect::<Vec<_>>().join(" ");
     let mapped = match key.as_str() {

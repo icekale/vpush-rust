@@ -3,10 +3,10 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use base64::Engine;
+use futures_util::{stream, StreamExt, TryStreamExt};
 use rand::rngs::OsRng;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
-use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::{json, Value};
 use sha2::Sha256;
 use std::collections::HashSet;
@@ -198,15 +198,7 @@ pub async fn list_pdfs_deep(
     // seen 同时挡环形 parent，所以不需要深度上限
     while !level.is_empty() {
         let results = stream::iter(level.into_iter().map(|(id, day)| async move {
-            scan_folder(
-                http,
-                base,
-                session,
-                knowledge_base_id,
-                id,
-                day,
-            )
-            .await
+            scan_folder(http, base, session, knowledge_base_id, id, day).await
         }))
         .buffer_unordered(8)
         .try_collect::<Vec<_>>()
@@ -486,6 +478,29 @@ fn folder_text_str(text: &str) -> Option<String> {
     }
 }
 
+/// IMA 还没写出摘要时会塞状态文案。这些不是摘要。
+const ABSTRACT_PLACEHOLDERS: &[&str] = &["AI摘要生成中", "该内容暂未生成摘要"];
+
+pub fn usable_abstract(text: &str) -> String {
+    let text = text.trim();
+    if ABSTRACT_PLACEHOLDERS.contains(&text) {
+        String::new()
+    } else {
+        text.to_string()
+    }
+}
+
+/// 优先 abstract，占位或空则用 introduction。和旧 Python `item_text` 一样。
+fn item_text(item: &Value) -> String {
+    for key in ["abstract", "introduction"] {
+        let text = usable_abstract(item[key].as_str().unwrap_or(""));
+        if !text.is_empty() {
+            return text.chars().take(2000).collect();
+        }
+    }
+    String::new()
+}
+
 fn pdf_file(item: &Value) -> Option<File> {
     let media_id = item["media_id"]
         .as_str()
@@ -516,12 +531,7 @@ fn pdf_file(item: &Value) -> Option<File> {
         day,
         sort_date,
         size,
-        text: item["abstract"]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .take(2000)
-            .collect(),
+        text: item_text(item),
     })
 }
 
@@ -925,7 +935,65 @@ mod tests {
         // 0929 目录下的文档用目录名当日期，create_time 缺失也不再沉底
         let by_id = |wanted: &str| files.iter().find(|file| file.media_id == wanted).unwrap();
         assert_eq!(by_id("f-b").day, "0929");
-        assert!(by_id("f-b").sort_date.ends_with("-09-29"), "{}", by_id("f-b").sort_date);
+        assert!(
+            by_id("f-b").sort_date.ends_with("-09-29"),
+            "{}",
+            by_id("f-b").sort_date
+        );
         assert_eq!(by_id("f-a").day, "unknown");
+    }
+
+    #[test]
+    fn placeholder_abstracts_are_empty() {
+        assert_eq!(usable_abstract("AI摘要生成中"), "");
+        assert_eq!(usable_abstract("  该内容暂未生成摘要  "), "");
+        assert_eq!(usable_abstract(""), "");
+        assert_eq!(
+            usable_abstract("收入增长，公司上调全年指引"),
+            "收入增长，公司上调全年指引"
+        );
+        assert_eq!(
+            usable_abstract("AI摘要生成中的需求仍在"),
+            "AI摘要生成中的需求仍在"
+        );
+    }
+
+    #[test]
+    fn pdf_file_uses_introduction_when_abstract_is_a_placeholder() {
+        let pending = pdf_file(&json!({
+            "media_id": "m1",
+            "title": "报告.pdf",
+            "media_type": 1,
+            "abstract": "AI摘要生成中",
+            "introduction": " 公司上调指引 ",
+        }))
+        .unwrap();
+        assert_eq!(pending.text, "公司上调指引");
+
+        let missing = pdf_file(&json!({
+            "media_id": "m2",
+            "title": "另一份.pdf",
+            "abstract": "该内容暂未生成摘要",
+            "introduction": "AI摘要生成中",
+        }))
+        .unwrap();
+        assert_eq!(missing.text, "");
+
+        let real = pdf_file(&json!({
+            "media_id": "m3",
+            "title": "真实.pdf",
+            "abstract": "真实摘要",
+            "introduction": "引言不该盖过摘要",
+        }))
+        .unwrap();
+        assert_eq!(real.text, "真实摘要");
+
+        let intro_only = pdf_file(&json!({
+            "media_id": "m4",
+            "title": "只有引言.pdf",
+            "introduction": "引言正文",
+        }))
+        .unwrap();
+        assert_eq!(intro_only.text, "引言正文");
     }
 }

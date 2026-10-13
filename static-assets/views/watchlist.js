@@ -312,7 +312,7 @@ function renderA500Panels(data, transitionConfig = data?.transitionConfig || nul
   const temperature = available ? renderMarketTemperatureMarkup(safe.a500) : a500UnavailableMarkup(safe.reason);
   const dividend = available ? renderDividendPanel(safe) : a500UnavailableMarkup(safe.reason);
   const macro = available ? renderTransitionPanel(safe) : a500UnavailableMarkup(safe.reason);
-  return `<section class="section-panel watch-a500 watch-panel" id="watch-panel-temperature" role="tabpanel" aria-labelledby="watch-tab-temperature" data-watch-panel="temperature" hidden><div class="section-head"><h3 class="section-title">市场温度</h3><p class="section-meta">中国A500 · 指数与估值趋势</p></div><div data-a500-temperature>${temperature}</div></section>
+  return `<section class="section-panel watch-a500 watch-panel" id="watch-panel-temperature" role="tabpanel" aria-labelledby="watch-tab-temperature" data-watch-panel="temperature"><div class="section-head"><h3 class="section-title">市场温度</h3><p class="section-meta">中国A500 · 指数与估值趋势</p></div><div data-a500-temperature>${temperature}</div></section>
     <section class="section-panel watch-a500 watch-panel" id="watch-panel-dividend" role="tabpanel" aria-labelledby="watch-tab-dividend" data-watch-panel="dividend" hidden><div class="section-head"><h3 class="section-title">红利低波</h3><p class="section-meta">563020 · 股息、估值与趋势</p></div><div data-a500-dividend>${dividend}</div></section>
     <section class="section-panel watch-a500 watch-panel" id="watch-panel-macro" role="tabpanel" aria-labelledby="watch-tab-macro" data-watch-panel="macro" hidden><div class="section-head"><h3 class="section-title">宏观数据</h3><p class="section-meta">经济健康 · 四条主线</p></div><div data-a500-macro>${macro}</div></section>`;
 }
@@ -388,13 +388,13 @@ export function renderWatchlistMarkup({ items = [], loading = false, error = "",
   return `<div class="watchlist-page">
     <header class="watchlist-intro"><div><h2 class="section-title">自选股</h2><p class="section-meta">行情与市场研究</p></div></header>
     <div class="settings-tabs watch-workspace-tabs" role="tablist" aria-label="自选股板块">
-      <button type="button" class="settings-tab" role="tab" id="watch-tab-temperature" aria-selected="false" aria-controls="watch-panel-temperature" tabindex="-1" data-watch-tab="temperature">市场温度</button>
+      <button type="button" class="settings-tab active" role="tab" id="watch-tab-temperature" aria-selected="true" aria-controls="watch-panel-temperature" tabindex="0" data-watch-tab="temperature">市场温度</button>
       <button type="button" class="settings-tab" role="tab" id="watch-tab-dividend" aria-selected="false" aria-controls="watch-panel-dividend" tabindex="-1" data-watch-tab="dividend">红利低波</button>
       <button type="button" class="settings-tab" role="tab" id="watch-tab-macro" aria-selected="false" aria-controls="watch-panel-macro" tabindex="-1" data-watch-tab="macro">宏观数据</button>
-      <button type="button" class="settings-tab active" role="tab" id="watch-tab-watchlist" aria-selected="true" aria-controls="watch-panel-watchlist" data-watch-tab="watchlist">自选股</button>
+      <button type="button" class="settings-tab" role="tab" id="watch-tab-watchlist" aria-selected="false" aria-controls="watch-panel-watchlist" tabindex="-1" data-watch-tab="watchlist">自选股</button>
     </div>
     <div data-watch-a500-content>${renderA500Panels(a500Data || (marketTemperature ? { available: marketTemperature.available, a500: marketTemperature } : null))}</div>
-    <section class="watch-panel" id="watch-panel-watchlist" role="tabpanel" aria-labelledby="watch-tab-watchlist" data-watch-panel="watchlist">
+    <section class="watch-panel" id="watch-panel-watchlist" role="tabpanel" aria-labelledby="watch-tab-watchlist" data-watch-panel="watchlist" hidden>
     <div class="watchlist-intro-actions"><span class="watch-fetch-time" data-watch-fetched>上次获取时间：--</span><a class="watch-settings-link" href="/settings" data-spa-link>推送设置</a></div>
     <section class="section-panel watch-search-panel" aria-labelledby="watch-search-title">
       <div class="section-head"><h3 class="section-title" id="watch-search-title">添加标的</h3><p class="section-meta">按市场搜索代码或名称，搜索结果来自可用数据源。</p></div>

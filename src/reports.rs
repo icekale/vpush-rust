@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use sha2::{Digest, Sha256};
 use sqlx::Row;
 
@@ -5,9 +7,118 @@ use crate::db::Db;
 
 pub(crate) const EXTRACT_PROMPT: &str = "从研报文本抽取结构化信息，只输出一个 JSON 对象，字段 rating、target_price、thesis、report_kind、tickers。tickers 每项含 code、name、stance，最多 8 个。不确定就留空。";
 const DIGEST_PROMPT: &str = "把同一标的的研报要点汇编成中文综述，只输出一个 JSON 对象，字段 consensus、evolution、divergence。evolution 是 {date, point} 数组。没有的信息留空，不要编造。";
+const PDF_MAX_PAGES: usize = 4;
+const PDF_MAX_CHARS: usize = 12000;
 
-pub async fn read_text(path: String) -> Option<String> {
-    tokio::fs::read_to_string(path).await.ok()
+/// Production reader for `extract_due`: relative archive paths only, txt as text and pdf via
+/// `pdf_first_pages_text`. `None` means the path was rejected or the file could not be read.
+pub async fn read_report_text(path: String) -> Option<String> {
+    let root = match crate::ima_admin::archive_root() {
+        Ok(root) => root,
+        Err(_) => {
+            warn_missing_archive();
+            return None;
+        }
+    };
+    read_report_file(&root, &path).await
+}
+
+fn warn_missing_archive() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| tracing::warn!("研报抽取无法读取归档根目录"));
+}
+
+async fn read_report_file(root: &Path, relative: &str) -> Option<String> {
+    let resolved = resolve_report_path(root, relative)?;
+    let bytes = tokio::fs::read(&resolved).await.ok()?;
+    if !is_pdf(&resolved, &bytes) {
+        return Some(String::from_utf8_lossy(&bytes).into_owned());
+    }
+    let label = Path::new(relative)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("report.pdf")
+        .to_string();
+    let text = tokio::task::spawn_blocking(move || pdf_first_pages_text(&bytes, &label))
+        .await
+        .unwrap_or_default();
+    Some(text)
+}
+
+/// Join `relative` onto the archive root. Absolute paths, NUL, and `..` never resolve.
+fn resolve_report_path(root: &Path, relative: &str) -> Option<PathBuf> {
+    if relative.is_empty() || relative.contains('\0') {
+        return None;
+    }
+    let path = crate::ima_storage::safe_child(root, relative).ok()?;
+    path.starts_with(root).then_some(path)
+}
+
+fn is_pdf(path: &Path, bytes: &[u8]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("pdf"))
+        || bytes.starts_with(b"%PDF")
+}
+
+/// First pages of a report PDF, whitespace collapsed, capped like Python `pdf_first_pages_text`.
+/// Parse failure returns an empty string so the caller can record `notext` instead of retrying.
+fn pdf_first_pages_text(bytes: &[u8], label: &str) -> String {
+    // pdf-extract panics on some broken catalogs. A panic would kill the hourly maintenance task.
+    let extracted =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extract_pdf_pages(bytes)));
+    match extracted {
+        Ok(Ok(text)) => text,
+        Ok(Err(err)) => {
+            tracing::warn!(file = label, "PDF 文本抽取失败: {err}");
+            String::new()
+        }
+        Err(_) => {
+            tracing::warn!(file = label, "PDF 文本抽取失败");
+            String::new()
+        }
+    }
+}
+
+fn extract_pdf_pages(bytes: &[u8]) -> Result<String, String> {
+    let mut doc = pdf_extract::Document::load_mem(bytes).map_err(|err| err.to_string())?;
+    if doc.is_encrypted() && doc.decrypt("").is_err() {
+        return Err("加密 PDF".into());
+    }
+    let mut pages = Vec::new();
+    for page_num in doc.get_pages().keys().copied().take(PDF_MAX_PAGES) {
+        let mut page = String::new();
+        {
+            let mut output = pdf_extract::PlainTextOutput::new(&mut page);
+            pdf_extract::output_doc_page(&doc, &mut output, page_num)
+                .map_err(|err| err.to_string())?;
+        }
+        pages.push(collapse(&page));
+    }
+    Ok(clip(&pages.join(" "), PDF_MAX_CHARS))
+}
+
+/// Collapse whitespace. Drop a short broken-font mapping: at most 200 chars dominated by
+/// ASCII alphanumeric tokens of length 18 or more, matching Python `usable_report_text`.
+/// Real text, including unspaced Chinese, is kept.
+fn usable_report_text(text: &str) -> String {
+    let normalized = collapse(text);
+    if normalized.is_empty() {
+        return String::new();
+    }
+    let total = normalized.chars().count();
+    let long_alnum: usize = normalized
+        .split(' ')
+        .filter(|word| {
+            let len = word.chars().count();
+            len >= 18 && word.chars().all(|ch| ch.is_ascii_alphanumeric())
+        })
+        .map(|word| word.chars().count())
+        .sum();
+    if total <= 200 && long_alnum > 0 && long_alnum * 2 >= total {
+        return String::new();
+    }
+    normalized
 }
 
 pub async fn extract_due<R, RF, A, AF>(
@@ -106,7 +217,6 @@ where
         .await?
         .unwrap_or_default();
     let mut completed = 0;
-    let mut unresolved = 0;
     for doc in &docs {
         if std::time::Instant::now() >= deadline {
             break;
@@ -124,38 +234,36 @@ where
                 text = body;
             }
         }
-        if text.trim().is_empty() && !pdf_path.is_empty() {
+        // txt wins only when it yields usable text; an empty or broken txt falls through to the pdf.
+        if usable_report_text(&text).is_empty() && !pdf_path.is_empty() {
             if let Some(body) = read(pdf_path).await {
                 opened = true;
                 text = body;
             }
         }
-        let usable = collapse(&text);
+        let usable = usable_report_text(&text);
         if usable.is_empty() {
-            if !opened
-                && (!doc.get::<String, _>("txt_path").is_empty()
-                    || !doc.get::<String, _>("pdf_path").is_empty())
-            {
-                unresolved += 1;
-                continue;
+            let status = if opened { "notext" } else { "nofile" };
+            if opened {
+                tracing::warn!(%group_id, %media_id, "研报无可用文本，记为 notext");
+            } else {
+                tracing::warn!(%group_id, %media_id, "研报文件缺失或不可读，记为 nofile");
             }
-            if name.trim().is_empty() {
-                save_extraction(
-                    db,
-                    &group_id,
-                    &media_id,
-                    "",
-                    "",
-                    "",
-                    "",
-                    "",
-                    &[],
-                    &model,
-                    "notext",
-                )
-                .await?;
-                continue;
-            }
+            save_extraction(
+                db,
+                &group_id,
+                &media_id,
+                "",
+                "",
+                "",
+                "",
+                "",
+                &[],
+                &model,
+                status,
+            )
+            .await?;
+            continue;
         }
         let hashed = hash16(&usable);
         if usable.chars().count() < 200 && name.trim().is_empty() {
@@ -231,9 +339,6 @@ where
                 .await?;
             }
         }
-    }
-    if unresolved == docs.len() {
-        return Ok(0);
     }
     if completed > 0 {
         db.set_setting(&done_key, &(done_today + completed as i64).to_string())
@@ -869,7 +974,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_file_retries_and_llm_failure_is_kept() {
+    async fn missing_file_is_recorded_and_llm_failure_is_kept() {
         let path = temp_db();
         let db = Db::open(&path).await.unwrap();
         db.set_setting("report_extract_interval_seconds", "1")
@@ -879,23 +984,28 @@ mod tests {
             .await
             .unwrap();
         doc(&db, "a", "miss", "2026-08-02", "缺", "miss.txt").await;
+        let mut asks = 0;
         let skipped = extract_due(
             &db,
             20,
             later(),
             |_| async { None },
-            |_, _| async { Ok("{}".into()) },
+            |_, _| {
+                asks += 1;
+                async { Ok("{}".into()) }
+            },
         )
         .await
         .unwrap();
         assert_eq!(skipped, 0);
-        assert_eq!(
-            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM report_extractions")
+        assert_eq!(asks, 0);
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM report_extractions WHERE media_id = 'miss'")
                 .fetch_one(db.pool())
                 .await
-                .unwrap(),
-            0
-        );
+                .unwrap();
+        assert_eq!(status, "nofile");
+        doc(&db, "a", "llm", "2026-08-02", "模型失败", "llm.txt").await;
         let failed = extract_due(
             &db,
             22,
@@ -907,7 +1017,7 @@ mod tests {
         .unwrap();
         assert_eq!(failed, 0);
         let status: String =
-            sqlx::query_scalar("SELECT status FROM report_extractions WHERE media_id = 'miss'")
+            sqlx::query_scalar("SELECT status FROM report_extractions WHERE media_id = 'llm'")
                 .fetch_one(db.pool())
                 .await
                 .unwrap();
@@ -1022,5 +1132,389 @@ mod tests {
         .unwrap();
         assert_eq!(marked, 0);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_report_path_joins_relative_and_rejects_escapes() {
+        let root = std::env::temp_dir().join(format!(
+            "vpush-report-paths-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("1012")).unwrap();
+        let resolved = resolve_report_path(&root, "1012/foo.pdf").unwrap();
+        assert_eq!(resolved, root.join("1012/foo.pdf"));
+        assert_eq!(
+            resolve_report_path(&root, "./1012/foo.pdf").unwrap(),
+            root.join("1012/foo.pdf")
+        );
+        assert!(resolve_report_path(&root, "/etc/passwd").is_none());
+        assert!(resolve_report_path(&root, "../outside.txt").is_none());
+        assert!(resolve_report_path(&root, "1012/../../outside.txt").is_none());
+        assert!(resolve_report_path(&root, "").is_none());
+        assert!(resolve_report_path(&root, "1012/foo.pdf\0").is_none());
+        std::os::unix::fs::symlink("/etc/passwd", root.join("link.pdf")).unwrap();
+        assert!(resolve_report_path(&root, "link.pdf").is_none());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn usable_report_text_rejects_short_garbled_mapping() {
+        assert_eq!(
+            usable_report_text("4FOEZFp5oUeWcW9PbPbR QoOnPtNlOmMyRkPrRwOaQrQqQvP"),
+            ""
+        );
+        assert_eq!(
+            usable_report_text("  Buy   rating and target price 250 dollars. "),
+            "Buy rating and target price 250 dollars."
+        );
+        assert_eq!(usable_report_text(" \n\t "), "");
+        assert!(usable_report_text(&format!("正文 {}", "甲".repeat(180))).contains("正文"));
+    }
+
+    #[test]
+    fn pdf_first_pages_text_reads_fixture_and_caps_length() {
+        let fixture = include_bytes!("fixtures/report-first-pages.pdf");
+        let text = pdf_first_pages_text(fixture, "report-first-pages.pdf");
+        assert!(text.contains("NVIDIA target price 250 dollars"));
+        assert!(text.contains("PAGEFOURINCLUDED"));
+        assert!(!text.contains("PAGEFIVEUNIQUE"));
+        assert!(text.chars().count() <= PDF_MAX_CHARS);
+
+        let long = "abcd ".repeat(3000);
+        let generated = pdf_with_pages(&[&long]);
+        let extracted = pdf_first_pages_text(&generated, "long.pdf");
+        assert!(extracted.starts_with("abcd"));
+        assert_eq!(extracted.chars().count(), PDF_MAX_CHARS);
+    }
+
+    fn pdf_with_pages(pages: &[&str]) -> Vec<u8> {
+        fn obj(n: usize, body: &[u8]) -> Vec<u8> {
+            let mut out = format!("{n} 0 obj\n").into_bytes();
+            out.extend_from_slice(body);
+            out.extend_from_slice(b"\nendobj\n");
+            out
+        }
+        let mut kids = Vec::new();
+        let mut bodies = Vec::new();
+        let mut next = 4usize;
+        for text in pages {
+            assert!(text
+                .bytes()
+                .all(|byte| byte != b'(' && byte != b')' && byte != b'\\'));
+            let content = format!("BT /F1 12 Tf 72 720 Td ({text}) Tj ET").into_bytes();
+            let content_num = next;
+            let page_num = next + 1;
+            next += 2;
+            kids.push(page_num);
+            let mut content_body =
+                format!("<< /Length {} >>\nstream\n", content.len()).into_bytes();
+            content_body.extend_from_slice(&content);
+            content_body.extend_from_slice(b"\nendstream");
+            bodies.push(obj(content_num, &content_body));
+            let page_body = format!(
+                "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents {content_num} 0 R /Resources << /Font << /F1 3 0 R >> >> >>"
+            );
+            bodies.push(obj(page_num, page_body.as_bytes()));
+        }
+        let kids_refs = kids
+            .iter()
+            .map(|n| format!("{n} 0 R"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut objects = vec![
+            obj(1, b"<< /Type /Catalog /Pages 2 0 R >>"),
+            obj(
+                2,
+                format!(
+                    "<< /Type /Pages /Count {} /Kids [{kids_refs}] >>",
+                    pages.len()
+                )
+                .as_bytes(),
+            ),
+            obj(3, b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>"),
+        ];
+        objects.extend(bodies);
+        let mut out = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n".to_vec();
+        let mut offsets = vec![0_u64];
+        for object in &objects {
+            offsets.push(out.len() as u64);
+            out.extend_from_slice(object);
+        }
+        let xref_at = out.len();
+        let size = objects.len() + 1;
+        out.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        out.extend_from_slice(b"0000000000 65535 f \n");
+        for offset in offsets.iter().skip(1) {
+            out.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+        }
+        out.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_at}\n%%EOF\n")
+                .as_bytes(),
+        );
+        out
+    }
+
+    async fn indexed(
+        db: &Db,
+        group: &str,
+        media: &str,
+        day: &str,
+        name: &str,
+        txt: &str,
+        pdf: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO ima_document_index (group_id, media_id, sort_date, name, txt_path, pdf_path) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(group)
+        .bind(media)
+        .bind(day)
+        .bind(name)
+        .bind(txt)
+        .bind(pdf)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+
+    fn temp_archive() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "vpush-report-archive-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("1012")).unwrap();
+        root
+    }
+
+    #[tokio::test]
+    async fn extract_due_reads_relative_archive_text() {
+        let path = temp_db();
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("report_extract_interval_seconds", "1")
+            .await
+            .unwrap();
+        db.set_setting("report_extract_backfill_days", "0")
+            .await
+            .unwrap();
+        let root = temp_archive();
+        let pdf = include_bytes!("fixtures/report-first-pages.pdf");
+        std::fs::write(root.join("1012/nvda.pdf"), pdf).unwrap();
+        std::fs::write(
+            root.join("1012/note.txt"),
+            format!("正文 {}", "甲".repeat(220)),
+        )
+        .unwrap();
+        std::fs::write(root.join("1012/blank.txt"), " \n\t ").unwrap();
+        indexed(
+            &db,
+            "reports",
+            "both",
+            "2026-08-03",
+            "优先文本",
+            "1012/note.txt",
+            "1012/nvda.pdf",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "pdf",
+            "2026-08-02",
+            "只有PDF",
+            "",
+            "1012/nvda.pdf",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "fallback",
+            "2026-08-01",
+            "空文本回退",
+            "1012/blank.txt",
+            "1012/nvda.pdf",
+        )
+        .await;
+        let archive = root.clone();
+        let mut seen = Vec::new();
+        let done = extract_due(
+            &db,
+            30,
+            later(),
+            move |relative| {
+                let archive = archive.clone();
+                async move { read_report_file(&archive, &relative).await }
+            },
+            |title, text| {
+                seen.push((title, text));
+                async { Ok(r#"{"rating":"Buy","target_price":"250","thesis":"逻辑","report_kind":"公司","tickers":[]}"#.into()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(done, 3);
+        let txt = seen.iter().find(|(title, _)| title == "优先文本").unwrap();
+        assert!(txt.1.contains("正文"));
+        assert!(!txt.1.contains("NVIDIA"));
+        let pdf_only = seen.iter().find(|(title, _)| title == "只有PDF").unwrap();
+        assert!(pdf_only.1.contains("NVIDIA target price 250 dollars"));
+        assert!(pdf_only.1.contains("PAGEFOURINCLUDED"));
+        assert!(!pdf_only.1.contains("PAGEFIVEUNIQUE"));
+        let fallback = seen
+            .iter()
+            .find(|(title, _)| title == "空文本回退")
+            .unwrap();
+        assert!(fallback.1.contains("NVIDIA target price 250 dollars"));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn extract_due_records_nofile_and_notext_without_asking() {
+        let path = temp_db();
+        let db = Db::open(&path).await.unwrap();
+        db.set_setting("report_extract_interval_seconds", "1")
+            .await
+            .unwrap();
+        db.set_setting("report_extract_backfill_days", "0")
+            .await
+            .unwrap();
+        let root = temp_archive();
+        std::fs::write(root.join("1012/empty.txt"), " \n\t ").unwrap();
+        std::fs::write(
+            root.join("1012/garbage.txt"),
+            "4FOEZFp5oUeWcW9PbPbR QoOnPtNlOmMyRkPrRwOaQrQqQvP",
+        )
+        .unwrap();
+        std::fs::write(root.join("1012/broken.pdf"), b"not a pdf").unwrap();
+        let outside = root.parent().unwrap().join(format!(
+            "vpush-report-outside-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&outside, format!("SHOULD_NOT_LEAK {}", "甲".repeat(80))).unwrap();
+        indexed(
+            &db,
+            "reports",
+            "miss",
+            "2026-08-06",
+            "缺文件",
+            "",
+            "1012/missing.pdf",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "empty",
+            "2026-08-05",
+            "空文件",
+            "1012/empty.txt",
+            "",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "garbage",
+            "2026-08-04",
+            "乱码",
+            "1012/garbage.txt",
+            "",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "broken",
+            "2026-08-03",
+            "坏PDF",
+            "",
+            "1012/broken.pdf",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "absolute",
+            "2026-08-02",
+            "绝对路径",
+            outside.to_str().unwrap(),
+            "",
+        )
+        .await;
+        indexed(
+            &db,
+            "reports",
+            "escape",
+            "2026-08-01",
+            "越界",
+            "../outside.txt",
+            "",
+        )
+        .await;
+        let archive = root.clone();
+        let mut asks = 0;
+        let done = extract_due(
+            &db,
+            40,
+            later(),
+            move |relative| {
+                let archive = archive.clone();
+                async move { read_report_file(&archive, &relative).await }
+            },
+            |_, _| {
+                asks += 1;
+                async { Ok(r#"{"rating":"Buy","thesis":"不应调用"}"#.into()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(done, 0);
+        assert_eq!(asks, 0);
+        for (media, status) in [
+            ("miss", "nofile"),
+            ("empty", "notext"),
+            ("garbage", "notext"),
+            ("broken", "notext"),
+            ("absolute", "nofile"),
+            ("escape", "nofile"),
+        ] {
+            let saved: String =
+                sqlx::query_scalar("SELECT status FROM report_extractions WHERE media_id = ?")
+                    .bind(media)
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            assert_eq!(saved, status, "{media}");
+        }
+        let mut retries = 0;
+        let again = extract_due(
+            &db,
+            42,
+            later(),
+            |_| async { Some("甲".repeat(220)) },
+            |_, _| {
+                retries += 1;
+                async { Ok("{}".into()) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(again, 0);
+        assert_eq!(retries, 0);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

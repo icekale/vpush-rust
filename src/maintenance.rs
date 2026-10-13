@@ -352,7 +352,7 @@ async fn llm_batches(db: &Db) {
             db,
             unix_now(),
             deadline,
-            crate::reports::read_text,
+            crate::reports::read_report_text,
             |title, text| {
                 let cfg = extract_cfg.clone();
                 async move {

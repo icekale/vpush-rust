@@ -37,3 +37,4 @@ wreq-util = "0.1.0"
 zhconv = { version = "0.3", default-features = false, features = ["compress", "opencc"] }
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+pdf-extract = "0.12.1"

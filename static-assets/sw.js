@@ -19,7 +19,7 @@ const SHELL = [
   "/views/admin/news.269a9edcf5f0.js",
   "/views/admin/users.171b6837216e.js",
   "/views/feishu-personal.d74ec140be8a.js",
-  "/views/ima.9c16966acb16.js",
+  "/views/ima.b966b5e3284e.js",
   "/views/market.4e2ffc62abf0.js",
   "/views/news.bfd291dc84d6.js",
   "/views/post-card-export.27dbd2f5c5fa.js",
@@ -27,7 +27,7 @@ const SHELL = [
   "/views/etf-premium.b096b76ff531.js",
   "/views/watchlist.6bcf8b0152e5.js",
   // asset-modules:end
-  "/style.306c8d1de381.css",
+  "/style.0fb7291126ad.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",

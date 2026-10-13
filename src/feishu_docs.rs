@@ -236,7 +236,10 @@ pub async fn list_documents(
             latest_document_page(db, user_id, is_admin, group, page_limit, start).await?
         };
         let has_more = page.len() as i64 > page_limit;
-        let page: Vec<_> = page.into_iter().take(page_limit as usize).collect();
+        let mut page: Vec<_> = page.into_iter().take(page_limit as usize).collect();
+        db.attach_report_extractions(&mut page)
+            .await
+            .map_err(|_| "读取文档失败")?;
         let (total, days) = if facets_only {
             (
                 latest_document_count(db, user_id, is_admin, group).await?,
@@ -263,7 +266,7 @@ pub async fn list_documents(
     }
     let total = document_count(db, user_id, is_admin, group, day, &needle).await?;
     let days = document_days(db, user_id, is_admin, group, day, &needle).await?;
-    let page = if facets_only || start >= total {
+    let mut page = if facets_only || start >= total {
         Vec::new()
     } else {
         document_page(
@@ -271,6 +274,9 @@ pub async fn list_documents(
         )
         .await?
     };
+    db.attach_report_extractions(&mut page)
+        .await
+        .map_err(|_| "读取文档失败")?;
     Ok(json!({
         "groups": [],
         "items": page,
@@ -699,7 +705,7 @@ pub async fn document_meta(
             crate::ima_client::usable_abstract(doc["abstract"].as_str().unwrap_or(""));
         let (abstract_zh, needs_translation) =
             translation_fields(db, &gid, media_id, &abstract_text).await?;
-        return Ok(json!({
+        let mut document = json!({
             "media_id": doc["media_id"],
             "name": name,
             "day": doc["day"],
@@ -718,7 +724,11 @@ pub async fn document_meta(
             "type": if feishu.is_some() { "feishu_timeline" } else { "document" },
             "source_url": feishu.as_ref().and_then(|row| row["canonical_url"].as_str()).unwrap_or(""),
             "feishu_display": if feishu.is_some() { "timeline" } else { "" },
-        }));
+        });
+        db.attach_report_extractions(std::slice::from_mut(&mut document))
+            .await
+            .map_err(|_| "读取文档失败")?;
+        return Ok(document);
     }
     let Some(row) = db
         .feishu_document(media_id, group)
@@ -1552,5 +1562,126 @@ mod tests {
         assert!(facets["items"].as_array().unwrap().is_empty());
         assert_eq!(facets["document_count"], 3);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn reader_detail_and_lists_attach_report_extraction() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-extract-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.insert_ima_document("reports", "qincheng", "高盛-勤诚", "2026-09-07", "", "")
+            .await
+            .unwrap();
+        db.insert_ima_document("reports", "hold", "维持评级", "2026-09-06", "", "")
+            .await
+            .unwrap();
+        db.insert_ima_document("reports", "bare", "没有抽取", "2026-09-05", "", "")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ima_document_index SET abstract = ? WHERE media_id = ?")
+            .bind("AI摘要生成中")
+            .bind("qincheng")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ima_document_index SET abstract = ? WHERE media_id = ?")
+            .bind("这是真实摘要")
+            .bind("hold")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO report_extractions (group_id, media_id, rating, target_price, thesis, model, status) \
+             VALUES ('reports', 'qincheng', 'Overweight', '25.00元', 'AI 算力驱动需求高增。', 'gemini-test', 'ok')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO report_extraction_tickers (group_id, media_id, code, name, stance) \
+             VALUES ('reports', 'qincheng', '002428', '云南锗业', '推荐')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO report_extractions (group_id, media_id, rating, thesis, status) \
+             VALUES ('reports', 'hold', '维持', '维持原判断。', 'ok')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let root = PathBuf::new();
+        let meta = document_meta(&db, 1, true, "qincheng", "reports", &root)
+            .await
+            .unwrap();
+        assert_eq!(meta["abstract"], "");
+        assert_eq!(meta["needs_translation"], false);
+        assert_eq!(meta["type"], "document");
+        assert_eq!(meta["extraction"]["status"], "ok");
+        assert_eq!(meta["extraction"]["rating"], "增持");
+        assert_eq!(meta["extraction"]["target_price"], "25.00元");
+        assert_eq!(meta["extraction"]["thesis"], "AI 算力驱动需求高增。");
+        assert_eq!(meta["extraction"]["model"], "gemini-test");
+        assert_eq!(meta["extraction"]["tickers"][0]["code"], "002428");
+        assert_eq!(meta["extraction"]["tickers"][0]["name"], "云南锗业");
+        assert_eq!(meta["extraction"]["tickers"][0]["stance"], "推荐");
+        let held = document_meta(&db, 1, true, "hold", "reports", &root)
+            .await
+            .unwrap();
+        assert_eq!(held["abstract"], "这是真实摘要");
+        assert_eq!(held["extraction"]["rating"], "维持");
+        assert_eq!(held["extraction"]["thesis"], "维持原判断。");
+        assert!(held["extraction"]["tickers"].as_array().unwrap().is_empty());
+        let bare = document_meta(&db, 1, true, "bare", "reports", &root)
+            .await
+            .unwrap();
+        assert!(bare.get("extraction").is_none());
+
+        let listed = list_documents(&db, 1, true, "reports", "", "", "", 50, 0, false)
+            .await
+            .unwrap();
+        let items = listed["items"].as_array().unwrap();
+        let qincheng = items
+            .iter()
+            .find(|item| item["media_id"] == "qincheng")
+            .unwrap();
+        assert_eq!(qincheng["abstract"], "");
+        assert_eq!(qincheng["extraction"]["rating"], "增持");
+        assert_eq!(qincheng["extraction"]["tickers"][0]["code"], "002428");
+        let untouched = items
+            .iter()
+            .find(|item| item["media_id"] == "bare")
+            .unwrap();
+        assert!(untouched.get("extraction").is_none());
+        let searched = list_documents(&db, 1, true, "reports", "勤诚", "", "", 50, 0, false)
+            .await
+            .unwrap();
+        assert_eq!(searched["items"][0]["media_id"], "qincheng");
+        assert_eq!(searched["items"][0]["abstract"], "");
+        assert_eq!(searched["items"][0]["extraction"]["status"], "ok");
+        assert_eq!(searched["items"][0]["extraction"]["rating"], "增持");
+
+        db.insert_feishu_source(
+            "feishu-open",
+            "timeline",
+            "时间线",
+            "docs/timeline.json",
+            "",
+        )
+        .await
+        .unwrap();
+        let timeline = document_meta(&db, 1, true, "timeline", "feishu-open", &root)
+            .await
+            .unwrap();
+        assert_eq!(timeline["type"], "feishu_timeline");
+        assert!(timeline.get("extraction").is_none());
+        let _ = std::fs::remove_file(&path);
     }
 }

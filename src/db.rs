@@ -1100,6 +1100,115 @@ impl Db {
         Ok(rows.iter().map(ima_index_row).collect())
     }
 
+    /// 按 (group_id, media_id) 批量读取抽取结果和标的。没有行的键不出现。
+    pub async fn report_extractions_for_keys(
+        &self,
+        keys: &[(String, String)],
+    ) -> Result<HashMap<(String, String), Value>, sqlx::Error> {
+        let mut clean = Vec::new();
+        let mut seen = HashSet::new();
+        for (group_id, media_id) in keys {
+            if group_id.is_empty() || media_id.is_empty() {
+                continue;
+            }
+            let pair = (group_id.clone(), media_id.clone());
+            if seen.insert(pair.clone()) {
+                clean.push(pair);
+            }
+        }
+        let mut out = HashMap::new();
+        for part in clean.chunks(200) {
+            let conds = std::iter::repeat_n("(group_id = ? AND media_id = ?)", part.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT group_id, media_id, rating, target_price, thesis, status, model \
+                 FROM report_extractions WHERE {conds}"
+            );
+            let mut query = sqlx::query(&sql);
+            for (group_id, media_id) in part {
+                query = query.bind(group_id).bind(media_id);
+            }
+            let rows = query.fetch_all(&self.pool).await?;
+            if rows.is_empty() {
+                continue;
+            }
+            let ticker_sql = format!(
+                "SELECT group_id, media_id, code, name, stance \
+                 FROM report_extraction_tickers WHERE {conds}"
+            );
+            let mut ticker_query = sqlx::query(&ticker_sql);
+            for (group_id, media_id) in part {
+                ticker_query = ticker_query.bind(group_id).bind(media_id);
+            }
+            let ticker_rows = ticker_query.fetch_all(&self.pool).await?;
+            let mut tickmap: HashMap<(String, String), Vec<Value>> = HashMap::new();
+            for row in &ticker_rows {
+                let key = (
+                    row.get::<String, _>("group_id"),
+                    row.get::<String, _>("media_id"),
+                );
+                tickmap.entry(key).or_default().push(json!({
+                    "code": row.get::<String, _>("code"),
+                    "name": row.get::<String, _>("name"),
+                    "stance": row.get::<String, _>("stance"),
+                }));
+            }
+            for row in &rows {
+                let key = (
+                    row.get::<String, _>("group_id"),
+                    row.get::<String, _>("media_id"),
+                );
+                let ticker_list = tickmap.remove(&key).unwrap_or_default();
+                out.insert(
+                    key,
+                    json!({
+                        "status": row.get::<String, _>("status"),
+                        "rating": row.get::<String, _>("rating"),
+                        "target_price": row.get::<String, _>("target_price"),
+                        "thesis": row.get::<String, _>("thesis"),
+                        "model": row.get::<String, _>("model"),
+                        "tickers": ticker_list,
+                    }),
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// 给文档项挂上 extraction。没有抽取行的不写这个字段。评级在这里换成中文。
+    pub async fn attach_report_extractions(&self, items: &mut [Value]) -> Result<(), sqlx::Error> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        let keys = items
+            .iter()
+            .map(|item| {
+                (
+                    item["group_id"].as_str().unwrap_or("").to_string(),
+                    item["media_id"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let found = self.report_extractions_for_keys(&keys).await?;
+        if found.is_empty() {
+            return Ok(());
+        }
+        for item in items {
+            let key = (
+                item["group_id"].as_str().unwrap_or("").to_string(),
+                item["media_id"].as_str().unwrap_or("").to_string(),
+            );
+            let Some(mut extra) = found.get(&key).cloned() else {
+                continue;
+            };
+            let rating = extra["rating"].as_str().unwrap_or("");
+            extra["rating"] = json!(crate::reports::rating_zh(rating));
+            item["extraction"] = extra;
+        }
+        Ok(())
+    }
+
     pub async fn ima_ticker_page(
         &self,
         raw_code: &str,

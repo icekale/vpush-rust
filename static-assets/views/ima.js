@@ -362,6 +362,19 @@ export function createImaView(dependencies) {
     return parts.join("");
   }
 
+  function imaReaderExtractionHtml(item) {
+    const ex = item?.extraction;
+    if (!ex || ex.status !== "ok") return "";
+    const thesis = String(ex.thesis || "").trim();
+    const tickers = Array.isArray(ex.tickers) ? ex.tickers : [];
+    const hasTicker = tickers.some((ticker) => ticker && (ticker.code || ticker.name));
+    if (!thesis && !ex.rating && !ex.target_price && !hasTicker) return "";
+    const badges = imaExtractionBadgesHtml(item);
+    const thesisHtml = thesis ? `<p>${escapeHtml(thesis)}</p>` : "";
+    const badgeHtml = badges ? `<div class="ima-reader-extraction-badges">${badges}</div>` : "";
+    return `<details open class="ima-reader-abstract ima-reader-extraction"><summary><span>AI 解读</span></summary>${thesisHtml}${badgeHtml}</details>`;
+  }
+
   function imaReportMetaHtml(item) {
     const parts = [];
     const ticker = imaDocTicker(item.name);
@@ -1441,6 +1454,7 @@ export function createImaView(dependencies) {
       const abstractHtml = abstractText
         ? `<details open class="ima-reader-abstract${abstractLong ? " is-clamped" : ""}"><summary><span>摘要</span></summary><p id="ima-reader-abstract">${escapeHtml(abstractText)}</p>${abstractMore}</details>`
         : "";
+      const extractionHtml = isFeishuTimeline ? "" : imaReaderExtractionHtml(item);
       // 快照路由校验（与 currentImaListSnapshot 同思路）：与本次应返回的列表路由不匹配的旧快照不用于导航/计数
       const listSnapshot = _imaListSnapshot && _imaListSnapshot.route === normalizeRoute(backRoute) ? _imaListSnapshot : null;
       const standalonePwa = isStandalonePwa();
@@ -1488,6 +1502,7 @@ export function createImaView(dependencies) {
             <h2 class="ima-reader-title">${readerTitle}</h2>
             ${fileMetaHtml}
             ${imaReaderWatchHtml(item.tags)}
+            ${extractionHtml}
             ${abstractHtml}
           </section>
           ${documentPanel}
@@ -1697,6 +1712,7 @@ export function createImaView(dependencies) {
     loadImaDocumentsMore,
     backFromImaReader,
     imaReaderNavHtml,
+    imaReaderExtractionHtml,
     renderImaDocument,
     showImaPdfFail,
     loadImaPdf,

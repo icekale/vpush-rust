@@ -248,7 +248,7 @@ fn normalize_symbol(market: &str, raw: &str) -> Result<Instrument, String> {
         Market::Us => {
             let code = raw.to_ascii_uppercase();
             let valid = code.len() <= 10
-                && code.len() >= 1
+                && !code.is_empty()
                 && code
                     .bytes()
                     .next()

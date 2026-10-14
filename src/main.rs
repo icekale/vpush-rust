@@ -4976,6 +4976,7 @@ async fn register(
         Err(RegisterError::Db(err)) => return Err(db_err(err)),
     };
     release_login_success(&state, &ip, &attempted);
+    ima_collector::grant_default_libraries(&state.db, id).await;
     let user = state
         .db
         .user_by_id(id)
@@ -8055,6 +8056,117 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(admin_user.status(), StatusCode::BAD_REQUEST);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn register_grants_enabled_research_libraries_and_survives_grant_failure() {
+        let _lock = crate::ima_collector::lock_grant_env().await;
+        struct RestoreGrantEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreGrantEnv {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("WEB_GRANT_DEFAULT_IMA_KB", value),
+                    None => std::env::remove_var("WEB_GRANT_DEFAULT_IMA_KB"),
+                }
+            }
+        }
+        let _restore = RestoreGrantEnv(std::env::var_os("WEB_GRANT_DEFAULT_IMA_KB"));
+        std::env::set_var("WEB_GRANT_DEFAULT_IMA_KB", "1");
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-reg-kb-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        let db = Db::open(&dir.join("vpush.db")).await.unwrap();
+        db.ensure_admin(&auth::hash_password("password1234", None))
+            .await
+            .unwrap();
+        let groups = json!([
+            {"id": "legacy", "name": "旧库", "knowledge_base_id": "1", "root_folder_id": "1", "folder_ids": ["1"], "enabled": true, "source": "manual", "interval_seconds": 3600},
+            {"id": "off-kb", "name": "关闭", "knowledge_base_id": "2", "root_folder_id": "2", "folder_ids": ["2"], "enabled": false, "source": "manual", "interval_seconds": 3600}
+        ]);
+        db.set_setting("ima_pure_groups", &groups.to_string())
+            .await
+            .unwrap();
+        db.set_setting(
+            "ima_local_libraries",
+            &json!({
+                "libraries": [
+                    {"slug": "cicc-research", "group_id": "local-cicc-research", "name": "中金研究", "enabled": true},
+                    {"slug": "draft", "group_id": "local-draft", "name": "草稿", "enabled": false}
+                ]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO register_codes (code) VALUES ('INVITE1'), ('INVITE2')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        let app = router(AppState {
+            db: db.clone(),
+            secret: "test-secret".into(),
+            allow_register: true,
+            static_dir: dir.join("static"),
+            fails: new_login_limit(),
+        });
+        let registered = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"username":"newuser","password":"password1234","code":"invite1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.status(), StatusCode::OK);
+        let reader = db.user_by_username("newuser").await.unwrap().unwrap();
+        assert!(!reader.is_admin);
+        assert_eq!(
+            db.ima_kb_group_ids_for_user(reader.id).await.unwrap(),
+            vec!["legacy".to_string(), "local-cicc-research".to_string()]
+        );
+        assert_eq!(
+            db.ima_kb_subscribed_group_ids_for_user(reader.id)
+                .await
+                .unwrap(),
+            vec!["legacy".to_string(), "local-cicc-research".to_string()]
+        );
+        assert!(db
+            .ima_kb_group_ids_for_user(admin.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query("DROP TABLE ima_kb_acl")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let failed = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/auth/register")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"username":"newuser2","password":"password1234","code":"invite2"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(failed.status(), StatusCode::OK);
+        assert!(db.user_by_username("newuser2").await.unwrap().is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -15,6 +15,7 @@ WEB_ADMIN_PASSWORD='至少10位' cargo run
 | `VPUSH_STATIC` | `static` |
 | `HOST` / `PORT` | `127.0.0.1:8000` |
 | `WEB_ALLOW_REGISTER` | 开启；`0` 关闭 |
+| `WEB_GRANT_DEFAULT_IMA_KB` | 开启；`0`、`false`、`False` 关闭。网页邀请码和微信邀请码注册成功后，按当前启用的研报库写入 ACL 并自动订阅。读的是注册当时的采集配置和本地库，不写死库 id。管理员不写。开通失败只记日志，注册仍然成功 |
 | `FEISHU_WEBHOOK_URL` | 空。飞书自定义机器人地址，也可写在 settings 的 `feishu_webhook` |
 | `VPUSH_FETCH` | 开启；`0` 关闭雪球抓取 |
 | `CICC_LAB_LOG_DIR` | 未设置则不读 ARM 日志。没有 `local/.cicc/status.json` 时 `/api/admin/cicc/status` 仍是 `{"available":true,"stale":true}`。Compose 默认 `/app/cicc-lab-logs` |

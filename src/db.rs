@@ -967,6 +967,7 @@ impl Db {
 
     /// 本地库文档（`<archive>/local/<slug>/**/*.pdf`）入库，返回写入行数。
     /// 文件大小没变就不改写，否则每轮扫描都会把 downloaded_at 刷成当前时间。
+    #[allow(clippy::too_many_arguments)]
     pub async fn upsert_local_ima_document(
         &self,
         group_id: &str,

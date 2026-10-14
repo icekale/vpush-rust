@@ -104,7 +104,10 @@ pub async fn account(
             format!("wx_{stem}{suffix}")
         };
         match db.register_wechat(invite, &username, openid).await {
-            Ok(id) => return Ok(id),
+            Ok(id) => {
+                crate::ima_collector::grant_default_libraries(db, id).await;
+                return Ok(id);
+            }
             Err(RegisterError::Rejected("用户名已存在")) => continue,
             Err(RegisterError::Rejected("微信账号已存在")) => {
                 let user = db
@@ -188,5 +191,80 @@ mod tests {
         assert_eq!(again, id);
         assert!(account(&db, true, "oZZZ1234567890", "").await.is_err());
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn first_registration_grants_enabled_libraries_and_later_login_does_not() {
+        let _lock = crate::ima_collector::lock_grant_env().await;
+        let _on = GrantSwitch::set("1");
+        let path = std::env::temp_dir().join(format!(
+            "vpush-wx-kb-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let groups = serde_json::json!([
+            {"id": "legacy", "name": "旧库", "knowledge_base_id": "1", "root_folder_id": "1", "folder_ids": ["1"], "enabled": true, "source": "manual", "interval_seconds": 3600},
+            {"id": "off-kb", "name": "关闭", "knowledge_base_id": "2", "root_folder_id": "2", "folder_ids": ["2"], "enabled": false, "source": "manual", "interval_seconds": 3600}
+        ]);
+        db.set_setting("ima_pure_groups", &groups.to_string())
+            .await
+            .unwrap();
+        db.set_setting(
+            "ima_local_libraries",
+            &serde_json::json!({
+                "libraries": [
+                    {"slug": "cicc-research", "group_id": "local-cicc-research", "name": "中金研究", "enabled": true},
+                    {"slug": "draft", "group_id": "local-draft", "name": "草稿", "enabled": false}
+                ]
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO register_codes (code) VALUES ('WX1234')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let id = account(&db, true, "oABC1234567890", "wx1234")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.ima_kb_group_ids_for_user(id).await.unwrap(),
+            vec!["legacy".to_string(), "local-cicc-research".to_string()]
+        );
+        assert_eq!(
+            db.ima_kb_subscribed_group_ids_for_user(id).await.unwrap(),
+            vec!["legacy".to_string(), "local-cicc-research".to_string()]
+        );
+        db.set_ima_kb_acl_for_user(id, &[]).await.unwrap();
+        let again = account(&db, true, "oABC1234567890", "").await.unwrap();
+        assert_eq!(again, id);
+        assert!(db.ima_kb_group_ids_for_user(id).await.unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    struct GrantSwitch {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl GrantSwitch {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("WEB_GRANT_DEFAULT_IMA_KB");
+            std::env::set_var("WEB_GRANT_DEFAULT_IMA_KB", value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for GrantSwitch {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("WEB_GRANT_DEFAULT_IMA_KB", value),
+                None => std::env::remove_var("WEB_GRANT_DEFAULT_IMA_KB"),
+            }
+        }
     }
 }

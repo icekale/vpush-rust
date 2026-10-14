@@ -99,6 +99,147 @@ pub async fn status(db: &Db) -> Result<Value, String> {
     }))
 }
 
+/// 给非管理员开通当前启用的研报库。名单与管理端用户弹窗一致，写入走 `Db::set_ima_kb_acl_for_user`。
+/// 失败只记日志。`WEB_GRANT_DEFAULT_IMA_KB` 为 `0`、`false`、`False` 时跳过。
+pub async fn grant_default_libraries(db: &Db, user_id: i64) {
+    if !default_library_grant_enabled() {
+        return;
+    }
+    if let Err(err) = try_grant_default_libraries(db, user_id).await {
+        tracing::warn!(user_id, "新用户研报库开通失败: {err}");
+    }
+}
+
+fn default_library_grant_enabled() -> bool {
+    !matches!(
+        std::env::var("WEB_GRANT_DEFAULT_IMA_KB").ok().as_deref(),
+        Some("0" | "false" | "False")
+    )
+}
+
+async fn try_grant_default_libraries(db: &Db, user_id: i64) -> Result<(), String> {
+    let user = db
+        .user_by_id(user_id)
+        .await
+        .map_err(|err| err.to_string())?
+        .ok_or_else(|| "用户不存在".to_string())?;
+    if user.is_admin {
+        return Ok(());
+    }
+    let ids = enabled_research_group_ids(db).await?;
+    if ids.is_empty() {
+        return Ok(());
+    }
+    db.set_ima_kb_acl_for_user(user_id, &ids)
+        .await
+        .map_err(|err| err.to_string())?;
+    tracing::info!(
+        user_id,
+        groups = %ids.join(","),
+        "新用户已开通启用中的研报库"
+    );
+    Ok(())
+}
+
+async fn enabled_research_group_ids(db: &Db) -> Result<Vec<String>, String> {
+    let mut ids = Vec::new();
+    for id in collector_enabled_ids(db).await? {
+        remember_group(&mut ids, &id);
+    }
+    for id in local_enabled_ids(db).await? {
+        remember_group(&mut ids, &id);
+    }
+    Ok(ids)
+}
+
+async fn collector_enabled_ids(db: &Db) -> Result<Vec<String>, String> {
+    let status = status(db).await?;
+    let mut ids = Vec::new();
+    for group in status["config"]["groups"].as_array().into_iter().flatten() {
+        let Some(id) = group["id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        if id.starts_with("feishu-") || group["enabled"] == false {
+            continue;
+        }
+        if !grantable_group_id(id) {
+            tracing::warn!(group_id = id, "跳过格式无效的研报库");
+            continue;
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
+async fn local_enabled_ids(db: &Db) -> Result<Vec<String>, String> {
+    let payload = crate::ima_admin::libraries(db)
+        .await
+        .map_err(|err| err.detail)?;
+    let mut ids = Vec::new();
+    for lib in payload["libraries"].as_array().into_iter().flatten() {
+        let Some(id) = lib["group_id"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let name = lib["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                lib["slug"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+            })
+            .unwrap_or(id);
+        let enabled =
+            lib["enabled"] == true && lib["error"].as_str().is_none_or(|text| text.is_empty());
+        if name.is_empty() || id.starts_with("feishu-") || !enabled {
+            continue;
+        }
+        if !grantable_group_id(id) {
+            tracing::warn!(group_id = id, "跳过格式无效的研报库");
+            continue;
+        }
+        ids.push(id.to_string());
+    }
+    Ok(ids)
+}
+
+fn remember_group(ids: &mut Vec<String>, id: &str) {
+    if !ids.iter().any(|item| item == id) {
+        ids.push(id.to_string());
+    }
+}
+
+fn grantable_group_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b':' | b'-'))
+}
+
+#[cfg(test)]
+pub(crate) static GRANT_ENV_LOCK: tokio::sync::OnceCell<tokio::sync::Mutex<()>> =
+    tokio::sync::OnceCell::const_new();
+
+#[cfg(test)]
+pub(crate) async fn lock_grant_env() -> tokio::sync::MutexGuard<'static, ()> {
+    GRANT_ENV_LOCK
+        .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+        .await
+        .lock()
+        .await
+}
+
 pub async fn save(db: &Db, body: &SaveBody) -> Result<Value, CollectorError> {
     let current = load(db)
         .await
@@ -896,5 +1037,167 @@ mod tests {
         )
         .await
         .is_err());
+    }
+
+    #[test]
+    fn grantable_group_id_matches_the_admin_route() {
+        assert!(grantable_group_id("legacy"));
+        assert!(grantable_group_id("local-cicc-research"));
+        assert!(grantable_group_id("7479082602225992"));
+        assert!(!grantable_group_id("bad id"));
+        assert!(!grantable_group_id(&"x".repeat(129)));
+    }
+
+    struct GrantEnv {
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl GrantEnv {
+        fn set(value: &str) -> Self {
+            let previous = std::env::var_os("WEB_GRANT_DEFAULT_IMA_KB");
+            std::env::set_var("WEB_GRANT_DEFAULT_IMA_KB", value);
+            Self { previous }
+        }
+    }
+
+    impl Drop for GrantEnv {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("WEB_GRANT_DEFAULT_IMA_KB", value),
+                None => std::env::remove_var("WEB_GRANT_DEFAULT_IMA_KB"),
+            }
+        }
+    }
+
+    async fn seed_research_libraries(db: &Db) {
+        let groups = json!([
+            {"id": "legacy", "name": "旧库", "knowledge_base_id": "7464369361259867", "root_folder_id": "7464369361259867", "folder_ids": ["7464369361259867"], "enabled": true, "source": "manual", "interval_seconds": 3600},
+            {"id": "7479082602225992", "name": "库A", "knowledge_base_id": "7479082602225992", "root_folder_id": "root-a", "folder_ids": ["root-a"], "enabled": true, "source": "manual", "interval_seconds": 3600},
+            {"id": "new-library-9001", "name": "新库", "knowledge_base_id": "9001", "root_folder_id": "root-new", "folder_ids": ["root-new"], "enabled": true, "source": "manual", "interval_seconds": 3600},
+            {"id": "disabled-kb", "name": "关闭", "knowledge_base_id": "111", "root_folder_id": "root-off", "folder_ids": ["root-off"], "enabled": false, "source": "manual", "interval_seconds": 3600},
+            {"id": "unmounted", "name": "未挂载", "knowledge_base_id": "222", "root_folder_id": "root-empty", "folder_ids": [], "enabled": true, "source": "manual", "interval_seconds": 3600},
+            {"id": "feishu-open", "name": "飞书", "knowledge_base_id": "333", "root_folder_id": "root-f", "folder_ids": ["root-f"], "enabled": true, "source": "manual", "interval_seconds": 3600}
+        ]);
+        db.set_setting(GROUPS_KEY, &groups.to_string())
+            .await
+            .unwrap();
+        let local = json!({
+            "scanned_at": "2026-10-14T00:00:00Z",
+            "libraries": [
+                {"slug": "cicc-research", "group_id": "local-cicc-research", "name": "中金研究", "enabled": true, "error": ""},
+                {"slug": "draft", "group_id": "local-draft", "name": "草稿", "enabled": false, "error": ""},
+                {"slug": "broken", "group_id": "local-broken", "name": "损坏", "enabled": true, "error": "标记文件不可读"}
+            ]
+        });
+        db.set_setting("ima_local_libraries", &local.to_string())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_user_gets_enabled_libraries_admin_is_left_alone_and_failures_are_logged() {
+        let _lock = lock_grant_env().await;
+        let _on = GrantEnv::set("1");
+        let db = db().await;
+        seed_research_libraries(&db).await;
+        let configured = [
+            "legacy",
+            "7479082602225992",
+            "new-library-9001",
+            "local-cicc-research",
+        ];
+        assert_eq!(
+            enabled_research_group_ids(&db).await.unwrap(),
+            configured
+                .iter()
+                .map(|id| (*id).to_string())
+                .collect::<Vec<_>>()
+        );
+
+        db.ensure_admin("hash").await.unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        sqlx::query("INSERT INTO ima_kb_acl (group_id, user_id) VALUES ('kept', ?)")
+            .bind(admin.id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        grant_default_libraries(&db, admin.id).await;
+        assert_eq!(
+            db.ima_kb_group_ids_for_user(admin.id).await.unwrap(),
+            vec!["kept".to_string()]
+        );
+        assert!(db
+            .ima_kb_subscribed_group_ids_for_user(admin.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES ('readerkb', 'x', 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let reader = db.user_by_username("readerkb").await.unwrap().unwrap();
+        grant_default_libraries(&db, reader.id).await;
+        let mut stored: Vec<String> = configured.iter().map(|id| (*id).to_string()).collect();
+        stored.sort();
+        assert_eq!(
+            db.ima_kb_group_ids_for_user(reader.id).await.unwrap(),
+            stored
+        );
+        assert_eq!(
+            db.ima_kb_subscribed_group_ids_for_user(reader.id)
+                .await
+                .unwrap(),
+            stored
+        );
+        assert_eq!(
+            db.ima_kb_group_ids_for_user(admin.id).await.unwrap(),
+            vec!["kept".to_string()]
+        );
+        let listed = db.list_admin_users().await.unwrap();
+        let row = listed
+            .iter()
+            .find(|row| row["username"] == "readerkb")
+            .unwrap();
+        assert_eq!(row["ima_kb_groups"], json!(stored));
+
+        {
+            let _off = GrantEnv::set("0");
+            assert!(!default_library_grant_enabled());
+            sqlx::query(
+                "INSERT INTO users (username, password_hash, is_admin) VALUES ('readeroff', 'x', 0)",
+            )
+            .execute(db.pool())
+            .await
+            .unwrap();
+            let off = db.user_by_username("readeroff").await.unwrap().unwrap();
+            grant_default_libraries(&db, off.id).await;
+            assert!(db
+                .ima_kb_group_ids_for_user(off.id)
+                .await
+                .unwrap()
+                .is_empty());
+        }
+        for value in ["false", "False"] {
+            let _off = GrantEnv::set(value);
+            assert!(!default_library_grant_enabled(), "{value}");
+        }
+        assert!(default_library_grant_enabled());
+
+        sqlx::query("DROP TABLE ima_kb_acl")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (username, password_hash, is_admin) VALUES ('readerfail', 'x', 0)",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let failed = db.user_by_username("readerfail").await.unwrap().unwrap();
+        grant_default_libraries(&db, failed.id).await;
+        assert!(db.user_by_id(failed.id).await.unwrap().is_some());
     }
 }

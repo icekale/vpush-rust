@@ -128,6 +128,8 @@ fn new_owner() -> String {
     hex::encode(bytes)
 }
 
+/// 外层守护：一次会话因租约丢失、冲突或数据库故障结束后，退避一段时间重新抢租约，
+/// 而不是让入站命令永久停摆。进程锁在整个生命周期内持有。
 pub(crate) async fn run_with_endpoint(
     db: Db,
     token: String,
@@ -135,16 +137,51 @@ pub(crate) async fn run_with_endpoint(
     endpoint: &str,
     _os_lock: File,
 ) {
-    let Some(mut offset) = wait_for_poll_lease(&db, &owner).await else {
+    let mut restarts: u32 = 0;
+    loop {
+        let started = std::time::Instant::now();
+        run_session(&db, &token, &owner, endpoint).await;
+        if started.elapsed() > Duration::from_secs(600) {
+            restarts = 0;
+        }
+        restarts = restarts.saturating_add(1);
+        let delay = restart_delay(restarts);
+        tracing::warn!("Telegram 入站 worker 将在 {} 秒后重启", delay.as_secs_f32());
+        tokio::time::sleep(delay).await;
+    }
+}
+
+fn restart_delay(restarts: u32) -> Duration {
+    let secs = 5u64
+        .saturating_mul(1 << restarts.saturating_sub(1).min(6))
+        .min(300);
+    if cfg!(test) {
+        Duration::from_millis(secs * 10)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+fn backoff_delay(failures: u32) -> Duration {
+    let secs = (1u64 << failures.min(5)).min(MAX_BACKOFF_SECS);
+    if cfg!(test) {
+        Duration::from_millis(secs * 10)
+    } else {
+        Duration::from_secs(secs)
+    }
+}
+
+async fn run_session(db: &Db, token: &str, owner: &str, endpoint: &str) {
+    let Some(mut offset) = wait_for_poll_lease(db, owner).await else {
         return;
     };
 
     let (lease_tx, lease_rx) = watch::channel(false);
-    let heartbeat = spawn_heartbeat(db.clone(), owner.clone(), lease_tx.clone());
-    let result = poll_loop(&db, &token, &owner, endpoint, &mut offset, lease_rx).await;
+    let heartbeat = spawn_heartbeat(db.clone(), owner.to_owned(), lease_tx.clone());
+    let result = poll_loop(db, token, owner, endpoint, &mut offset, lease_rx).await;
     lease_tx.send_replace(true);
     heartbeat.abort();
-    if let Err(error) = db.telegram_poll_release(&owner).await {
+    if let Err(error) = db.telegram_poll_release(owner).await {
         tracing::warn!("Telegram 入站租约释放失败: {error}");
     }
     if let Err(error) = result {
@@ -173,26 +210,44 @@ async fn wait_for_poll_lease(db: &Db, owner: &str) -> Option<i64> {
     }
 }
 
+/// 心跳偶发失败（例如 SQLite busy）不立刻判定租约丢失；连续 3 次（约 45 秒，
+/// 小于 90 秒租期）才放弃。
 fn spawn_heartbeat(db: Db, owner: String, lease_lost: watch::Sender<bool>) -> JoinHandle<()> {
     tokio::spawn(async move {
+        let mut failures = 0;
         loop {
             tokio::time::sleep(HEARTBEAT_INTERVAL).await;
             match db.telegram_poll_heartbeat(&owner, LEASE_SECS).await {
-                Ok(true) => {}
+                Ok(true) => failures = 0,
                 Ok(false) => {
                     lease_lost.send_replace(true);
                     return;
                 }
                 Err(error) => {
-                    tracing::warn!("Telegram 入站租约心跳失败: {error}");
-                    lease_lost.send_replace(true);
-                    return;
+                    failures += 1;
+                    tracing::warn!("Telegram 入站租约心跳失败（第 {failures} 次）: {error}");
+                    if failures >= 3 {
+                        lease_lost.send_replace(true);
+                        return;
+                    }
                 }
             }
         }
     })
 }
 
+async fn backoff(failures: u32, lease: &mut watch::Receiver<bool>) -> Result<(), PollError> {
+    tokio::select! {
+        _ = tokio::time::sleep(backoff_delay(failures)) => Ok(()),
+        changed = lease.changed() => {
+            changed.map_err(|_| PollError::LostLease)?;
+            Err(PollError::LostLease)
+        }
+    }
+}
+
+/// 网络、HTTP 5xx、响应解析、数据库错误都在循环内退避重试；单条 update 处理失败
+/// 记日志后跳过并保存 offset。只有租约丢失或 Telegram 报告冲突才结束会话。
 async fn poll_loop(
     db: &Db,
     token: &str,
@@ -201,18 +256,39 @@ async fn poll_loop(
     offset: &mut i64,
     mut lease: watch::Receiver<bool>,
 ) -> Result<(), PollError> {
+    let mut failures: u32 = 0;
     loop {
-        ensure_lease(db, owner, &lease).await?;
+        match ensure_lease(db, owner, &lease).await {
+            Ok(()) => {}
+            Err(PollError::Db(error)) => {
+                failures = failures.saturating_add(1);
+                tracing::warn!("Telegram 入站租约检查失败: {error}");
+                backoff(failures, &mut lease).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        }
         let token_for_request = token.to_owned();
         let endpoint_for_request = endpoint.to_owned();
         let requested_offset = *offset;
-        let response = get_updates_with_lease(
+        let response = match get_updates_with_lease(
             endpoint_for_request,
             token_for_request,
             requested_offset,
             &mut lease,
         )
-        .await?;
+        .await
+        {
+            Ok(response) => response,
+            Err(error @ (PollError::Http(_) | PollError::Json(_))) => {
+                failures = failures.saturating_add(1);
+                tracing::warn!("Telegram getUpdates 失败（第 {failures} 次）: {error}");
+                backoff(failures, &mut lease).await?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        failures = 0;
         match response {
             GetUpdates::Conflict => return Err(PollError::Conflict),
             GetUpdates::RateLimited(seconds) => {
@@ -226,16 +302,51 @@ async fn poll_loop(
             }
             GetUpdates::Updates(updates) => {
                 for value in updates {
-                    *offset = process_update(
+                    let update_id = value.get("update_id").and_then(Value::as_i64);
+                    match process_update(
                         db.clone(),
                         owner,
                         value,
                         lease.clone(),
                         http_transport(endpoint, token),
                     )
-                    .await?;
+                    .await
+                    {
+                        Ok(next) => *offset = next,
+                        Err(error @ (PollError::Conflict | PollError::LostLease)) => {
+                            return Err(error)
+                        }
+                        Err(error) => {
+                            tracing::warn!("跳过 Telegram update {update_id:?}: {error}");
+                            skip_update(db, owner, update_id, offset).await?;
+                        }
+                    }
                 }
             }
+        }
+    }
+}
+
+async fn skip_update(
+    db: &Db,
+    owner: &str,
+    update_id: Option<i64>,
+    offset: &mut i64,
+) -> Result<(), PollError> {
+    let Some(next) = update_id
+        .filter(|id| *id >= 0)
+        .and_then(|id| id.checked_add(1))
+        .filter(|next| *next > *offset)
+    else {
+        return Ok(());
+    };
+    *offset = next;
+    match db.telegram_poll_save_offset(owner, next).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(PollError::LostLease),
+        Err(error) => {
+            tracing::warn!("Telegram 入站 offset 保存失败: {error}");
+            Ok(())
         }
     }
 }
@@ -676,7 +787,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn normal_worker_failure_releases_sidecar_lock() {
+    async fn stopped_worker_releases_sidecar_lock() {
         let dir = std::env::temp_dir().join(format!(
             "vpush-telegram-lock-failure-{}-{}",
             std::process::id(),
@@ -686,14 +797,16 @@ mod tests {
         let db_path = dir.join("vpush.db");
         let db = Db::open(&db_path).await.unwrap();
         let lock = acquire_os_lock(&db_path).unwrap();
-        run_with_endpoint(
+        let worker = run_with_endpoint(
             db,
             "test-token".to_owned(),
             "owner".to_owned(),
             "http://127.0.0.1:1",
             lock,
-        )
-        .await;
+        );
+        assert!(tokio::time::timeout(Duration::from_millis(300), worker)
+            .await
+            .is_err());
         assert!(acquire_os_lock(&db_path).is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -851,5 +964,111 @@ mod tests {
         let result = get_updates(&format!("http://{}", address), "123:secret", 0).unwrap();
         assert!(matches!(result, GetUpdates::Updates(updates) if updates.is_empty()));
         thread.join().unwrap();
+    }
+
+    fn read_request(stream: &mut std::net::TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let length = stream.read(&mut chunk).unwrap_or(0);
+            if length == 0 {
+                break;
+            }
+            request.extend_from_slice(&chunk[..length]);
+            if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let headers = String::from_utf8_lossy(&request[..pos]).to_string();
+                let body_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse::<usize>().ok())?
+                    })
+                    .unwrap_or(0);
+                if request.len() >= pos + 4 + body_len {
+                    break;
+                }
+            }
+        }
+        String::from_utf8_lossy(&request).to_string()
+    }
+
+    #[tokio::test]
+    async fn poll_loop_survives_transient_errors_and_skips_bad_updates() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let updates: Arc<Mutex<Vec<(u16, String)>>> = Arc::new(Mutex::new(vec![
+            (
+                200,
+                json!({"ok": true, "result": [{"update_id": 6, "message": {"chat": {"id": 42, "type": "private"}}}]}).to_string(),
+            ),
+            (
+                200,
+                json!({"ok": true, "result": [{"update_id": 5, "message": {"chat": {"id": 42, "type": "private", "first_name": "Ada"}, "text": "/help"}}]}).to_string(),
+            ),
+            (502, "<html>bad gateway</html>".to_owned()),
+        ]));
+        let sends = Arc::new(AtomicUsize::new(0));
+        {
+            let updates = updates.clone();
+            let sends = sends.clone();
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let Ok(mut stream) = stream else { break };
+                    let request = read_request(&mut stream);
+                    let (status, body) = if request.contains("/getUpdates") {
+                        updates
+                            .lock()
+                            .unwrap()
+                            .pop()
+                            .unwrap_or((200, r#"{"ok":true,"result":[]}"#.to_owned()))
+                    } else {
+                        sends.fetch_add(1, Ordering::SeqCst);
+                        (
+                            403,
+                            r#"{"ok":false,"error_code":403,"description":"Forbidden: bot was blocked by the user"}"#.to_owned(),
+                        )
+                    };
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} X\r\nContent-Length: {}\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.flush();
+                }
+            });
+        }
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        db.telegram_poll_acquire("owner", 60).await.unwrap();
+        let (_lease_tx, lease_rx) = watch::channel(false);
+        let worker_db = db.clone();
+        let endpoint = format!("http://{address}");
+        let worker = tokio::spawn(async move {
+            let mut offset = 0;
+            poll_loop(&worker_db, "1:t", "owner", &endpoint, &mut offset, lease_rx).await
+        });
+        let mut saved = 0;
+        for _ in 0..200 {
+            saved = db.telegram_poll_offset().await.unwrap();
+            if saved == 7 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(saved, 7);
+        assert!(sends.load(Ordering::SeqCst) >= 1);
+        assert!(!worker.is_finished());
+        worker.abort();
+    }
+
+    #[test]
+    fn restart_and_backoff_delays_are_capped() {
+        assert!(backoff_delay(1) < backoff_delay(3));
+        assert_eq!(backoff_delay(40), backoff_delay(5));
+        assert!(restart_delay(1) < restart_delay(2));
+        assert_eq!(restart_delay(100), restart_delay(7));
     }
 }

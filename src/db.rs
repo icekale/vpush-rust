@@ -695,6 +695,7 @@ impl Db {
         ensure_news_admin_columns(&pool).await?;
         ensure_etf_premium_columns(&pool).await?;
         ensure_legacy_columns(&pool).await?;
+        normalize_news_timestamps(&pool).await?;
         create_schema_indexes(&pool, &indexes).await?;
         ensure_hot_indexes(&pool).await?;
         ensure_binding_indexes(&pool).await?;
@@ -2016,8 +2017,11 @@ impl Db {
         for entry in entries {
             let result = sqlx::query(
                 "INSERT INTO news_articles
-                    (source_id, feed_id, external_id, title, summary, content, url, author, published_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (source_id, feed_id, external_id, title, summary, content, url, author,
+                     published_at, fetched_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                     COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+                     strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
                  ON CONFLICT(source_id, external_id) DO NOTHING",
             )
             .bind(source_id)
@@ -2615,7 +2619,7 @@ impl Db {
             "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
                     a.title, a.summary, a.url, a.author, a.published_at, a.topics,
                     CASE WHEN a.images NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_image,
-                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
+                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
              LEFT JOIN news_feeds f ON f.id = a.feed_id
@@ -2628,7 +2632,7 @@ impl Db {
                )
                AND (? = '' OR a.title LIKE ? ESCAPE '!' OR a.summary LIKE ? ESCAPE '!')
                AND (? = '' OR a.topics LIKE ? ESCAPE '!')
-               AND (? = 0 OR NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at)))
+               AND (? = 0 OR NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at))))
              ORDER BY a.published_at DESC, a.id DESC
              LIMIT ? OFFSET ?",
         )
@@ -2671,7 +2675,7 @@ impl Db {
             "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
                     a.title, a.summary, a.content, a.url, a.author, a.published_at, a.topics,
                     CASE WHEN a.images NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_image,
-                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
+                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
              LEFT JOIN news_feeds f ON f.id = a.feed_id
@@ -2736,7 +2740,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT a.id, a.title, a.author, a.issue_key, a.issue_label, a.issue_title, a.issue_cover,
                     a.section, a.published_at, a.toc_order,
-                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
+                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
              LEFT JOIN news_reads r ON r.article_id = a.id AND r.user_id = ?
@@ -2921,7 +2925,7 @@ impl Db {
                  NOT EXISTS (SELECT 1 FROM user_news_sources u WHERE u.user_id = ?)
                  OR EXISTS (SELECT 1 FROM user_news_sources u WHERE u.user_id = ? AND u.source_id = a.source_id)
                )
-               AND NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at))",
+               AND NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)))",
         )
         .bind(user_id)
         .bind(user_id)
@@ -4316,7 +4320,8 @@ impl Db {
         let posts = if posts_days == 0 {
             0
         } else {
-            let cutoff = format!("datetime('now', '-{posts_days} days')");
+            let cutoff =
+                format!("strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', '-{posts_days} days')");
             let old_news = format!("published_at != '' AND published_at < {cutoff}");
             delete_in_batches(
                 &self.pool,
@@ -5195,7 +5200,7 @@ impl Db {
                 "SELECT a.id, a.title, a.summary, a.author, s.name AS source_name FROM news_articles a
                  JOIN news_sources s ON s.id = a.source_id
                  WHERE s.archived_at IS NULL AND s.internal = 0
-                 AND COALESCE(NULLIF(a.fetched_at, ''), a.published_at) >= ?
+                 AND datetime(COALESCE(NULLIF(a.fetched_at, ''), a.published_at)) >= datetime(?)
                  AND NOT EXISTS (SELECT 1 FROM news_keyword_notified n WHERE n.user_id = ? AND n.article_id = a.id)
                  ORDER BY a.id DESC LIMIT 400",
             )
@@ -8573,6 +8578,50 @@ fn read_sql_name(sql: &str, index: usize) -> Result<(usize, String), String> {
         return Err(invalid.into());
     }
     Ok((index + end, rest[..end].to_string()))
+}
+
+/// Rewrites legacy `news_articles.published_at` values (RFC 822 strings, naive
+/// Beijing-time stamps, other offsets) into the canonical UTC form. Rows already
+/// canonical are skipped, so this is cheap and safe to run on every start.
+async fn normalize_news_timestamps(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    const CANONICAL: &str =
+        "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00";
+    let mut last_id = 0i64;
+    let mut fixed = 0usize;
+    loop {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(&format!(
+            "SELECT id, published_at, fetched_at FROM news_articles
+             WHERE id > ? AND published_at != '' AND published_at NOT GLOB '{CANONICAL}'
+             ORDER BY id LIMIT 1000"
+        ))
+        .bind(last_id)
+        .fetch_all(pool)
+        .await?;
+        let Some((id, _, _)) = rows.last() else {
+            break;
+        };
+        last_id = *id;
+        let mut tx = pool.begin().await?;
+        for (id, published, fetched) in &rows {
+            let value = crate::news::utc_stamp(published)
+                .or_else(|| crate::news::utc_stamp(fetched))
+                .unwrap_or_default();
+            sqlx::query(
+                "UPDATE news_articles SET published_at = COALESCE(NULLIF(?, ''),
+                     strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')) WHERE id = ?",
+            )
+            .bind(value)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        fixed += rows.len();
+    }
+    if fixed > 0 {
+        tracing::info!(fixed, "资讯发布时间已统一为 UTC");
+    }
+    Ok(())
 }
 
 /// Deletes matching rows a few thousand at a time. The pool has a single
@@ -12426,6 +12475,50 @@ mod regression_tests {
             .await
             .unwrap();
         assert_eq!(left, 4000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn legacy_news_timestamps_are_migrated_and_compare_correctly() {
+        let (db, path) = fresh_db("news-ts").await;
+        sqlx::raw_sql(
+            "INSERT INTO news_sources (id, name, slug) VALUES (1, 'S', 's');
+             INSERT INTO news_articles (id, source_id, external_id, title, published_at) VALUES
+                 (1, 1, 'rfc', 'old rfc', 'Sat, 01 Aug 2020 08:00:00 GMT'),
+                 (2, 1, 'naive', 'naive beijing', '2026-10-17 08:00'),
+                 (3, 1, 'offset', 'offset', '2026-10-17T08:00:00+08:00'),
+                 (4, 1, 'junk', 'junk', 'not a date');",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, published_at FROM news_articles ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows[0].1, "2020-08-01T08:00:00+00:00");
+        assert_eq!(rows[1].1, "2026-10-17T00:00:00+00:00");
+        assert_eq!(rows[2].1, "2026-10-17T00:00:00+00:00");
+        assert!(crate::news::utc_stamp(&rows[3].1).is_some());
+        let unread_after_seen: bool = sqlx::query_scalar(
+            "SELECT datetime(published_at) <= datetime('2026-10-17 00:30:00') FROM news_articles WHERE id = 2",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(unread_after_seen);
+        db.set_setting("stats_posts_retention_days", "30")
+            .await
+            .unwrap();
+        db.prune_retention_if_due().await.unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM news_articles ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(!ids.contains(&1), "RFC 822 articles must age out");
         let _ = std::fs::remove_file(&path);
     }
 }

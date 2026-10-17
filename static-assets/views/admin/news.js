@@ -1,3 +1,11 @@
+function adminStamp(raw) {
+  const text = String(raw || "");
+  const d = /(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(text) ? new Date(text) : null;
+  if (!d || Number.isNaN(d.getTime())) return text.slice(0, 16).replace("T", " ");
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 export function createAdminNewsView(dependencies) {
   const {
     $,
@@ -230,7 +238,7 @@ export function createAdminNewsView(dependencies) {
         <div class="news-admin-feed-row">
           <div class="news-admin-feed-main">
             <div class="news-admin-feed-title"><strong>${escapeHtml(article.title)}</strong></div>
-            <div class="news-admin-feed-meta">${escapeHtml(article.feed_name || "")} · ${escapeHtml((article.published_at || "").slice(0, 16).replace("T", " "))}</div>
+            <div class="news-admin-feed-meta">${escapeHtml(article.feed_name || "")} · ${escapeHtml(adminStamp(article.published_at))}</div>
           </div>
           <div class="news-admin-feed-actions">
             <button type="button" class="btn-ghost danger" onclick="deleteAdminNewsArticle(${article.id})">删除</button>

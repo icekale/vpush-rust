@@ -158,7 +158,14 @@ fn rss_entry(block: &str) -> Option<NewsEntry> {
         summary: plain(&body),
         content: plain(&body),
         url,
-        author: plain(&text_of(block, "creator")),
+        author: plain(&{
+            let creator = text_of(block, "dc:creator");
+            if creator.is_empty() {
+                text_of(block, "author")
+            } else {
+                creator
+            }
+        }),
         published_at: stamp(&text_of(block, "pubDate")),
     })
 }
@@ -366,21 +373,166 @@ fn first_nonempty(values: &[&str]) -> String {
 }
 
 fn stamp(raw: &str) -> String {
+    utc_stamp(raw).unwrap_or_default()
+}
+
+const BEIJING_OFFSET_MIN: i64 = 8 * 60;
+
+/// Canonical storage form for news timestamps: UTC `YYYY-MM-DDTHH:MM:SS+00:00`
+/// (sorts lexically, `datetime()` understands it, the frontend parses it).
+/// Accepts ISO 8601 / SQLite style (no offset means Beijing time, matching how
+/// the frontend always displayed such values) and RFC 822/2822 dates.
+pub(crate) fn utc_stamp(raw: &str) -> Option<String> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return String::new();
+        return None;
     }
-    if let Some(iso) = raw.get(0..19) {
-        if iso.as_bytes().get(4) == Some(&b'-')
-            && iso
-                .as_bytes()
-                .get(10)
-                .is_some_and(|b| *b == b'T' || *b == b' ')
-        {
-            return format!("{} {}", &iso[..10], &iso[11..16]);
+    let (y, mo, d, h, mi, sec, offset) = parse_iso(raw).or_else(|| parse_rfc2822(raw))?;
+    if !(1..=12).contains(&mo)
+        || d == 0
+        || d > days_in_month(y, mo)
+        || h > 23
+        || mi > 59
+        || sec > 60
+    {
+        return None;
+    }
+    let local = days_from_civil(y, mo, d) * 86_400 + (h * 3600 + mi * 60 + sec.min(59)) as i64;
+    let utc = local - offset * 60;
+    let (y, mo, d) = civil_from_days(utc.div_euclid(86_400));
+    let tod = utc.rem_euclid(86_400);
+    Some(format!(
+        "{y:04}-{mo:02}-{d:02}T{:02}:{:02}:{:02}+00:00",
+        tod / 3600,
+        (tod % 3600) / 60,
+        tod % 60
+    ))
+}
+
+type Civil = (i64, u32, u32, u32, u32, u32, i64);
+
+fn num(text: &str) -> Option<u32> {
+    (!text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+fn parse_offset(text: &str) -> Option<i64> {
+    let text = text.trim();
+    match text.to_ascii_uppercase().as_str() {
+        "" => return Some(BEIJING_OFFSET_MIN),
+        "Z" | "UT" | "UTC" | "GMT" => return Some(0),
+        "EST" => return Some(-5 * 60),
+        "EDT" => return Some(-4 * 60),
+        "CST" => return Some(-6 * 60),
+        "CDT" => return Some(-5 * 60),
+        "MST" => return Some(-7 * 60),
+        "MDT" => return Some(-6 * 60),
+        "PST" => return Some(-8 * 60),
+        "PDT" => return Some(-7 * 60),
+        _ => {}
+    }
+    let sign = match text.as_bytes().first()? {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let digits: String = text[1..].chars().filter(|c| *c != ':').collect();
+    if digits.len() != 4 && digits.len() != 2 {
+        return None;
+    }
+    let hours = num(&digits[..2])? as i64;
+    let minutes = digits.get(2..).map(num).unwrap_or(Some(0))? as i64;
+    Some(sign * (hours * 60 + minutes))
+}
+
+fn parse_iso(raw: &str) -> Option<Civil> {
+    let bytes = raw.as_bytes();
+    if raw.len() < 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let (y, mo, d) = (num(&raw[..4])? as i64, num(&raw[5..7])?, num(&raw[8..10])?);
+    let rest = &raw[10..];
+    if rest.is_empty() {
+        return Some((y, mo, d, 0, 0, 0, BEIJING_OFFSET_MIN));
+    }
+    let rest = rest.strip_prefix(['T', 't', ' '])?;
+    let h = num(rest.get(..2)?)?;
+    let rest = rest.get(2..)?.strip_prefix(':')?;
+    let mi = num(rest.get(..2)?)?;
+    let mut rest = rest.get(2..)?;
+    let mut sec = 0;
+    if let Some(tail) = rest.strip_prefix(':') {
+        sec = num(tail.get(..2)?)?;
+        rest = tail.get(2..)?;
+        if let Some(frac) = rest.strip_prefix(['.', ',']) {
+            let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+            rest = &frac[digits..];
         }
     }
-    raw.to_string()
+    Some((y, mo, d, h, mi, sec, parse_offset(rest)?))
+}
+
+fn parse_rfc2822(raw: &str) -> Option<Civil> {
+    let text = raw.split_once(',').map_or(raw, |(_, rest)| rest);
+    let mut parts = text.split_whitespace();
+    let d = num(parts.next()?)?;
+    let month = parts.next()?.get(..3)?.to_ascii_lowercase();
+    let mo = [
+        "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec",
+    ]
+    .iter()
+    .position(|m| *m == month)? as u32
+        + 1;
+    let year = num(parts.next()?)? as i64;
+    let y = match year {
+        0..=49 => 2000 + year,
+        50..=999 => 1900 + year,
+        _ => year,
+    };
+    let clock: Vec<&str> = parts.next()?.split(':').collect();
+    let (h, mi, sec) = match clock.as_slice() {
+        [h, m] => (num(h)?, num(m)?, 0),
+        [h, m, s] => (num(h)?, num(m)?, num(s)?),
+        _ => return None,
+    };
+    let offset = match parts.next() {
+        Some(zone) => parse_offset(zone)?,
+        None => 0,
+    };
+    Some((y, mo, d, h, mi, sec, offset))
+}
+
+fn days_in_month(y: i64, m: u32) -> u32 {
+    match m {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let mp = (m as i64 + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    (y, m, d)
 }
 
 const IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/gif"];
@@ -508,7 +660,7 @@ mod tests {
         assert_eq!(parsed.format, "RSS");
         assert_eq!(parsed.entries[0].title, "一条 & 新闻");
         assert_eq!(parsed.entries[0].summary, "正文");
-        assert_eq!(parsed.entries[0].published_at, "2026-09-26 12:30");
+        assert_eq!(parsed.entries[0].published_at, "2026-09-26T12:30:00+00:00");
         assert_eq!(parsed.entries[0].external_id, "a1");
         assert!(public_https("http://example.com/a").is_err());
         assert!(public_https("https://127.0.0.1/a").is_err());
@@ -570,5 +722,42 @@ mod tests {
         assert_eq!(web_url("data:text/html,x"), "");
         assert_eq!(web_url("https://a.example/\nx"), "");
         assert_eq!(web_url("//evil.example/"), "");
+    }
+
+    #[test]
+    fn timestamps_are_normalised_to_utc() {
+        for (raw, expected) in [
+            ("Sat, 17 Oct 2026 08:05:09 GMT", "2026-10-17T08:05:09+00:00"),
+            ("17 Oct 2026 08:05 +0800", "2026-10-17T00:05:00+00:00"),
+            (
+                "Fri, 01 Jan 2027 01:00:00 -0500",
+                "2027-01-01T06:00:00+00:00",
+            ),
+            ("Thu, 31 Dec 2026 20:00:00 EST", "2027-01-01T01:00:00+00:00"),
+            ("2026-10-17T08:05:09.123Z", "2026-10-17T08:05:09+00:00"),
+            ("2026-10-17T08:05:09+08:00", "2026-10-17T00:05:09+00:00"),
+            ("2026-10-17 08:05", "2026-10-17T00:05:00+00:00"),
+            ("2026-03-01", "2026-02-28T16:00:00+00:00"),
+            ("2026-10-17T00:05:09+00:00", "2026-10-17T00:05:09+00:00"),
+        ] {
+            assert_eq!(utc_stamp(raw).as_deref(), Some(expected), "{raw}");
+        }
+        for raw in [
+            "",
+            "yesterday",
+            "2026-13-01",
+            "2026-02-30 10:00",
+            "32 Oct 2026 10:00 GMT",
+        ] {
+            assert_eq!(utc_stamp(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn rss_reads_rfc822_dates_and_dc_creator() {
+        let xml = r#"<rss xmlns:dc="http://purl.org/dc/elements/1.1/"><channel><item><title>T</title><dc:creator>作者甲</dc:creator><pubDate>Sat, 17 Oct 2026 08:00:00 GMT</pubDate></item></channel></rss>"#;
+        let parsed = parse_feed(xml).unwrap();
+        assert_eq!(parsed.entries[0].author, "作者甲");
+        assert_eq!(parsed.entries[0].published_at, "2026-10-17T08:00:00+00:00");
     }
 }

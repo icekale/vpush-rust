@@ -341,15 +341,7 @@ fn public_url(raw: &str) -> String {
 }
 
 fn normalize_ts(raw: &str, fallback: &str) -> String {
-    let text = raw.trim();
-    if text.len() < 10 || text.as_bytes().get(4) != Some(&b'-') {
-        return fallback.to_string();
-    }
-    if text.ends_with('Z') || text.ends_with('z') {
-        format!("{}+00:00", &text[..text.len() - 1])
-    } else {
-        text.to_string()
-    }
+    crate::news::utc_stamp(raw).unwrap_or_else(|| fallback.to_string())
 }
 
 fn now_iso() -> String {

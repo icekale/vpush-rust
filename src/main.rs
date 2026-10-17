@@ -51,7 +51,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{
@@ -1764,6 +1764,14 @@ async fn img_proxy(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let target = img_proxy::validate(&q.url).map_err(img_err)?;
+    img_proxy::take_quota(target.video, &ip, now_secs()).map_err(img_err)?;
+    let permit = tokio::time::timeout(Duration::from_secs(10), img_proxy::UPSTREAM.acquire())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "图片代理繁忙，请稍后再试")
+        })?;
     let host = target.host.clone();
     let ips = tokio::task::spawn_blocking(move || img_proxy::resolve(&host))
         .await
@@ -1771,7 +1779,6 @@ async fn img_proxy(
     if !img_proxy::resolution_ok(&ips) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "不支持的图片地址"));
     }
-    img_proxy::take_quota(target.video, &ip, now_secs()).map_err(img_err)?;
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -1786,8 +1793,14 @@ async fn img_proxy(
     for (name, value) in proxied.headers {
         response = response.header(name, value);
     }
+    let body = match proxied.body {
+        img_proxy::ProxiedBody::Full(bytes) => Body::from(bytes),
+        img_proxy::ProxiedBody::Stream(reader) => {
+            Body::from_stream(img_proxy::stream_body(reader, permit))
+        }
+    };
     response
-        .body(Body::from(proxied.body))
+        .body(body)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "图片源请求失败"))
 }
 

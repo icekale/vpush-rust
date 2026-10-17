@@ -20,7 +20,13 @@ const IMAGE_TYPES: &[&str] = &["image/jpeg", "image/png", "image/webp", "image/g
 const VIDEO_TYPES: &[&str] = &["video/mp4", "video/quicktime", "video/webm"];
 const IMAGE_MAX: usize = 10 * 1024 * 1024;
 const VIDEO_MAX: usize = 60 * 1024 * 1024;
+/// 单次 Range 请求最多向上游要这么多字节；浏览器会按 206 的 Content-Range 继续请求后续分片。
+const VIDEO_CHUNK: u64 = 4 * 1024 * 1024;
 const VIDEO_PROBE: u64 = 1024 * 1024;
+const STREAM_CHUNK: usize = 64 * 1024;
+
+/// 同时在途的上游请求上限。视频走流式转发，每个请求只占一个 64KB 缓冲。
+pub static UPSTREAM: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(8);
 const WINDOW: u64 = 60;
 const IMAGE_QUOTA: u32 = 60;
 const VIDEO_QUOTA: u32 = 180;
@@ -38,7 +44,53 @@ pub struct Proxied {
     pub status: u16,
     pub media_type: String,
     pub headers: Vec<(&'static str, String)>,
-    pub body: Vec<u8>,
+    pub body: ProxiedBody,
+}
+
+pub enum ProxiedBody {
+    Full(Vec<u8>),
+    Stream(Box<dyn Read + Send>),
+}
+
+impl ProxiedBody {
+    #[cfg(test)]
+    fn len_hint(&self) -> usize {
+        match self {
+            ProxiedBody::Full(body) => body.len(),
+            ProxiedBody::Stream(_) => 0,
+        }
+    }
+}
+
+/// 在阻塞线程里按 64KB 分块读上游，经 channel 交给响应体；客户端断开时停止读取。
+/// `guard` 随读取线程一起释放（用来持有并发许可）。
+pub fn stream_body<G: Send + 'static>(
+    mut reader: Box<dyn Read + Send>,
+    guard: G,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        loop {
+            let mut buf = vec![0u8; STREAM_CHUNK];
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.truncate(n);
+                    if tx.blocking_send(Ok(buf)).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    let _ = tx.blocking_send(Err(err));
+                    break;
+                }
+            }
+        }
+    });
+    futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| (item, rx))
+    })
 }
 
 #[derive(Debug)]
@@ -98,7 +150,7 @@ pub fn bounded_range(header: Option<&str>) -> String {
     if let Some(rest) = lower.strip_prefix("bytes=") {
         if let Some(n) = rest.strip_prefix('-') {
             if let Ok(n) = n.parse::<u64>() {
-                return format!("bytes=-{}", n.clamp(1, VIDEO_MAX as u64));
+                return format!("bytes=-{}", n.clamp(1, VIDEO_CHUNK));
             }
         } else if let Some((start, end)) = rest.split_once('-') {
             if let Ok(start) = start.parse::<u64>() {
@@ -107,7 +159,7 @@ pub fn bounded_range(header: Option<&str>) -> String {
                 } else {
                     end.parse::<u64>()
                         .unwrap_or(start)
-                        .min(start.saturating_add(VIDEO_MAX as u64 - 1))
+                        .min(start.saturating_add(VIDEO_CHUNK - 1))
                 };
                 return format!("bytes={start}-{}", end.max(start));
             }
@@ -179,7 +231,6 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
         .header("content-length")
         .and_then(|v| v.parse::<usize>().ok());
     let content_range = response.header("content-range").map(str::to_string);
-    let max = if target.video { VIDEO_MAX } else { IMAGE_MAX };
     if !target.video {
         if status != 200 {
             return Err(upstream(false));
@@ -217,30 +268,37 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
             });
         }
     }
+    if target.video {
+        let reader: Box<dyn Read + Send> = Box::new(response.into_reader().take(VIDEO_MAX as u64));
+        return finish(
+            true,
+            status,
+            content_type,
+            content_length,
+            content_range,
+            ProxiedBody::Stream(reader),
+        );
+    }
     let mut body = Vec::new();
     response
         .into_reader()
-        .take(max as u64 + 1)
+        .take(IMAGE_MAX as u64 + 1)
         .read_to_end(&mut body)
-        .map_err(|_| upstream(target.video))?;
-    if body.len() > max {
+        .map_err(|_| upstream(false))?;
+    if body.len() > IMAGE_MAX {
         return Err(ImgError {
             status: 400,
-            detail: if target.video {
-                "视频过大"
-            } else {
-                "图片过大"
-            },
+            detail: "图片过大",
             retry_after: None,
         });
     }
     finish(
-        target.video,
+        false,
         status,
         content_type,
         content_length,
         content_range,
-        body,
+        ProxiedBody::Full(body),
     )
 }
 
@@ -250,7 +308,7 @@ fn finish(
     content_type: String,
     content_length: Option<usize>,
     content_range: Option<String>,
-    body: Vec<u8>,
+    body: ProxiedBody,
 ) -> Result<Proxied, ImgError> {
     if video {
         let media_type = if content_type == "video/quicktime" {
@@ -355,7 +413,14 @@ fn fetch_truth(target: &Target) -> Result<Proxied, ImgError> {
             retry_after: None,
         });
     }
-    finish(false, 200, content_type, Some(body.len()), None, body)
+    finish(
+        false,
+        200,
+        content_type,
+        Some(body.len()),
+        None,
+        ProxiedBody::Full(body),
+    )
 }
 
 fn chrome() -> Result<wreq::Client, String> {
@@ -431,9 +496,14 @@ mod tests {
         );
         assert_eq!(
             bounded_range(Some("bytes=-999999999")),
-            format!("bytes=-{VIDEO_MAX}")
+            format!("bytes=-{VIDEO_CHUNK}")
         );
         assert_eq!(bounded_range(None), format!("bytes=0-{}", VIDEO_PROBE - 1));
+        assert_eq!(
+            bounded_range(Some("bytes=0-99999999")),
+            format!("bytes=0-{}", VIDEO_CHUNK - 1)
+        );
+        assert_eq!(bounded_range(Some("bytes=100-199")), "bytes=100-199");
         reset_quota();
         QUOTA
             .lock()
@@ -463,6 +533,30 @@ mod tests {
         let target = validate("https://static-assets-1.truthsocial.com/tmtg:prime-ts-assets/media_attachments/files/117/345/153/898/008/432/original/3826b8f99055aa3b.jpg").unwrap();
         let got = fetch(&target, None).expect("truth image");
         assert_eq!(got.media_type, "image/jpeg");
-        assert!(got.body.len() > 2048);
+        assert!(got.body.len_hint() > 2048);
+    }
+
+    #[tokio::test]
+    async fn video_body_is_streamed_in_chunks_and_releases_the_permit() {
+        use futures_util::StreamExt;
+        let data: Vec<u8> = (0..(STREAM_CHUNK * 3 + 17)).map(|i| i as u8).collect();
+        let reader: Box<dyn Read + Send> = Box::new(std::io::Cursor::new(data.clone()));
+        let before = UPSTREAM.available_permits();
+        let permit = UPSTREAM.acquire().await.unwrap();
+        assert_eq!(UPSTREAM.available_permits(), before - 1);
+        let chunks: Vec<Vec<u8>> = stream_body(reader, permit)
+            .map(|chunk| chunk.unwrap())
+            .collect()
+            .await;
+        assert!(chunks.len() >= 4);
+        assert!(chunks.iter().all(|chunk| chunk.len() <= STREAM_CHUNK));
+        assert_eq!(chunks.concat(), data);
+        for _ in 0..50 {
+            if UPSTREAM.available_permits() == before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(UPSTREAM.available_permits(), before);
     }
 }

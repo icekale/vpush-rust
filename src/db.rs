@@ -12148,7 +12148,13 @@ mod tests {
         assert!(count_user_rows(&db, reader.id).await >= 14);
         db.delete_user(admin.id, reader.id).await.unwrap();
         assert!(db.user_by_id(reader.id).await.unwrap().is_none());
-        assert_eq!(count_user_rows(&db, reader.id).await, 0);
+        let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_logs WHERE user_id = ?")
+            .bind(reader.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(audit, 1);
+        assert_eq!(count_user_rows(&db, reader.id).await, audit);
         let admin_push: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM webpush_subscriptions WHERE user_id = ?")
                 .bind(admin.id)

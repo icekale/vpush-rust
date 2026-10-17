@@ -8674,7 +8674,7 @@ async fn normalize_news_timestamps(pool: &SqlitePool) -> Result<(), sqlx::Error>
         let mut tx = pool.begin().await?;
         for (id, published, fetched) in &rows {
             let value = crate::news::utc_stamp(published)
-                .or_else(|| crate::news::utc_stamp(fetched))
+                .or_else(|| crate::news::utc_stamp_zoneless_utc(fetched))
                 .unwrap_or_default();
             sqlx::query(
                 "UPDATE news_articles SET published_at = COALESCE(NULLIF(?, ''),
@@ -12608,7 +12608,10 @@ mod regression_tests {
                  (1, 1, 'rfc', 'old rfc', 'Sat, 01 Aug 2020 08:00:00 GMT'),
                  (2, 1, 'naive', 'naive beijing', '2026-10-17 08:00'),
                  (3, 1, 'offset', 'offset', '2026-10-17T08:00:00+08:00'),
-                 (4, 1, 'junk', 'junk', 'not a date');",
+                 (4, 1, 'junk', 'junk', 'not a date');
+             INSERT INTO news_articles (id, source_id, external_id, title, published_at, fetched_at) VALUES
+                 (5, 1, 'fallback', 'fallback', 'not a date', '2026-10-16 18:30:00'),
+                 (6, 1, 'fallback-z', 'fallback z', 'garbage', '2026-10-16T18:30:00Z');",
         )
         .execute(db.pool())
         .await
@@ -12624,6 +12627,8 @@ mod regression_tests {
         assert_eq!(rows[1].1, "2026-10-17T00:00:00+00:00");
         assert_eq!(rows[2].1, "2026-10-17T00:00:00+00:00");
         assert!(crate::news::utc_stamp(&rows[3].1).is_some());
+        assert_eq!(rows[4].1, "2026-10-16T18:30:00+00:00");
+        assert_eq!(rows[5].1, "2026-10-16T18:30:00+00:00");
         let unread_after_seen: bool = sqlx::query_scalar(
             "SELECT datetime(published_at) <= datetime('2026-10-17 00:30:00') FROM news_articles WHERE id = 2",
         )

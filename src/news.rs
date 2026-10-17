@@ -409,6 +409,23 @@ pub(crate) fn utc_stamp(raw: &str) -> Option<String> {
     ))
 }
 
+/// Like `utc_stamp`, but a value without a zone is read as UTC: legacy
+/// `fetched_at` came from SQLite `datetime('now')`, whereas a zoneless
+/// `published_at` is Beijing time.
+pub(crate) fn utc_stamp_zoneless_utc(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let zoneless = (16..=19).contains(&raw.len())
+        && raw.is_char_boundary(10)
+        && raw[10..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || matches!(b, b':' | b' ' | b'T' | b't'));
+    if zoneless {
+        utc_stamp(&format!("{raw}+00:00"))
+    } else {
+        utc_stamp(raw)
+    }
+}
+
 type Civil = (i64, u32, u32, u32, u32, u32, i64);
 
 fn num(text: &str) -> Option<u32> {

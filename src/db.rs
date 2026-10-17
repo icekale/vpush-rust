@@ -635,6 +635,7 @@ CREATE TABLE IF NOT EXISTS ima_document_index (
 );
 CREATE INDEX IF NOT EXISTS idx_ima_doc_latest ON ima_document_index(sort_date DESC, name DESC, group_id ASC, media_id ASC);
 CREATE INDEX IF NOT EXISTS idx_ima_doc_group_latest ON ima_document_index(group_id, sort_date DESC, name DESC, media_id ASC);
+CREATE INDEX IF NOT EXISTS idx_ima_doc_pdf_path ON ima_document_index(pdf_path);
 CREATE TABLE IF NOT EXISTS report_extractions (
     group_id TEXT NOT NULL,
     media_id TEXT NOT NULL,
@@ -9161,10 +9162,7 @@ async fn ensure_etf_premium_columns(pool: &SqlitePool) -> Result<(), sqlx::Error
 /// Collision repairs that keep failing stop being retried after this many rounds.
 pub(crate) const IMA_REDOWNLOAD_MAX_ATTEMPTS: i64 = 5;
 
-async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let mut tx = pool.begin().await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO ima_redownload (group_id, media_id)
+const IMA_PDF_COLLISIONS_SQL: &str = "INSERT OR IGNORE INTO ima_redownload (group_id, media_id)
          SELECT d.group_id, d.media_id FROM ima_document_index AS d
          WHERE d.pdf_path != '' AND d.pdf_path NOT LIKE 'ima/%'
            AND d.group_id NOT LIKE 'local-%' AND d.group_id NOT LIKE 'feishu-%'
@@ -9177,10 +9175,20 @@ async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error>
                     OR (o.downloaded_at = d.downloaded_at
                         AND (o.group_id > d.group_id
                              OR (o.group_id = d.group_id AND o.media_id > d.media_id))))
-           )",
+           )";
+
+async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // The self-join below is O(n²) without this index, and create_schema_indexes
+    // only warns on failure, so make sure it exists (or fail) before repairing.
+    sqlx::raw_sql(
+        "CREATE INDEX IF NOT EXISTS idx_ima_doc_pdf_path ON ima_document_index(pdf_path)",
     )
-    .execute(&mut *tx)
+    .execute(pool)
     .await?;
+    let mut tx = pool.begin().await?;
+    sqlx::query(IMA_PDF_COLLISIONS_SQL)
+        .execute(&mut *tx)
+        .await?;
     let cleared = sqlx::query(
         "UPDATE ima_document_index SET pdf_path = ''
          WHERE pdf_path != '' AND pdf_path NOT LIKE 'ima/%'
@@ -12461,6 +12469,87 @@ mod regression_tests {
     }
 
     #[tokio::test]
+    async fn ima_pdf_path_index_is_built_before_collision_repair() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-ima-pdf-index-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::new()
+                    .filename(&path)
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        // A 1.12.281 database: the table and repair queue exist, the index does not.
+        let (tables, _) = split_schema(SCHEMA);
+        sqlx::raw_sql(&tables).execute(&pool).await.unwrap();
+        for (group, media, at) in [
+            ("g1", "m1", "2026-01-01 00:00:00"),
+            ("g2", "m2", "2026-02-01 00:00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO ima_document_index (group_id, media_id, pdf_path, downloaded_at)
+                 VALUES (?, ?, '1114/晨会纪要.pdf', ?)",
+            )
+            .bind(group)
+            .bind(media)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        let index_count = |pool: SqlitePool| async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_ima_doc_pdf_path'
+                   AND tbl_name = 'ima_document_index'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+        assert_eq!(index_count(pool.clone()).await, 0);
+        repair_ima_pdf_collisions(&pool).await.unwrap();
+        assert_eq!(index_count(pool.clone()).await, 1);
+        let plan = sqlx::query(&format!("EXPLAIN QUERY PLAN {IMA_PDF_COLLISIONS_SQL}"))
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        assert!(plan.contains("idx_ima_doc_pdf_path"), "{plan}");
+        let queued: Vec<String> = sqlx::query_scalar("SELECT media_id FROM ima_redownload")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, ["m1"]);
+        pool.close().await;
+
+        // Reopening (including after the index was created by hand in production)
+        // is idempotent and keeps exactly one index with that name.
+        for _ in 0..2 {
+            let db = Db::open(&path).await.unwrap();
+            assert_eq!(index_count(db.pool().clone()).await, 1);
+            let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ima_redownload")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(queued, 1);
+            db.pool().close().await;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
     async fn binding_ids_are_unique_unless_legacy_duplicates_exist() {
         let (db, path) = fresh_db("binding-unique").await;
         let a = add_user(&db, "a").await;
@@ -12540,6 +12629,7 @@ mod regression_tests {
                 "uq_kol_requests_pending",
                 "idx_ima_doc_latest",
                 "idx_ima_doc_group_latest",
+                "idx_ima_doc_pdf_path",
             ] {
                 assert!(indexes.iter().any(|name| name == expected), "{expected}");
             }

@@ -1158,6 +1158,16 @@ pub(crate) fn exchange_calendar_known(market: &str, now: i64) -> bool {
     }
 }
 
+/// Years whose CN table is still the pre-notice estimate (待核对).
+const CN_ESTIMATED_YEARS: &[i32] = &[2027];
+
+/// Whether the closures for `now`'s year come from an official notice; false
+/// for unknown years and for the estimated CN tables.
+pub(crate) fn exchange_calendar_verified(market: &str, now: i64) -> bool {
+    exchange_calendar_known(market, now)
+        && !(market == "cn" && CN_ESTIMATED_YEARS.contains(&to_cn(now).year))
+}
+
 pub(crate) fn regular_session_open(market: &str, now: i64) -> bool {
     let local = if market == "us" {
         to_ny(now)
@@ -1543,6 +1553,12 @@ mod tests {
         let lny = cn_unix("2027-02-08T10:00:00");
         assert!(exchange_calendar_known("cn", lny));
         assert!(exchange_calendar_known("hk", lny));
+        assert!(!exchange_calendar_verified("cn", lny));
+        assert!(exchange_calendar_verified("hk", lny));
+        assert!(exchange_calendar_verified(
+            "cn",
+            cn_unix("2026-10-09T10:00:00")
+        ));
         assert!(!regular_session_open("cn", lny));
         assert!(!regular_session_open("hk", lny));
         assert!(!regular_session_open("cn", cn_unix("2027-10-04T10:00:00")));

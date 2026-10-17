@@ -696,7 +696,8 @@ pub async fn list(db: &Db, user_id: i64) -> Result<Value, WatchlistError> {
         let entry = cached(&instrument.key());
         let quote = entry.as_ref().and_then(|entry| entry.quote.as_ref());
         let error = entry.as_ref().and_then(|entry| entry.error.clone());
-        let calendar_verified = crate::market::exchange_calendar_known(market.as_str(), now / 1000);
+        let calendar_verified =
+            crate::market::exchange_calendar_verified(market.as_str(), now / 1000);
         let status = if error.is_some()
             || quote.is_none()
             || quote.is_some_and(|quote| quote.observed_at_ms > now)

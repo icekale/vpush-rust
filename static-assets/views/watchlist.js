@@ -345,6 +345,13 @@ function alertRuleMarkup(item, rule, label, escapeHtml) {
   </div>`;
 }
 
+// 交易日历是推算值（如 A 股 2027）或年份超出内置表时，休市/开市判断可能有误。
+function calendarHint(item, escapeHtml) {
+  if (item.calendar_verified !== false) return "";
+  const title = "本年交易日历尚未按交易所官方通知核对，节假日可能被误判为开市";
+  return ` · <abbr class="watch-calendar-hint" title="${escapeHtml(title)}">交易日历待核对</abbr>`;
+}
+
 function itemMarkup(item, escapeHtml) {
   const status = item.status || "unavailable";
   const hasPrice = isNumber(item.price) && status !== "unavailable" && status !== "stale";
@@ -363,7 +370,7 @@ function itemMarkup(item, escapeHtml) {
     <div class="watch-quote" data-quote>
       <div class="watch-price"><span class="watch-price-value ${hasPrice ? "" : "is-unavailable"}">${escapeHtml(quoteText)}</span><span class="watch-quote-label">${escapeHtml(item.currency || "--")}</span></div>
       <div class="watch-change ${tone(item.percent)}"><span>${escapeHtml(changeText)}</span><span>涨跌幅</span></div>
-      <div class="watch-state"><span class="watch-status watch-status-${escapeHtml(status)}">${escapeHtml(statusDetail)}</span><span>${escapeHtml(item.quoted_at ? `报价 · ${quoteTime(item.quoted_at)}` : "报价时间未知")}</span></div>
+      <div class="watch-state"><span class="watch-status watch-status-${escapeHtml(status)}">${escapeHtml(statusDetail)}</span><span>${escapeHtml(item.quoted_at ? `报价 · ${quoteTime(item.quoted_at)}` : "报价时间未知")}${calendarHint(item, escapeHtml)}</span></div>
     </div>
     <form class="watch-rules" data-alert-form="${escapeHtml(key)}">
       ${alertRuleMarkup(item, "above", "上穿提醒", escapeHtml)}
@@ -447,7 +454,7 @@ export function createWatchlistView({ api, escapeHtml = escapeFallback, setPageT
     const hasPrice = isNumber(item.price) && status !== "unavailable" && status !== "stale";
     const hasPercent = isNumber(item.percent) && status !== "unavailable" && status !== "stale";
     const statusDetail = item.error && status === "unavailable" ? item.error : statusLabel(status);
-    return `<div class="watch-price"><span class="watch-price-value ${hasPrice ? "" : "is-unavailable"}">${escape(hasPrice ? `${currencyLabel(item.currency)} ${number(item.price, item.tick_size)}` : "--")}</span><span class="watch-quote-label">${escape(item.currency || "--")}</span></div><div class="watch-change ${tone(item.percent)}"><span>${escape(hasPercent ? percent(item.percent) : "--")}</span><span>涨跌幅</span></div><div class="watch-state"><span class="watch-status watch-status-${escape(status)}">${escape(statusDetail)}</span><span>${escape(item.quoted_at ? `报价 · ${quoteTime(item.quoted_at)}` : "报价时间未知")}</span></div>`;
+    return `<div class="watch-price"><span class="watch-price-value ${hasPrice ? "" : "is-unavailable"}">${escape(hasPrice ? `${currencyLabel(item.currency)} ${number(item.price, item.tick_size)}` : "--")}</span><span class="watch-quote-label">${escape(item.currency || "--")}</span></div><div class="watch-change ${tone(item.percent)}"><span>${escape(hasPercent ? percent(item.percent) : "--")}</span><span>涨跌幅</span></div><div class="watch-state"><span class="watch-status watch-status-${escape(status)}">${escape(statusDetail)}</span><span>${escape(item.quoted_at ? `报价 · ${quoteTime(item.quoted_at)}` : "报价时间未知")}${calendarHint(item, escape)}</span></div>`;
   }
 
   function actionIsCurrent(seq, action) {

@@ -2194,8 +2194,9 @@ mod tests {
             .add_kol_request_without_category("xueqiu", "777", applicant.id, "")
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, telegram_chat_id)
+        sqlx::raw_sql(
+            "DROP INDEX idx_users_telegram_chat_id;
+             INSERT INTO users (username, password_hash, is_admin, telegram_chat_id)
              VALUES ('duplicate-admin', 'x', 1, 'duplicate-chat'),
                     ('duplicate-reader', 'x', 0, 'duplicate-chat')",
         )

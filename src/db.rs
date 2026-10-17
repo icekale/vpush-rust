@@ -688,6 +688,7 @@ impl Db {
         ensure_news_admin_columns(&pool).await?;
         ensure_etf_premium_columns(&pool).await?;
         ensure_hot_indexes(&pool).await?;
+        ensure_binding_indexes(&pool).await?;
         repair_ima_pdf_collisions(&pool).await?;
         Ok(Self { pool })
     }
@@ -3033,12 +3034,14 @@ impl Db {
     }
 
     pub async fn user_by_feishu_open_id(&self, open_id: &str) -> Result<Option<User>, sqlx::Error> {
-        let row =
-            sqlx::query("SELECT * FROM users WHERE feishu_open_id = ? AND feishu_open_id != ''")
-                .bind(open_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(user_from_row))
+        let rows = sqlx::query(
+            "SELECT * FROM users WHERE feishu_open_id = ? AND feishu_open_id != '' LIMIT 2",
+        )
+        .bind(open_id)
+        .fetch_all(&self.pool)
+        .await?;
+        // Ambiguous legacy duplicates must not route commands to an arbitrary account.
+        Ok((rows.len() == 1).then(|| user_from_row(rows.into_iter().next().unwrap())))
     }
 
     pub async fn upsert_feishu_identity(
@@ -3473,6 +3476,10 @@ impl Db {
             }
             sqlx::query("INSERT INTO news_seen (user_id, seen_at) SELECT ?, seen_at FROM news_seen WHERE user_id = ? ON CONFLICT(user_id) DO UPDATE SET seen_at = MAX(news_seen.seen_at, excluded.seen_at)")
                 .bind(user_id).bind(owner).execute(&mut *tx).await?;
+            sqlx::query("UPDATE users SET telegram_chat_id = '' WHERE id = ?")
+                .bind(owner)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("UPDATE users SET telegram_chat_id = ?, news_last_seen_at = MAX(news_last_seen_at, (SELECT news_last_seen_at FROM users WHERE id = ?)) WHERE id = ?")
                 .bind(identity).bind(owner).bind(user_id).execute(&mut *tx).await?;
             sqlx::query(
@@ -8867,6 +8874,37 @@ async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// Unique partial indexes for push binding IDs. Legacy databases might already
+/// hold duplicates; those are left untouched (the index is skipped with a
+/// warning) so no user silently loses a binding during an upgrade.
+async fn ensure_binding_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    for (column, index) in [
+        ("telegram_chat_id", "idx_users_telegram_chat_id"),
+        ("feishu_open_id", "idx_users_feishu_open_id"),
+    ] {
+        let duplicates: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM (SELECT {column} FROM users WHERE {column} != ''
+             GROUP BY {column} HAVING COUNT(*) > 1)"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if duplicates > 0 {
+            tracing::warn!(
+                column,
+                duplicates,
+                "存在重复绑定，暂不建立唯一索引，请在后台解绑重复项"
+            );
+            continue;
+        }
+        sqlx::raw_sql(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON users({column}) WHERE {column} != ''"
+        ))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn ensure_hot_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         "CREATE INDEX IF NOT EXISTS idx_push_logs_post ON push_logs(post_id, channel, user_id);
@@ -11189,7 +11227,8 @@ mod tests {
                 .id,
             id
         );
-        sqlx::query("INSERT INTO users (username, telegram_chat_id) VALUES ('duplicate1', 'shared'), ('duplicate2', 'shared')")
+        sqlx::raw_sql("DROP INDEX idx_users_telegram_chat_id;
+             INSERT INTO users (username, telegram_chat_id) VALUES ('duplicate1', 'shared'), ('duplicate2', 'shared')")
             .execute(db.pool()).await.unwrap();
         let (code, _) = db.issue_bind_code(target, 6600).await.unwrap();
         assert!(matches!(
@@ -12056,6 +12095,36 @@ mod regression_tests {
                 .await
                 .unwrap();
         assert_eq!(kept, "1114/晨会纪要.pdf");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn binding_ids_are_unique_unless_legacy_duplicates_exist() {
+        let (db, path) = fresh_db("binding-unique").await;
+        let a = add_user(&db, "a").await;
+        let b = add_user(&db, "b").await;
+        sqlx::query("UPDATE users SET telegram_chat_id = '7' WHERE id = ?")
+            .bind(a)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("UPDATE users SET telegram_chat_id = '7' WHERE id = ?")
+                .bind(b)
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        sqlx::raw_sql(
+            "DROP INDEX idx_users_feishu_open_id;
+             UPDATE users SET feishu_open_id = 'ou_dup';",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        assert!(db.user_by_feishu_open_id("ou_dup").await.unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

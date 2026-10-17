@@ -179,7 +179,7 @@ struct WechatIn {
     invite_code: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct MeUpdate {
     telegram_chat_id: Option<String>,
     telegram_bot_token: Option<String>,
@@ -5502,6 +5502,29 @@ async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result
         .telegram_bot_token
         .as_ref()
         .is_some_and(|value| !masked_secret(value.trim()));
+    // Chat/open IDs are only ever set by the bind-code flows (or the bot token
+    // resolver); the profile endpoint may clear them or echo the current value.
+    let bound_ids = [
+        (
+            (!replacing_token)
+                .then_some(&body.telegram_chat_id)
+                .and_then(Option::as_ref),
+            &user.telegram_chat_id,
+        ),
+        (body.feishu_open_id.as_ref(), &user.feishu_open_id),
+        (body.feishu_chat_id.as_ref(), &user.feishu_chat_id),
+    ];
+    for (requested, current) in bound_ids {
+        if let Some(value) = requested {
+            let value = value.trim();
+            if !value.is_empty() && value != current.trim() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "请通过绑定码完成绑定，这里只能解绑",
+                ));
+            }
+        }
+    }
     if !replacing_token {
         if let Some(value) = &body.telegram_chat_id {
             let value = value.trim();
@@ -8409,5 +8432,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn profile_update_cannot_claim_push_identities() {
+        let path =
+            std::env::temp_dir().join(format!("vpush-m1-{}-{}.db", std::process::id(), now_secs()));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        sqlx::query("UPDATE users SET telegram_chat_id = '42', feishu_open_id = 'ou_me'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "test-secret".into(),
+            allow_register: false,
+            static_dir: path.clone(),
+            fails: new_login_limit(),
+        };
+        for update in [
+            MeUpdate {
+                telegram_chat_id: Some("-100999".into()),
+                ..MeUpdate::default()
+            },
+            MeUpdate {
+                feishu_open_id: Some("ou_victim".into()),
+                ..MeUpdate::default()
+            },
+            MeUpdate {
+                feishu_chat_id: Some("oc_group".into()),
+                ..MeUpdate::default()
+            },
+        ] {
+            let err = apply_profile(&state, &user, &update).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+        apply_profile(
+            &state,
+            &user,
+            &MeUpdate {
+                telegram_chat_id: Some(" 42 ".into()),
+                feishu_open_id: Some(String::new()),
+                ..MeUpdate::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.detail));
+        let saved = state.db.user_by_id(user.id).await.unwrap().unwrap();
+        assert_eq!(saved.telegram_chat_id, "42");
+        assert_eq!(saved.feishu_open_id, "");
+        let _ = std::fs::remove_file(&path);
     }
 }

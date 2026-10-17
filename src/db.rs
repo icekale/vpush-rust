@@ -3775,16 +3775,26 @@ impl Db {
             .is_some())
     }
 
-    pub async fn push_targets(&self, kol_id: i64) -> Result<Vec<PushTarget>, sqlx::Error> {
+    /// 只返回订阅类型匹配、且没有把该 KOL 设为"次要"（特别关注除外）的订阅者，
+    /// 与 `should_push` 的闸门条件一致。
+    pub async fn push_targets(
+        &self,
+        kol_id: i64,
+        post_type: &str,
+    ) -> Result<Vec<PushTarget>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT s.user_id, u.notify_enabled, u.push_channels, u.dnd_start, u.dnd_end,
                     u.dnd_allow_favorite, u.wecom_webhook, u.bark_key,
                     u.telegram_chat_id, u.telegram_bot_token, s.favorite
              FROM subscriptions s
              JOIN users u ON u.id = s.user_id
-             WHERE s.kol_id = ?",
+             JOIN kols k ON k.id = s.kol_id
+             WHERE s.kol_id = ?
+               AND s.type IN (?, 'both', 'all')
+               AND (s.favorite = 1 OR (k.secondary = 0 AND s.secondary = 0))",
         )
         .bind(kol_id)
+        .bind(post_type)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -6592,7 +6602,7 @@ impl Db {
             "SELECT 1 FROM subscriptions s
              JOIN kols k ON k.id = s.kol_id
              WHERE s.kol_id = ?
-               AND (s.type = 'all' OR s.type = ?)
+               AND s.type IN (?, 'both', 'all')
                AND (s.favorite = 1 OR (k.secondary = 0 AND s.secondary = 0))
              LIMIT 1",
         )
@@ -9599,7 +9609,7 @@ mod tests {
             .await
             .unwrap();
         db.subscribe(user.id, true, kol, "post").await.unwrap();
-        let targets = db.push_targets(kol).await.unwrap();
+        let targets = db.push_targets(kol, "post").await.unwrap();
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].notify_enabled);
         assert!(targets[0].wecom_webhook.contains("qyapi"));
@@ -11774,5 +11784,84 @@ mod tests {
             total += n;
         }
         total
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    async fn fresh_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-{tag}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (Db::open(&path).await.unwrap(), path)
+    }
+
+    async fn add_user(db: &Db, name: &str) -> i64 {
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES (?, 'x')")
+            .bind(name)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.user_by_username(name).await.unwrap().unwrap().id
+    }
+
+    #[tokio::test]
+    async fn both_subscribers_open_the_gate_and_fanout_filters_per_user() {
+        let (db, path) = fresh_db("push-both").await;
+        let kol = db
+            .add_kol("xueqiu", "甲", "both-1", None, false, false, false)
+            .await
+            .unwrap();
+        let both = add_user(&db, "both").await;
+        db.subscribe(both, true, kol, "both").await.unwrap();
+        assert!(db.should_push(kol, "post").await.unwrap());
+        assert!(db.should_push(kol, "reply").await.unwrap());
+
+        let reply_only = add_user(&db, "reply_only").await;
+        db.subscribe(reply_only, true, kol, "reply").await.unwrap();
+        let side = add_user(&db, "side").await;
+        db.subscribe(side, true, kol, "post").await.unwrap();
+        db.set_secondary(side, kol, true).await.unwrap();
+        let side_fav = add_user(&db, "side_fav").await;
+        db.subscribe(side_fav, true, kol, "post").await.unwrap();
+        db.set_secondary(side_fav, kol, true).await.unwrap();
+        db.set_favorite(side_fav, kol, true).await.unwrap();
+
+        let ids = |targets: Vec<PushTarget>| {
+            let mut ids: Vec<i64> = targets.iter().map(|t| t.user_id).collect();
+            ids.sort();
+            ids
+        };
+        let mut want_post = vec![both, side_fav];
+        want_post.sort();
+        assert_eq!(ids(db.push_targets(kol, "post").await.unwrap()), want_post);
+        let mut want_reply = vec![both, reply_only];
+        want_reply.sort();
+        assert_eq!(
+            ids(db.push_targets(kol, "reply").await.unwrap()),
+            want_reply
+        );
+
+        let quiet = db
+            .add_kol("xueqiu", "乙", "both-2", None, false, true, false)
+            .await
+            .unwrap();
+        db.subscribe(both, true, quiet, "both").await.unwrap();
+        assert!(!db.should_push(quiet, "post").await.unwrap());
+        assert!(db.push_targets(quiet, "post").await.unwrap().is_empty());
+        db.set_favorite(both, quiet, true).await.unwrap();
+        assert!(db.should_push(quiet, "post").await.unwrap());
+        assert_eq!(
+            ids(db.push_targets(quiet, "post").await.unwrap()),
+            vec![both]
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

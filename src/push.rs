@@ -216,7 +216,7 @@ pub(crate) async fn hold_push_slot() -> tokio::sync::SemaphorePermit<'static> {
 }
 
 pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
-    let targets = match db.push_targets(kol_id).await {
+    let targets = match db.push_targets(kol_id, note.post_type).await {
         Ok(targets) => targets,
         Err(err) => {
             tracing::warn!(kol = kol_id, "读取推送对象失败: {err}");
@@ -3874,7 +3874,7 @@ mod tests {
             url: "https://example.test/post",
             published_at: "2026-01-01 00:00",
         };
-        let targets = db.push_targets(kol_id).await.unwrap();
+        let targets = db.push_targets(kol_id, "post").await.unwrap();
         assert_eq!(targets.len(), 1);
         assert!(targets[0].notify_enabled);
         assert!(targets[0].telegram_chat_id.is_empty());

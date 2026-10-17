@@ -67,6 +67,10 @@ self.addEventListener("fetch", (e) => {
     e.respondWith(networkFirstNavigate(e.request));
     return;
   }
+  if (FINGERPRINTED.test(url.pathname)) {
+    e.respondWith(cacheFirst(e.request));
+    return;
+  }
   e.respondWith(networkFirst(e.request));
 });
 
@@ -112,6 +116,15 @@ async function networkFirstNavigate(req) {
   return (await caches.match("/")) || Response.error();
 }
 
+// 带 12 位内容 hash 的路径内容永不变：命中缓存直接用，不必每次冷启动全量重下
+const FINGERPRINTED = /\.[0-9a-f]{12}\.(?:js|css)$/;
+
+async function cacheFirst(req) {
+  const cached = await caches.match(req, { ignoreSearch: true });
+  if (cached) return cached;
+  return networkFirst(req);
+}
+
 async function networkFirst(req) {
   let fresh;
   try {
@@ -121,6 +134,11 @@ async function networkFirst(req) {
   } catch {
     const cached = await caches.match(req, { ignoreSearch: true });
     return cached || Response.error();
+  }
+  if (fresh && !fresh.ok) {
+    // 5xx / 404（如发版瞬间）时有旧缓存就先用旧的，避免把错误页当模块执行
+    const cached = await caches.match(req, { ignoreSearch: true });
+    if (cached) return cached;
   }
   if (fresh && fresh.ok && fresh.type === "basic") {
     // 后台写缓存：Cache.put 对 206（大文件 Range）等响应会抛错，

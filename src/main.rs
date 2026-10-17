@@ -6847,8 +6847,28 @@ async fn static_or_spa(State(state): State<AppState>, req: Request<Body>) -> Res
         return StatusCode::NOT_FOUND.into_response();
     }
     let head = req.method() == axum::http::Method::HEAD;
-    if let Some((path, fingerprinted, bytes)) = load_static(&state.static_dir, rel, !head).await {
-        return file_response(&path, fingerprinted, head, bytes);
+    if let Some(found) = load_static(&state.static_dir, rel, !head).await {
+        let not_modified = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|tag| tag.trim() == found.etag || tag.trim() == "*")
+            });
+        let mut res = if not_modified {
+            let mut res = file_response(&found.path, found.fingerprinted, true, Vec::new());
+            *res.status_mut() = StatusCode::NOT_MODIFIED;
+            res.headers_mut().remove(header::CONTENT_TYPE);
+            res
+        } else {
+            file_response(&found.path, found.fingerprinted, head, found.bytes)
+        };
+        if let Ok(etag) = found.etag.parse() {
+            res.headers_mut().insert(header::ETAG, etag);
+        }
+        return res;
     }
     let first = rel.split('/').next().unwrap_or("");
     if rel.is_empty() || SPA.contains(&first) {
@@ -6863,7 +6883,14 @@ async fn static_or_spa(State(state): State<AppState>, req: Request<Body>) -> Res
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf, bool, Vec<u8>)> {
+struct StaticFile {
+    path: PathBuf,
+    fingerprinted: bool,
+    bytes: Vec<u8>,
+    etag: String,
+}
+
+async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<StaticFile> {
     if rel.is_empty() {
         return None;
     }
@@ -6874,15 +6901,27 @@ async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf
         .ok()?
 }
 
-fn resolve_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf, bool, Vec<u8>)> {
+fn resolve_static(root: &Path, rel: &str, read_body: bool) -> Option<StaticFile> {
     let direct = root.join(rel);
     if direct.is_file() && inside(root, &direct) {
+        let meta = std::fs::metadata(&direct).ok()?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
         let bytes = if read_body {
             std::fs::read(&direct).ok()?
         } else {
             Vec::new()
         };
-        return Some((direct, false, bytes));
+        return Some(StaticFile {
+            path: direct,
+            fingerprinted: false,
+            bytes,
+            etag: format!("W/\"{:x}-{modified:x}\"", meta.len()),
+        });
     }
     let logical = unhash(rel)?;
     let path = root.join(&logical);
@@ -6894,7 +6933,12 @@ fn resolve_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf, b
     if !digest.starts_with(hashed) {
         return None;
     }
-    Some((path, true, bytes))
+    Some(StaticFile {
+        path,
+        fingerprinted: true,
+        bytes,
+        etag: format!("\"{}\"", &digest[..16]),
+    })
 }
 
 type DigestCache = HashMap<PathBuf, (std::time::SystemTime, u64, String)>;
@@ -8809,5 +8853,51 @@ mod tests {
         maybe_prune_login_limit(&mut limit, now);
         assert!(limit.hits.len() <= LOGIN_LIMIT_CAP);
         assert!(limit.hits.contains_key("ip:hot"));
+    }
+
+    #[tokio::test]
+    async fn static_assets_answer_conditional_requests_with_304() {
+        let dir =
+            std::env::temp_dir().join(format!("vpush-etag-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        std::fs::write(dir.join("static/app.js"), b"console.log(2)").unwrap();
+        std::fs::write(dir.join("static/logo.svg"), b"<svg/>").unwrap();
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        let app = router(AppState {
+            db,
+            secret: "test-secret".into(),
+            allow_register: false,
+            static_dir: dir.join("static"),
+            fails: new_login_limit(),
+        });
+        let digest = hex::encode(Sha256::digest(b"console.log(2)"));
+        for uri in [
+            format!("/app.{}.js", &digest[..12]),
+            "/logo.svg".to_string(),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            let etag = res.headers().get(header::ETAG).unwrap().clone();
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::IF_NONE_MATCH, etag.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_MODIFIED, "{uri}");
+            assert_eq!(res.headers().get(header::ETAG), Some(&etag));
+            assert!(to_bytes(res.into_body(), 1024).await.unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

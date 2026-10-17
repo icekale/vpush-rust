@@ -49,11 +49,14 @@ pub fn spawn_shared(db: Db) {
         let app_id = app_id.clone();
         let secret = secret.clone();
         async move {
+            let mut backoff = Backoff::default();
             loop {
+                let started = std::time::Instant::now();
                 if let Err(err) = run_shared(&db, &app_id, &secret).await {
                     tracing::warn!("飞书共享机器人将重试: {err}");
                 }
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                backoff.after_attempt(started.elapsed());
+                tokio::time::sleep(backoff.next_delay()).await;
             }
         }
     });
@@ -100,14 +103,16 @@ async fn run_shared(db: &Db, app_id: &str, secret: &str) -> Result<(), String> {
             _ => continue,
         };
         let (reply, outgoing) = handle_shared_frame(db, &bytes, now_secs()).await?;
-        if let Some((chat_id, text)) = outgoing {
-            crate::feishu::send_shared_text(&chat_id, &text).await?;
-        }
         if let Some(reply) = reply {
             socket
                 .send(Message::Binary(reply.into()))
                 .await
                 .map_err(|err| err.to_string())?;
+        }
+        if let Some((chat_id, text)) = outgoing {
+            if let Err(err) = crate::feishu::send_shared_text(&chat_id, &text).await {
+                tracing::warn!("飞书共享机器人回复失败 {chat_id}: {err}");
+            }
         }
     }
 }
@@ -125,6 +130,7 @@ pub async fn resume(db: Db) {
 }
 
 async fn run(db: &Db, session_id: &str) -> Result<(), String> {
+    let mut backoff = Backoff::default();
     loop {
         let Some(session) = db
             .feishu_session(session_id)
@@ -158,6 +164,7 @@ async fn run(db: &Db, session_id: &str) -> Result<(), String> {
         } else {
             "https://open.feishu.cn"
         };
+        let started = std::time::Instant::now();
         let endpoint = tokio::task::spawn_blocking({
             let app_id = app_id.to_string();
             let secret = secret.to_string();
@@ -165,12 +172,18 @@ async fn run(db: &Db, session_id: &str) -> Result<(), String> {
             move || fetch_endpoint(&domain, &app_id, &secret)
         })
         .await
-        .map_err(|err| err.to_string())??;
-        match serve(db, session_id, &endpoint, &app_id, &secret, &brand).await {
+        .map_err(|err| err.to_string())
+        .and_then(|result| result);
+        let result = match endpoint {
+            Ok(endpoint) => serve(db, session_id, &endpoint, &app_id, &secret, &brand).await,
+            Err(err) => Err(format!("获取长连接地址失败: {err}")),
+        };
+        match result {
             Ok(()) => return Ok(()),
             Err(err) => {
                 tracing::warn!("飞书长连接将重试 {session_id}: {err}");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                backoff.after_attempt(started.elapsed());
+                tokio::time::sleep(backoff.next_delay()).await;
             }
         }
     }
@@ -234,10 +247,11 @@ async fn serve(
             session_id,
             &bytes,
             now_secs(),
-            move |_, _, chat, host| send_notice(&app_id, &secret, chat, host, &brand),
+            move |_, _, chat, host| {
+                tokio::task::block_in_place(|| send_notice(&app_id, &secret, chat, host, &brand))
+            },
         )
-        .await
-        .map_err(|err| err.to_string())?;
+        .await?;
         if let Some(reply) = reply {
             socket
                 .send(Message::Binary(reply.into()))
@@ -294,9 +308,11 @@ where
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if let Some(code) = feishu_personal::parse_bind_code(&text) {
-                    accept_bind(db, session_id, code, sender, chat_id, now, send_test)
-                        .await
-                        .map_err(|err| format!("{err:?}"))?;
+                    if let Err(err) =
+                        accept_bind(db, session_id, code, sender, chat_id, now, send_test).await
+                    {
+                        tracing::warn!("飞书绑定处理失败 {session_id}: {err:?}");
+                    }
                 }
             }
         }
@@ -310,6 +326,39 @@ where
 }
 
 static SEEN: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Reconnect delay: doubles from 5s up to 5min, with ±20% jitter so many
+/// listeners do not reconnect in lockstep. A connection that stayed up for a
+/// while resets it.
+#[derive(Default)]
+struct Backoff {
+    failures: u32,
+}
+
+impl Backoff {
+    const BASE_SECS: u64 = 5;
+    const MAX_SECS: u64 = 300;
+    const HEALTHY: Duration = Duration::from_secs(120);
+
+    fn after_attempt(&mut self, lasted: Duration) {
+        if lasted >= Self::HEALTHY {
+            self.failures = 0;
+        }
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    fn base_delay(&self) -> Duration {
+        let exp = self.failures.saturating_sub(1).min(10);
+        Duration::from_secs((Self::BASE_SECS << exp).min(Self::MAX_SECS))
+    }
+
+    fn next_delay(&self) -> Duration {
+        use rand::Rng;
+        let base = self.base_delay().as_millis() as u64;
+        let spread = base / 5;
+        Duration::from_millis(base - spread + rand::thread_rng().gen_range(0..=spread * 2))
+    }
+}
 
 pub async fn handle_shared_frame(
     db: &Db,
@@ -326,10 +375,14 @@ pub async fn handle_shared_frame(
         .and_then(Value::as_str)
         .unwrap_or("")
     {
-        "im.message.receive_v1" => shared_message(db, &payload, now).await?,
-        "card.action.trigger" => shared_card(db, &payload, now).await?,
-        _ => None,
-    };
+        "im.message.receive_v1" => shared_message(db, &payload, now).await,
+        "card.action.trigger" => shared_card(db, &payload, now).await,
+        _ => Ok(None),
+    }
+    .unwrap_or_else(|err| {
+        tracing::warn!("飞书共享机器人事件处理失败: {err}");
+        None
+    });
     frame.headers.push(Header {
         key: "biz_rt".into(),
         value: "1".into(),
@@ -914,5 +967,42 @@ mod tests {
         let mut index = 0;
         assert_eq!(read_bytes(&[2, b'o', b'k'], &mut index).unwrap(), b"ok");
         assert_eq!(index, 3);
+    }
+
+    #[tokio::test]
+    async fn business_errors_are_acked_instead_of_dropping_the_connection() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.pool().close().await;
+        let frame = text_event("om_broken_db", "ou_x", "oc_x", "p2p", "/help");
+        let (reply, outgoing) = handle_shared_frame(&db, &frame, 1_000).await.unwrap();
+        assert!(outgoing.is_none());
+        let ack = decode_frame(&reply.expect("ack")).unwrap();
+        assert_eq!(ack.payload, br#"{"code":200}"#);
+        assert_eq!(header(&ack, "biz_rt"), "1");
+
+        let bind = text_event("om_bind_broken", "ou_x", "oc_x", "p2p", "123456");
+        let reply = handle_frame(&db, "session", &bind, 1_000, |_, _, _, _| Ok(()))
+            .await
+            .unwrap();
+        let ack = decode_frame(&reply.expect("ack")).unwrap();
+        assert_eq!(ack.payload, br#"{"code":200}"#);
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_caps_and_resets_after_a_healthy_run() {
+        let mut backoff = Backoff::default();
+        let quick = Duration::from_secs(1);
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            backoff.after_attempt(quick);
+            delays.push(backoff.base_delay().as_secs());
+        }
+        assert_eq!(delays, [5, 10, 20, 40, 80, 160, 300, 300]);
+        for _ in 0..50 {
+            let jittered = backoff.next_delay().as_secs_f64();
+            assert!((240.0..=360.0).contains(&jittered), "{jittered}");
+        }
+        backoff.after_attempt(Duration::from_secs(600));
+        assert_eq!(backoff.base_delay().as_secs(), 5);
     }
 }

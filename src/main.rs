@@ -5233,6 +5233,7 @@ async fn llm_test(
     Json(body): Json<LlmForm>,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_user(&state, &headers).await?;
+    throttle_user(&state, "llm-test", user.id, 10)?;
     let started = std::time::Instant::now();
     let cfg = llm_config(&user, &body)?;
     let key = cfg.key.clone();
@@ -5892,10 +5893,13 @@ async fn change_password(
     if body.new_password.len() > auth::PASSWORD_MAX {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "新密码最长128位"));
     }
-    if !user.password_hash.is_empty()
-        && !verify_password_off(body.old_password.clone(), user.password_hash.clone()).await
-    {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "原密码错误"));
+    if !user.password_hash.is_empty() {
+        let bucket = format!("uid:{}", user.id);
+        admit_password_attempt(&state, &bucket, &user.username).await?;
+        if !verify_password_off(body.old_password.clone(), user.password_hash.clone()).await {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "原密码错误"));
+        }
+        release_login_success(&state, &bucket, &user.username);
     }
     let hash = hash_password_off(body.new_password.clone()).await?;
     state
@@ -6374,6 +6378,7 @@ async fn attach_ip(mut req: Request<Body>, next: Next) -> Response {
             .headers()
             .get("x-real-ip")
             .and_then(|value| value.to_str().ok());
+        warn_untrusted_proxy(peer, !forwarded.is_empty() || real_ip.is_some());
         client_ip::resolve_client_ip(
             peer,
             &forwarded,
@@ -6384,6 +6389,28 @@ async fn attach_ip(mut req: Request<Body>, next: Next) -> Response {
     };
     req.extensions_mut().insert(ClientIp(ip));
     next.run(req).await
+}
+
+/// A private-network peer sending forwarding headers is almost certainly the
+/// reverse proxy; if it is not trusted every visitor collapses onto its IP and
+/// a handful of failed logins locks out the whole site.
+fn warn_untrusted_proxy(peer: Option<std::net::IpAddr>, forwarded: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(peer) = peer else { return };
+    let private = match peer {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    };
+    if forwarded
+        && private
+        && !trusted_proxy_nets().iter().any(|net| net.contains(peer))
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            %peer,
+            "反向代理地址不在 TRUSTED_PROXIES 内，转发头被忽略，所有访客会共用同一个限流 IP"
+        );
+    }
 }
 
 fn trusted_proxy_nets() -> &'static [client_ip::Net] {
@@ -6464,8 +6491,22 @@ fn account_token(account: &str) -> Option<String> {
     )))
 }
 
+/// IPv6 clients usually control a whole /64, so the limiter buckets them by
+/// prefix; anything else (IPv4, unparsable test labels) is kept verbatim.
+fn limit_ip_key(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.to_ipv4_mapped().unwrap().to_string(),
+        _ => ip.to_string(),
+    }
+}
+
 fn login_keys(ip: &str, account: &str) -> LoginKeys {
     let token = account_token(account);
+    let ip = limit_ip_key(ip);
     LoginKeys {
         ip: format!("ip:{ip}"),
         pair: token.as_ref().map(|token| format!("pair:{ip}:{token}")),
@@ -6607,6 +6648,27 @@ fn reserve_account_limited(limit: &mut LoginLimit, ip: &str, account: &str, now:
         hits.push(now);
     }
     true
+}
+
+/// Sliding-window cap for expensive per-user actions (outbound probes,
+/// third-party lookups), sharing the login limiter's map and window.
+fn throttle_user(state: &AppState, action: &str, user_id: i64, max: usize) -> Result<(), ApiError> {
+    let now = now_secs();
+    let mut limit = state.fails.lock().expect("login limit");
+    maybe_prune_login_limit(&mut limit, now);
+    let hits = limit
+        .hits
+        .entry(format!("act:{action}:{user_id}"))
+        .or_default();
+    hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
+    if hits.len() >= max {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "操作太频繁，请稍后再试",
+        ));
+    }
+    hits.push(now);
+    Ok(())
 }
 
 fn login_limited_error() -> ApiError {
@@ -8484,5 +8546,94 @@ mod tests {
         assert_eq!(saved.telegram_chat_id, "42");
         assert_eq!(saved.feishu_open_id, "");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ipv6_clients_share_a_limiter_bucket_per_64() {
+        assert_eq!(
+            limit_ip_key("2001:db8:1:2:aaaa::1"),
+            limit_ip_key("2001:db8:1:2:ffff:ffff:ffff:fffe")
+        );
+        assert_ne!(
+            limit_ip_key("2001:db8:1:2::1"),
+            limit_ip_key("2001:db8:1:3::1")
+        );
+        assert_eq!(limit_ip_key("::ffff:1.2.3.4"), "1.2.3.4");
+        assert_eq!(limit_ip_key("1.2.3.4"), "1.2.3.4");
+        let mut limit = LoginLimit::default();
+        for n in 0..LOGIN_MAX_FAILURES {
+            assert!(reserve_limited(
+                &mut limit,
+                &format!("2001:db8::{n:x}"),
+                "victim",
+                1_000
+            ));
+        }
+        assert!(!reserve_limited(
+            &mut limit,
+            "2001:db8::ffff",
+            "victim",
+            1_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn password_change_and_llm_probe_are_rate_limited() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin(&auth::hash_password("correct-horse-1", None))
+            .await
+            .unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "pw-test".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let bearer = format!(
+            "Bearer {}",
+            auth::create_token(
+                admin.id,
+                &admin.username,
+                &state.secret,
+                admin.token_version,
+                now_secs(),
+                &admin.created_at,
+            )
+        );
+        let app = router(state.clone());
+        let attempt = |app: axum::Router, bearer: String| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/me/password")
+                    .header(header::AUTHORIZATION, bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"old_password":"wrong-guess-0","new_password":"another-pass-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        for _ in 0..LOGIN_MAX_FAILURES {
+            assert_eq!(
+                attempt(app.clone(), bearer.clone()).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            attempt(app.clone(), bearer.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        for _ in 0..10 {
+            throttle_user(&state, "llm-test", admin.id, 10)
+                .unwrap_or_else(|err| panic!("{}", err.detail));
+        }
+        assert!(throttle_user(&state, "llm-test", admin.id, 10).is_err());
+        assert!(throttle_user(&state, "llm-test", admin.id + 1, 10).is_ok());
     }
 }

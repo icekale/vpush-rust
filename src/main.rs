@@ -6766,6 +6766,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The frontend still relies on inline `on*=` handlers, so the enforced policy
+/// keeps `'unsafe-inline'`; `CSP_STRICT_REPORT_ONLY=1` additionally sends the
+/// strict variant as report-only to surface what still needs migrating.
+fn content_security_policy(allow_inline: bool) -> String {
+    let inline = if allow_inline { " 'unsafe-inline'" } else { "" };
+    format!(
+        "default-src 'self'; script-src 'self'{inline} https://challenges.cloudflare.com; style-src 'self'{inline}; img-src 'self' data: blob: https:; connect-src 'self' https://challenges.cloudflare.com https://icekale.github.io; frame-src 'self' blob: https://challenges.cloudflare.com; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+}
+
+fn strict_csp_report_only() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("CSP_STRICT_REPORT_ONLY")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 async fn security_headers(req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let mut res = next.run(req).await;
@@ -6775,10 +6799,14 @@ async fn security_headers(req: Request<Body>, next: Next) -> Response {
     headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https://challenges.cloudflare.com https://jinleiviva.github.io https://icekale.github.io; frame-src 'self' blob: https://challenges.cloudflare.com; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-            .parse()
-            .unwrap(),
+        content_security_policy(true).parse().unwrap(),
     );
+    if strict_csp_report_only() {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY_REPORT_ONLY,
+            content_security_policy(false).parse().unwrap(),
+        );
+    }
     if path == "/news"
         || path.starts_with("/news/")
         || path == "/api/news"
@@ -8738,5 +8766,16 @@ mod tests {
         let (changed, _) = static_digest(&file, false).unwrap();
         assert_eq!(changed, hex::encode(Sha256::digest(b"second")));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csp_drops_unused_origins_and_has_a_strict_variant() {
+        let enforced = content_security_policy(true);
+        assert!(enforced.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(!enforced.contains("jinleiviva"));
+        assert!(enforced.contains("https://icekale.github.io"));
+        let strict = content_security_policy(false);
+        assert!(!strict.contains("unsafe-inline"));
+        assert!(strict.contains("frame-ancestors 'none'"));
     }
 }

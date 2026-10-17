@@ -21,6 +21,7 @@ NIGdfITwmiBmS+R1Mr8P/ssNq0ptvr9+VqUvsJD7ASVCPo9EG658fZYGil6oH5JN\n\
 OQIDAQAB\n\
 -----END PUBLIC KEY-----\n";
 
+#[derive(Clone)]
 pub struct File {
     pub media_id: String,
     pub name: String,

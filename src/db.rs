@@ -688,6 +688,7 @@ impl Db {
         ensure_news_admin_columns(&pool).await?;
         ensure_etf_premium_columns(&pool).await?;
         ensure_hot_indexes(&pool).await?;
+        repair_ima_pdf_collisions(&pool).await?;
         Ok(Self { pool })
     }
 
@@ -890,6 +891,18 @@ impl Db {
                 .fetch_one(&self.pool)
                 .await?;
         Ok(n > 0)
+    }
+
+    /// 以前下载过、但因路径碰撞被清掉 `pdf_path` 的条目，不受"最近 3 天"窗口限制，需要重下。
+    pub async fn ima_redownload_ids(&self, group_id: &str) -> Result<HashSet<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT media_id FROM ima_document_index
+             WHERE group_id = ? AND pdf_path = '' AND downloaded_at != ''",
+        )
+        .bind(group_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
     }
 
     /// 已经下载过 PDF 的 media_id，用来跳过重复下载。
@@ -8824,6 +8837,36 @@ async fn ensure_etf_premium_columns(pool: &SqlitePool) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// 旧版 IMA PDF 落盘为 `MMDD/标题`，不同库或不同年份的同名研报会互相覆盖。
+/// 对仍指向同一旧路径的多行，只保留最后写入的那一行（文件内容属于它），其余清空
+/// `pdf_path` 让下一轮同步按新路径重下。可重复执行。
+async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let cleared = sqlx::query(
+        "UPDATE ima_document_index AS d
+         SET pdf_path = '',
+             downloaded_at = CASE WHEN d.downloaded_at = '' THEN datetime('now') ELSE d.downloaded_at END
+         WHERE d.pdf_path != '' AND d.pdf_path NOT LIKE 'ima/%'
+           AND d.group_id NOT LIKE 'local-%' AND d.group_id NOT LIKE 'feishu-%'
+           AND EXISTS (
+             SELECT 1 FROM ima_document_index o
+             WHERE o.pdf_path = d.pdf_path
+               AND o.group_id NOT LIKE 'local-%' AND o.group_id NOT LIKE 'feishu-%'
+               AND (o.group_id != d.group_id OR o.media_id != d.media_id)
+               AND (o.downloaded_at > d.downloaded_at
+                    OR (o.downloaded_at = d.downloaded_at
+                        AND (o.group_id > d.group_id
+                             OR (o.group_id = d.group_id AND o.media_id > d.media_id))))
+           )",
+    )
+    .execute(pool)
+    .await?
+    .rows_affected();
+    if cleared > 0 {
+        tracing::warn!(cleared, "IMA PDF 旧路径存在碰撞，已清空待重新下载");
+    }
+    Ok(())
+}
+
 async fn ensure_hot_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         "CREATE INDEX IF NOT EXISTS idx_push_logs_post ON push_logs(post_id, channel, user_id);
@@ -11960,6 +12003,59 @@ mod regression_tests {
         assert!(db.has_post("xueqiu", "fresh").await.unwrap());
         assert!(!db.has_post("xueqiu", "never").await.unwrap());
         assert!(!db.has_post("weibo", "pinned").await.unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn colliding_legacy_ima_pdf_paths_are_cleared_for_redownload() {
+        let (db, path) = fresh_db("ima-collide").await;
+        for (group, media, pdf, at) in [
+            ("g1", "m1", "1114/晨会纪要.pdf", "2026-01-01 00:00:00"),
+            ("g2", "m2", "1114/晨会纪要.pdf", "2026-02-01 00:00:00"),
+            ("local-x", "m3", "1114/晨会纪要.pdf", "2026-03-01 00:00:00"),
+            ("g3", "m4", "0101/独有.pdf", "2026-01-01 00:00:00"),
+            ("g4", "m5", "ima/g4/2026/0101/m5.pdf", "2026-01-01 00:00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO ima_document_index (group_id, media_id, pdf_path, downloaded_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(group)
+            .bind(media)
+            .bind(pdf)
+            .bind(at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let pdf = |group: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT pdf_path FROM ima_document_index WHERE group_id = ?",
+                )
+                .bind(group)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(pdf("g1").await, "");
+        assert_eq!(pdf("g2").await, "1114/晨会纪要.pdf");
+        assert_eq!(pdf("local-x").await, "1114/晨会纪要.pdf");
+        assert_eq!(pdf("g3").await, "0101/独有.pdf");
+        assert_eq!(pdf("g4").await, "ima/g4/2026/0101/m5.pdf");
+        assert!(db.ima_redownload_ids("g1").await.unwrap().contains("m1"));
+        assert!(db.ima_redownload_ids("g2").await.unwrap().is_empty());
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let kept: String =
+            sqlx::query_scalar("SELECT pdf_path FROM ima_document_index WHERE group_id = 'g2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(kept, "1114/晨会纪要.pdf");
         let _ = std::fs::remove_file(&path);
     }
 }

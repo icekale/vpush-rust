@@ -469,13 +469,17 @@ async fn sync_groups(
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 知识库列表读取失败"))?;
         let have = db.ima_downloaded_ids(&group.id).await.unwrap_or_default();
+        let retry = db.ima_redownload_ids(&group.id).await.unwrap_or_default();
         for file in &files {
             db.record_ima_listing(&group.id, &group.name, file)
                 .await
                 .map_err(|_| CollectorError::Unavailable("IMA 索引写入失败"))?;
             // 以前对列到的每个文件都直接 fetch_pdf。库里 legacy 一万七千行只下过 311 个，
             // 全量补档一轮要十几小时（上游每个请求 4 秒），所以只看最近几天的新研报。
-            if have.contains(&file.media_id) || !ima_client::fresh_sort_date(&file.sort_date, 3) {
+            if have.contains(&file.media_id)
+                || (!retry.contains(&file.media_id)
+                    && !ima_client::fresh_sort_date(&file.sort_date, 3))
+            {
                 continue;
             }
             pending += 1;
@@ -497,7 +501,7 @@ async fn sync_groups(
                         first_download_error = safe_ima(&err);
                     }
                 }
-                Ok(bytes) => match save_pdf(root, file, &bytes) {
+                Ok(bytes) => match save_pdf(root, &group.id, file, &bytes) {
                     Err(err) => {
                         download_errors += 1;
                         if first_download_error.is_empty() {
@@ -790,8 +794,11 @@ fn legacy(kb: &str, root: &str) -> Group {
     }
 }
 
+/// 落盘路径 `ima/{group}/{YYYY}/{MMDD}/{media_id}.pdf`：按库、按年隔开，文件名只用 media_id，
+/// 同名研报不会互相覆盖，也不会因中文标题过长超过文件名上限。标题只存在 DB 里。
 fn save_pdf(
     root: &std::path::Path,
+    group_id: &str,
     file: &ima_client::File,
     bytes: &[u8],
 ) -> Result<String, String> {
@@ -804,37 +811,69 @@ fn save_pdf(
     } else {
         "unknown".into()
     };
-    let name = safe_pdf_name(&file.name);
-    let dir = root.join(&day);
-    std::fs::create_dir_all(&dir).map_err(|_| "归档目录不可用".to_string())?;
-    let path = dir.join(&name);
-    std::fs::write(&path, bytes).map_err(|_| "PDF 写入失败".to_string())?;
-    let root = root
+    let year = file
+        .sort_date
+        .get(..4)
+        .filter(|year| year.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or("0000");
+    let relative = format!(
+        "ima/{}/{year}/{day}/{}.pdf",
+        path_component(group_id),
+        path_component(&file.media_id)
+    );
+    let path = root.join(&relative);
+    let dir = path.parent().ok_or_else(|| "归档目录不可用".to_string())?;
+    std::fs::create_dir_all(dir).map_err(|_| "归档目录不可用".to_string())?;
+    let canonical_root = root
         .canonicalize()
         .map_err(|_| "归档目录不可用".to_string())?;
-    let full = path
+    let canonical_dir = dir
         .canonicalize()
-        .map_err(|_| "PDF 写入失败".to_string())?;
-    if !full.starts_with(&root) {
+        .map_err(|_| "归档目录不可用".to_string())?;
+    if !canonical_dir.starts_with(&canonical_root) {
         return Err("PDF 路径越界".into());
     }
-    Ok(format!("{day}/{name}"))
+    write_atomic(&path, bytes).map_err(|_| "PDF 写入失败".to_string())?;
+    Ok(relative)
 }
 
-fn safe_pdf_name(name: &str) -> String {
-    let mut out = String::new();
-    for ch in name.chars() {
-        if ch.is_control() || matches!(ch, '/' | '\\' | ':') {
-            out.push('_');
-        } else {
-            out.push(ch);
-        }
+/// 先写同目录下的临时文件并 fsync，再 rename 覆盖，崩溃时不会留下截断的 PDF。
+pub(crate) fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = path.with_file_name(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let result = (|| {
+        let mut out = std::fs::File::create(&tmp)?;
+        out.write_all(bytes)?;
+        out.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
     }
-    let out = out.trim().trim_matches('.');
-    if out.is_empty() {
-        "file.pdf".into()
+    result
+}
+
+/// 目录/文件名片段只保留 `[A-Za-z0-9_-]`；不满足或过长时用 SHA-256 前 32 位代替。
+fn path_component(value: &str) -> String {
+    if (1..=96).contains(&value.len())
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        value.to_string()
     } else {
-        out.to_string()
+        sha_id(value)[..32].to_string()
     }
 }
 
@@ -1020,8 +1059,24 @@ mod tests {
             size: 12,
             text: String::new(),
         };
-        let relative = save_pdf(&root, &file, b"%PDF-1.4\n").unwrap();
-        assert_eq!(relative, "1114/报告.pdf");
+        let relative = save_pdf(&root, "kb1", &file, b"%PDF-1.4\n").unwrap();
+        assert_eq!(relative, "ima/kb1/2023/1114/m1.pdf");
+        let other = save_pdf(&root, "kb2", &file, b"%PDF-1.5\n").unwrap();
+        assert_eq!(other, "ima/kb2/2023/1114/m1.pdf");
+        assert_eq!(std::fs::read(root.join(&relative)).unwrap(), b"%PDF-1.4\n");
+        assert_eq!(std::fs::read(root.join(&other)).unwrap(), b"%PDF-1.5\n");
+        let long = ima_client::File {
+            media_id: "媒体/../x".repeat(40),
+            name: "很长的标题".repeat(60),
+            ..file.clone()
+        };
+        let odd = save_pdf(&root, "kb1", &long, b"%PDF-1.4\n").unwrap();
+        assert!(odd.starts_with("ima/kb1/2023/1114/"));
+        assert!(!odd.contains(".."));
+        assert!(std::fs::read_dir(root.join("ima/kb1/2023/1114"))
+            .unwrap()
+            .flatten()
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp-")));
         db.mark_ima_pdf("kb1", "m1", &relative).await.unwrap();
         let _ = std::fs::remove_dir_all(&root);
         assert!(save(

@@ -83,7 +83,15 @@ async fn poll(db: &Db) -> Result<(), String> {
             }
             Err(FetchErr::Dead) => {
                 tracing::warn!(kol = id, "雪球身份失效，重新注册");
-                cookie = crate::xueqiu::rotate_app_cookie(db).await?;
+                match crate::xueqiu::rotate_app_cookie(db).await {
+                    Ok(fresh) => cookie = fresh,
+                    Err(err) => {
+                        tracing::warn!(kol = id, "雪球身份轮换失败，跳过: {err}");
+                        crate::proxy_admin::note(db, proxy_id, false, &err).await;
+                        let _ = db.note_kol_fetch(id, Some(&err)).await;
+                        continue;
+                    }
+                }
                 if let Err(err) = sync_one(db, &cookie, id, &name, &symbol, proxy.clone()).await {
                     let detail = err.to_string();
                     let _ = db.note_kol_fetch(id, Some(&detail)).await;

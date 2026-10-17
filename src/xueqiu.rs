@@ -142,7 +142,15 @@ async fn poll(db: &Db, streak: &mut HashMap<i64, u32>) -> Result<(), String> {
             }
             Err(PullErr::Dead) => {
                 tracing::warn!("雪球身份失效，重新注册");
-                ident = rotate_identity(db).await?;
+                match rotate_identity(db).await {
+                    Ok(fresh) => ident = fresh,
+                    Err(err) => {
+                        tracing::warn!(kol = id, "雪球身份轮换失败，跳过: {err}");
+                        crate::proxy_admin::note(db, proxy_id, false, &err).await;
+                        let _ = db.note_kol_fetch(id, Some(&err)).await;
+                        continue;
+                    }
+                }
                 if let Ok(batch) = pull(db, &ident, id, &external_id, streak, proxy.clone()).await {
                     let _ = db.note_kol_fetch(id, None).await;
                     save(db, id, &name, batch).await?;

@@ -370,6 +370,12 @@ CREATE TABLE IF NOT EXISTS posts (
     UNIQUE (platform, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_posts_feed ON posts (kol_id, published_at, id);
+CREATE TABLE IF NOT EXISTS seen_posts (
+    platform TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (platform, external_id)
+);
 CREATE TABLE IF NOT EXISTS push_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     post_id INTEGER NOT NULL,
@@ -4206,6 +4212,50 @@ impl Db {
         Ok(removed)
     }
 
+    /// 按批删除过期帖子，每批一个短事务，避免长时间占住唯一的写连接。
+    /// 删除前把 `(platform, external_id)` 记进 `seen_posts`，`has_post` 会查它，
+    /// 置顶帖或低频 KOL 的旧帖再次出现时就不会被当成新帖重推。
+    async fn purge_old_posts(&self, days: i64) -> Result<u64, sqlx::Error> {
+        let cutoff: String = sqlx::query_scalar("SELECT datetime('now', ?)")
+            .bind(format!("-{days} days"))
+            .fetch_one(&self.pool)
+            .await?;
+        let mut total = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let ids: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM posts WHERE fetched_at < ? LIMIT 2000")
+                    .bind(&cutoff)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            if ids.is_empty() {
+                tx.commit().await?;
+                break;
+            }
+            let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            sqlx::query(&format!(
+                "INSERT INTO seen_posts (platform, external_id, seen_at)
+                 SELECT platform, external_id, datetime('now') FROM posts WHERE id IN ({list})
+                 ON CONFLICT(platform, external_id) DO UPDATE SET seen_at = excluded.seen_at"
+            ))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!("DELETE FROM push_logs WHERE post_id IN ({list})"))
+                .execute(&mut *tx)
+                .await?;
+            total += sqlx::query(&format!("DELETE FROM posts WHERE id IN ({list})"))
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            tokio::task::yield_now().await;
+        }
+        sqlx::query("DELETE FROM seen_posts WHERE seen_at < datetime('now', '-400 days')")
+            .execute(&self.pool)
+            .await?;
+        Ok(total)
+    }
+
     pub async fn prune_retention_if_due(&self) -> Result<(i64, i64, i64, i64), sqlx::Error> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4234,15 +4284,9 @@ impl Db {
         let posts = if posts_days == 0 {
             0
         } else {
-            sqlx::query(&format!("DELETE FROM push_logs WHERE post_id IN (SELECT id FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
             sqlx::query(&format!("DELETE FROM news_reads WHERE article_id IN (SELECT id FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
             let news = sqlx::query(&format!("DELETE FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days')")).execute(&self.pool).await?.rows_affected();
-            let posts = sqlx::query(&format!(
-                "DELETE FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days')"
-            ))
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+            let posts = self.purge_old_posts(posts_days).await?;
             self.set_setting("maintenance_last_cleanup", &now.to_string())
                 .await?;
             let logs = if log_days == 0 {
@@ -6295,7 +6339,10 @@ impl Db {
 
     pub async fn has_post(&self, platform: &str, external_id: &str) -> Result<bool, sqlx::Error> {
         let hit: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM posts WHERE platform = ? AND external_id = ? LIMIT 1",
+            "SELECT 1 FROM posts WHERE platform = ?1 AND external_id = ?2
+             UNION ALL
+             SELECT 1 FROM seen_posts WHERE platform = ?1 AND external_id = ?2
+             LIMIT 1",
         )
         .bind(platform)
         .bind(external_id)
@@ -11862,6 +11909,57 @@ mod regression_tests {
             ids(db.push_targets(quiet, "post").await.unwrap()),
             vec![both]
         );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_purged_posts_known_so_they_are_not_pushed_again() {
+        let (db, path) = fresh_db("seen-posts").await;
+        let kol = db
+            .add_kol("xueqiu", "甲", "seen-1", None, false, false, false)
+            .await
+            .unwrap();
+        db.save_fetched(
+            kol,
+            "pinned",
+            "",
+            "置顶",
+            "post",
+            "[]",
+            "",
+            "2025-01-01 00:00",
+        )
+        .await
+        .unwrap();
+        db.save_fetched(
+            kol,
+            "fresh",
+            "",
+            "新帖",
+            "post",
+            "[]",
+            "",
+            "2026-10-01 00:00",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE posts SET fetched_at = datetime('now', '-40 days') WHERE external_id = 'pinned'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (removed, _, _, _) = db.prune_retention_if_due().await.unwrap();
+        assert_eq!(removed, 1);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        assert!(db.has_post("xueqiu", "pinned").await.unwrap());
+        assert!(db.has_post("xueqiu", "fresh").await.unwrap());
+        assert!(!db.has_post("xueqiu", "never").await.unwrap());
+        assert!(!db.has_post("weibo", "pinned").await.unwrap());
         let _ = std::fs::remove_file(&path);
     }
 }

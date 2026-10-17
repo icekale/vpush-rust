@@ -15,6 +15,7 @@ const ROOT_KEY: &str = "ima_pure_root_folder_id";
 const GROUPS_KEY: &str = "ima_pure_groups";
 const INTERVAL_KEY: &str = "ima_pure_interval_seconds";
 const STARTED_KEY: &str = "ima_pure_last_started_at";
+const FAIL_STREAK_KEY: &str = "ima_pure_fail_streak";
 const FINISHED_KEY: &str = "ima_pure_last_finished_at";
 const RESULT_KEY: &str = "ima_pure_last_result";
 const DISCOVERY_KEY: &str = "ima_pure_discovery";
@@ -636,9 +637,23 @@ async fn sync_groups(
         done.push(group.id.clone());
     }
     if done.is_empty() && !failed_groups.is_empty() {
-        // Nothing was listed at all: let the next maintenance round retry
-        // instead of waiting out a full interval.
-        let _ = db.set_setting(STARTED_KEY, "0").await;
+        // Nothing was listed at all: retry before the full interval, backing
+        // off so an IMA outage does not mean a login + listing every minute.
+        let streak = text(db, FAIL_STREAK_KEY)
+            .await
+            .unwrap_or_default()
+            .parse::<u32>()
+            .unwrap_or(0)
+            .saturating_add(1);
+        let _ = db.set_setting(FAIL_STREAK_KEY, &streak.to_string()).await;
+        let _ = db
+            .set_setting(
+                STARTED_KEY,
+                &retry_started_at(now, cfg.interval_seconds, streak).to_string(),
+            )
+            .await;
+    } else if !done.is_empty() {
+        let _ = db.set_setting(FAIL_STREAK_KEY, "0").await;
     }
     let finished = now_secs();
     let result = json!({
@@ -1040,6 +1055,16 @@ fn now_secs() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Backdated start time that makes `too_soon` allow the next run after
+/// 60s, 120s, 240s, ... consecutive all-failed rounds, never later than a
+/// normal interval.
+fn retry_started_at(now: i64, interval: i64, streak: u32) -> i64 {
+    let backoff = 60_i64
+        .saturating_mul(1_i64 << streak.saturating_sub(1).min(20))
+        .min(interval);
+    now - interval + backoff
 }
 
 async fn too_soon(cfg: &Cfg, db: &Db) -> Result<Option<i64>, String> {
@@ -1467,6 +1492,29 @@ mod tests {
         assert_eq!(out["result"]["failed_groups"][0]["group"], "kb_bad");
         assert_eq!(out["result"]["listed"], 1);
 
+        let bad: Vec<Group> = cfg
+            .groups
+            .iter()
+            .filter(|group| group.id == "kb_bad")
+            .cloned()
+            .collect();
+        for streak in 1..=2_i64 {
+            sync_groups(&db, &cfg, &bad, &HalfBroken, None)
+                .await
+                .unwrap();
+            assert_eq!(
+                text(&db, FAIL_STREAK_KEY).await.unwrap(),
+                streak.to_string()
+            );
+            let next = too_soon(&cfg, &db).await.unwrap().expect("backing off");
+            let wait = next - now_secs();
+            assert!((60 * streak - 2..=60 * streak).contains(&wait), "{wait}");
+        }
+        sync_groups(&db, &cfg, &cfg.groups, &HalfBroken, None)
+            .await
+            .unwrap();
+        assert_eq!(text(&db, FAIL_STREAK_KEY).await.unwrap(), "0");
+
         let guard = RunGuard::acquire().expect("free");
         assert!(RunGuard::acquire().is_none());
         assert_eq!(status(&db).await.unwrap()["running"], true);
@@ -1514,5 +1562,17 @@ mod tests {
             download_wanted("new2", true, &have, &retry, &mut retried),
             Some(false)
         );
+    }
+
+    #[test]
+    fn all_failed_rounds_back_off_exponentially_up_to_the_interval() {
+        let now = 1_000_000;
+        let next_run = |streak| retry_started_at(now, 3600, streak) + 3600 - now;
+        assert_eq!(next_run(1), 60);
+        assert_eq!(next_run(2), 120);
+        assert_eq!(next_run(3), 240);
+        assert_eq!(next_run(6), 1920);
+        assert_eq!(next_run(7), 3600);
+        assert_eq!(next_run(u32::MAX), 3600);
     }
 }

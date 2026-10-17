@@ -5465,3 +5465,20 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
 .boot-error[hidden] { display: none; }
 .boot-error-title { font-size: 17px; font-weight: 600; color: var(--color-text-strong); }
 .boot-error-detail { max-width: 420px; color: var(--color-text-muted); }
+
+.update-banner {
+  position: fixed;
+  left: 50%;
+  bottom: calc(16px + env(safe-area-inset-bottom, 0px));
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: calc(100vw - 32px);
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: var(--color-bg);
+  color: var(--color-text-strong);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.18);
+  z-index: 1001;
+}

@@ -1160,36 +1160,79 @@ async function checkFeishuTimelineUpdate(mediaId, groupId, baseline, seq, reader
   }
 }
 
-async function checkUpdate() {
+const VERSION_CHECK_INTERVAL_MS = 5 * 60_000;
+let versionCheckAt = 0;
+let versionInfo = null;
+
+function renderVersionMeta() {
+  const link = $("#sidebar-gh-link");
+  const meta = $("#sidebar-version");
+  const v = versionInfo;
+  if (!link || !meta || !v) return;
+  // 始终显示服务端返回的当前版本，避免本地硬编码版本过期
+  meta.innerHTML = `v${escapeHtml(v.current)}`;
+  if (v.update_available && v.latest) {
+    link.classList.add("has-update");
+    meta.innerHTML += ` <a class="sidebar-update" href="${escapeHtml(v.url)}" target="_blank" rel="noopener" title="有新版本">↑ ${escapeHtml(v.latest)}</a>`;
+  }
+}
+
+// 正在输入（焦点在表单控件上，或页面里有改过但没提交的输入）时不自动刷新
+function userIsEditing() {
+  const active = document.activeElement;
+  if (active && (active.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName))) return true;
+  return [...document.querySelectorAll("#main input, #main textarea, dialog[open] input, dialog[open] textarea")]
+    .some((el) => (el.type === "checkbox" || el.type === "radio" ? el.checked !== el.defaultChecked : el.value !== el.defaultValue));
+}
+
+function reloadForNewVersion(guardKey, guardValue) {
+  if (sessionStorage.getItem(guardKey) === guardValue) return false;
+  if (userIsEditing()) {
+    showUpdateBanner();
+    return true;
+  }
+  sessionStorage.setItem(guardKey, guardValue);
+  location.reload();
+  return true;
+}
+
+function showUpdateBanner() {
+  if (document.getElementById("update-banner")) return;
+  const bar = document.createElement("div");
+  bar.id = "update-banner";
+  bar.className = "update-banner";
+  bar.setAttribute("role", "status");
+  bar.innerHTML = `<span>有新版本可用，保存好正在编辑的内容后刷新。</span>
+    <button type="button" class="btn-primary btn-sm">刷新</button>
+    <button type="button" class="btn-ghost btn-sm" aria-label="稍后">稍后</button>`;
+  const [reload, later] = bar.querySelectorAll("button");
+  reload.addEventListener("click", () => location.reload());
+  later.addEventListener("click", () => bar.remove());
+  document.body.appendChild(bar);
+}
+
+// 路由切换会重绘侧栏并调用这里：5 分钟内只复用上次结果，不重复打 3 个请求
+async function checkUpdate(force = false) {
+  if (!force && Date.now() - versionCheckAt < VERSION_CHECK_INTERVAL_MS) {
+    renderVersionMeta();
+    return;
+  }
+  versionCheckAt = Date.now();
   try {
     const v = await api("/api/version");
     if (v.current && v.current !== APP_VERSION) {
-      const refreshKey = `dav_version_refresh_${v.current}`;
-      if (!sessionStorage.getItem(refreshKey)) {
-        sessionStorage.setItem(refreshKey, "1");
-        location.reload();
-        return;
-      }
+      if (reloadForNewVersion(`dav_version_refresh_${v.current}`, "1")) return;
     }
     const response = await fetch("/", { cache: "no-store" });
     if (response.ok) {
       const latest = new DOMParser().parseFromString(await response.text(), "text/html");
       const revision = shellRevision(latest);
-      if (revision && revision !== shellRevision(document) && sessionStorage.getItem("dav_shell_refresh") !== revision) {
-        sessionStorage.setItem("dav_shell_refresh", revision);
-        location.reload();
-        return;
+      if (revision && revision !== shellRevision(document)) {
+        if (reloadForNewVersion("dav_shell_refresh", revision)) return;
       }
     }
-    const link = $("#sidebar-gh-link");
-    const meta = $("#sidebar-version");
-    if (!link || !meta) return;
-    // 始终显示服务端返回的当前版本，避免本地硬编码版本过期
-    meta.innerHTML = `v${escapeHtml(v.current)}`;
-    if (v.update_available && v.latest) {
-      link.classList.add("has-update");
-      meta.innerHTML += ` <a class="sidebar-update" href="${escapeHtml(v.url)}" target="_blank" rel="noopener" title="有新版本">↑ ${escapeHtml(v.latest)}</a>`;
-    }
+    versionInfo = v;
+    renderVersionMeta();
   } catch {
     /* 更新检查失败不打扰，保留本地硬编码版本兜底 */
   }
@@ -1201,7 +1244,7 @@ function ensureVersionRefreshCheck() {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") checkUpdate();
   });
-  window.addEventListener("focus", checkUpdate);
+  window.addEventListener("focus", () => checkUpdate());
 }
 
 function renderTopbar(user) {

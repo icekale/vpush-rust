@@ -159,8 +159,8 @@ export function createAdminDashboardView(dependencies) {
                     <span>Truth 间隔<span class="cfg-unit">秒</span></span>
                     <input id="pc-truth" type="number" class="form-control" min="0" max="600" value="${s.polling_config.truth_interval_seconds}">
                   </label>
-                  <label class="cfg-field" title="普通大V帖子按此周期合并推送摘要；0 = 实时单条推送">
-                    <span>合并推送周期<span class="cfg-unit">秒</span></span>
+                  <label class="cfg-field" title="保留项：当前版本没有摘要推送，普通大V新帖始终实时推送，此值不生效">
+                    <span>合并推送周期（未启用）<span class="cfg-unit">秒</span></span>
                     <input id="pc-digest" type="number" class="form-control" min="0" max="86400" value="${s.polling_config.digest_interval_seconds}">
                   </label>
                 </div>
@@ -196,22 +196,22 @@ export function createAdminDashboardView(dependencies) {
                 </div>
               </div>
               <div class="cfg-group">
-                <p class="cfg-group-title">次要大V <span class="hint">低频合并</span></p>
+                <p class="cfg-group-title">次要大V <span class="hint">不推送，仅在动态页显示</span></p>
                 <div class="cfg-fields">
-                  <label class="cfg-field" title="次要大V基础抓取间隔（低于普通大V频率）">
-                    <span>抓取间隔<span class="cfg-unit">秒</span></span>
+                  <label class="cfg-field" title="保留项：当前版本次要大V与普通大V同频抓取，此值不生效">
+                    <span>抓取间隔（未启用）<span class="cfg-unit">秒</span></span>
                     <input id="pc-si" type="number" class="form-control" min="60" max="86400" value="${s.polling_config.secondary_interval_seconds}">
                   </label>
-                  <label class="cfg-field" title="次要大V长期无新帖时封顶的空轮间隔">
-                    <span>空轮封顶<span class="cfg-unit">秒</span></span>
+                  <label class="cfg-field" title="保留项：当前版本次要大V与普通大V同频抓取，此值不生效">
+                    <span>空轮封顶（未启用）<span class="cfg-unit">秒</span></span>
                     <input id="pc-sc" type="number" class="form-control" min="60" max="86400" value="${s.polling_config.secondary_idle_cap_seconds}">
                   </label>
-                  <label class="cfg-field" title="次要大V帖子按此周期合并推送；0 = 实时推送">
-                    <span>推送周期<span class="cfg-unit">秒</span></span>
+                  <label class="cfg-field" title="保留项：当前版本没有摘要推送，次要大V新帖不推送，此值不生效">
+                    <span>推送周期（未启用）<span class="cfg-unit">秒</span></span>
                     <input id="pc-sd" type="number" class="form-control" min="0" max="86400" value="${s.polling_config.secondary_digest_interval_seconds}">
                   </label>
-                  <label class="cfg-field" title="合并推送最低条数：周期内积压不足此数则不推送、继续攒，够数才推">
-                    <span>最低条数<span class="cfg-unit">条</span></span>
+                  <label class="cfg-field" title="保留项：当前版本没有摘要推送，此值不生效">
+                    <span>最低条数（未启用）<span class="cfg-unit">条</span></span>
                     <input id="pc-sd-min" type="number" class="form-control" min="1" max="100" value="${s.polling_config.secondary_min_digest_count ?? 1}">
                   </label>
                 </div>

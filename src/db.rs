@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -25,14 +25,24 @@ pub struct NewsEntry {
     pub published_at: String,
 }
 
+/// Audit history survives account deletion: admin logs keep the actor id,
+/// push logs are anonymised (user_id set to NULL) so counts stay intact.
+const AUDIT_TABLES: &[&str] = &["admin_logs", "push_logs"];
+
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
+    path: std::sync::Arc<PathBuf>,
 }
 
 impl Db {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// The database file this handle was opened on (`:memory:` for tests).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -370,6 +380,19 @@ CREATE TABLE IF NOT EXISTS posts (
     UNIQUE (platform, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_posts_feed ON posts (kol_id, published_at, id);
+CREATE TABLE IF NOT EXISTS ima_redownload (
+    group_id TEXT NOT NULL,
+    media_id TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (group_id, media_id)
+);
+CREATE TABLE IF NOT EXISTS seen_posts (
+    platform TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    seen_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (platform, external_id)
+);
 CREATE TABLE IF NOT EXISTS push_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     post_id INTEGER NOT NULL,
@@ -439,6 +462,11 @@ CREATE TABLE IF NOT EXISTS feishu_document_sources (
     enabled INTEGER NOT NULL DEFAULT 1,
     last_success_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT
+);
+CREATE TABLE IF NOT EXISTS feishu_media_failures (
+    token TEXT PRIMARY KEY,
+    fails INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE TABLE IF NOT EXISTS feishu_oauth_sessions (
     state_hash TEXT PRIMARY KEY,
@@ -672,7 +700,8 @@ impl Db {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        let (tables, indexes) = split_schema(SCHEMA);
+        sqlx::raw_sql(&tables).execute(&pool).await?;
         ensure_user_columns(&pool).await?;
         ensure_users_autoincrement(&pool).await?;
         ensure_kol_columns(&pool).await?;
@@ -681,8 +710,16 @@ impl Db {
         ensure_feishu_columns(&pool).await?;
         ensure_news_admin_columns(&pool).await?;
         ensure_etf_premium_columns(&pool).await?;
+        ensure_legacy_columns(&pool).await?;
+        normalize_news_timestamps(&pool).await?;
+        create_schema_indexes(&pool, &indexes).await?;
         ensure_hot_indexes(&pool).await?;
-        Ok(Self { pool })
+        ensure_binding_indexes(&pool).await?;
+        repair_ima_pdf_collisions(&pool).await?;
+        Ok(Self {
+            pool,
+            path: std::sync::Arc::new(path.to_path_buf()),
+        })
     }
 
     pub async fn telegram_poll_acquire(
@@ -886,6 +923,36 @@ impl Db {
         Ok(n > 0)
     }
 
+    /// 只有碰撞修复清空过 `pdf_path` 的条目（登记在 `ima_redownload`）才绕过"最近 3 天"窗口重下；
+    /// 历史上建档但从没下过 PDF 的行不在这里，不会触发整库补档。
+    pub async fn ima_redownload_ids(&self, group_id: &str) -> Result<HashSet<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT r.media_id FROM ima_redownload r
+             JOIN ima_document_index d ON d.group_id = r.group_id AND d.media_id = r.media_id
+             WHERE r.group_id = ? AND r.attempts < ? AND d.pdf_path = ''",
+        )
+        .bind(group_id)
+        .bind(IMA_REDOWNLOAD_MAX_ATTEMPTS)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    pub async fn note_ima_redownload_failure(
+        &self,
+        group_id: &str,
+        media_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE ima_redownload SET attempts = attempts + 1 WHERE group_id = ? AND media_id = ?",
+        )
+        .bind(group_id)
+        .bind(media_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// 已经下载过 PDF 的 media_id，用来跳过重复下载。
     /// ponytail: 只看 pdf_path 有没有值，上游换掉同名文件不会重下；要跟内容就得再比 size。
     pub async fn ima_downloaded_ids(&self, group_id: &str) -> Result<HashSet<String>, sqlx::Error> {
@@ -932,6 +999,11 @@ impl Db {
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE ima_document_index SET pdf_path = ?, downloaded_at = datetime('now') WHERE group_id = ? AND media_id = ?")
             .bind(pdf_path)
+            .bind(group_id)
+            .bind(media_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM ima_redownload WHERE group_id = ? AND media_id = ?")
             .bind(group_id)
             .bind(media_id)
             .execute(&self.pool)
@@ -1846,27 +1918,45 @@ impl Db {
         if name.is_empty() || name.chars().count() > 60 {
             return Err(CatalogError::Bad("媒体名称需 1-60 字"));
         }
+        let mut tx = self.pool.begin().await?;
         let id = sqlx::query(
-            "INSERT INTO news_sources (slug, name, group_name) VALUES ('pending', ?, ?)",
+            "INSERT INTO news_sources (slug, name, group_name)
+             VALUES ('pending-' || lower(hex(randomblob(8))), ?, ?)",
         )
         .bind(name)
         .bind(group_name.trim())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .last_insert_rowid();
         sqlx::query("UPDATE news_sources SET slug = ? WHERE id = ?")
             .bind(format!("s{id}"))
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query(
             "INSERT INTO user_news_sources (user_id, source_id)
              SELECT DISTINCT user_id, ? FROM user_news_sources",
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
+    }
+
+    pub async fn validate_news_sources(&self, ids: &[i64]) -> Result<(), CatalogError> {
+        for id in ids {
+            let ok: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM news_sources WHERE id = ? AND archived_at IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if ok.is_none() {
+                return Err(CatalogError::Bad("来源不存在或已归档"));
+            }
+        }
+        Ok(())
     }
 
     pub async fn set_user_news_sources(
@@ -1880,22 +1970,7 @@ impl Db {
                 unique.push(*id);
             }
         }
-        if !unique.is_empty() {
-            let mut found = Vec::new();
-            for id in &unique {
-                let ok: Option<i64> = sqlx::query_scalar(
-                    "SELECT id FROM news_sources WHERE id = ? AND archived_at IS NULL",
-                )
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-                if ok.is_none() {
-                    return Err(CatalogError::Bad("来源不存在或已归档"));
-                }
-                found.push(*id);
-            }
-            let _ = found;
-        }
+        self.validate_news_sources(&unique).await?;
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM user_news_sources WHERE user_id = ?")
             .bind(user_id)
@@ -1934,22 +2009,29 @@ impl Db {
         if url.is_empty() || url.len() > 2048 {
             return Err(CatalogError::Bad("Feed URL 无效"));
         }
+        let mut tx = self.pool.begin().await?;
         let duplicate: Option<i64> = sqlx::query_scalar("SELECT id FROM news_feeds WHERE url = ?")
             .bind(url)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if duplicate.is_some() {
             return Err(CatalogError::Bad("Feed URL 已存在"));
         }
-        Ok(
-            sqlx::query("INSERT INTO news_feeds (source_id, name, url) VALUES (?, ?, ?)")
-                .bind(source_id)
-                .bind(name)
-                .bind(url)
-                .execute(&self.pool)
-                .await?
-                .last_insert_rowid(),
-        )
+        let id = sqlx::query("INSERT INTO news_feeds (source_id, name, url) VALUES (?, ?, ?)")
+            .bind(source_id)
+            .bind(name)
+            .bind(url)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| match &err {
+                sqlx::Error::Database(db) if db.is_unique_violation() => {
+                    CatalogError::Bad("Feed URL 已存在")
+                }
+                _ => CatalogError::Db(err),
+            })?
+            .last_insert_rowid();
+        tx.commit().await?;
+        Ok(id)
     }
 
     pub async fn news_feeds(&self) -> Result<Vec<(i64, i64, String, String)>, sqlx::Error> {
@@ -1984,8 +2066,11 @@ impl Db {
         for entry in entries {
             let result = sqlx::query(
                 "INSERT INTO news_articles
-                    (source_id, feed_id, external_id, title, summary, content, url, author, published_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    (source_id, feed_id, external_id, title, summary, content, url, author,
+                     published_at, fetched_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                     COALESCE(NULLIF(?, ''), strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')),
+                     strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now'))
                  ON CONFLICT(source_id, external_id) DO NOTHING",
             )
             .bind(source_id)
@@ -2583,7 +2668,7 @@ impl Db {
             "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
                     a.title, a.summary, a.url, a.author, a.published_at, a.topics,
                     CASE WHEN a.images NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_image,
-                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
+                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
              LEFT JOIN news_feeds f ON f.id = a.feed_id
@@ -2596,7 +2681,7 @@ impl Db {
                )
                AND (? = '' OR a.title LIKE ? ESCAPE '!' OR a.summary LIKE ? ESCAPE '!')
                AND (? = '' OR a.topics LIKE ? ESCAPE '!')
-               AND (? = 0 OR NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at)))
+               AND (? = 0 OR NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at))))
              ORDER BY a.published_at DESC, a.id DESC
              LIMIT ? OFFSET ?",
         )
@@ -2639,7 +2724,7 @@ impl Db {
             "SELECT a.id, a.source_id, s.name AS source_name, COALESCE(s.platform, '') AS source_platform, f.name AS feed_name,
                     a.title, a.summary, a.content, a.url, a.author, a.published_at, a.topics,
                     CASE WHEN a.images NOT IN ('', '[]') THEN 1 ELSE 0 END AS has_image,
-                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
+                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
              LEFT JOIN news_feeds f ON f.id = a.feed_id
@@ -2704,7 +2789,7 @@ impl Db {
         let rows = sqlx::query(
             "SELECT a.id, a.title, a.author, a.issue_key, a.issue_label, a.issue_title, a.issue_cover,
                     a.section, a.published_at, a.toc_order,
-                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at) THEN 1 ELSE 0 END AS is_read
+                    CASE WHEN r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)) THEN 1 ELSE 0 END AS is_read
              FROM news_articles a
              JOIN news_sources s ON s.id = a.source_id AND s.enabled = 1 AND s.archived_at IS NULL
              LEFT JOIN news_reads r ON r.article_id = a.id AND r.user_id = ?
@@ -2889,7 +2974,7 @@ impl Db {
                  NOT EXISTS (SELECT 1 FROM user_news_sources u WHERE u.user_id = ?)
                  OR EXISTS (SELECT 1 FROM user_news_sources u WHERE u.user_id = ? AND u.source_id = a.source_id)
                )
-               AND NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND a.published_at <= sn.seen_at))",
+               AND NOT (r.user_id IS NOT NULL OR (COALESCE(sn.seen_at, '') != '' AND a.published_at != '' AND datetime(a.published_at) <= datetime(sn.seen_at)))",
         )
         .bind(user_id)
         .bind(user_id)
@@ -3014,12 +3099,14 @@ impl Db {
     }
 
     pub async fn user_by_feishu_open_id(&self, open_id: &str) -> Result<Option<User>, sqlx::Error> {
-        let row =
-            sqlx::query("SELECT * FROM users WHERE feishu_open_id = ? AND feishu_open_id != ''")
-                .bind(open_id)
-                .fetch_optional(&self.pool)
-                .await?;
-        Ok(row.map(user_from_row))
+        let rows = sqlx::query(
+            "SELECT * FROM users WHERE feishu_open_id = ? AND feishu_open_id != '' LIMIT 2",
+        )
+        .bind(open_id)
+        .fetch_all(&self.pool)
+        .await?;
+        // Ambiguous legacy duplicates must not route commands to an arbitrary account.
+        Ok((rows.len() == 1).then(|| user_from_row(rows.into_iter().next().unwrap())))
     }
 
     pub async fn upsert_feishu_identity(
@@ -3454,6 +3541,10 @@ impl Db {
             }
             sqlx::query("INSERT INTO news_seen (user_id, seen_at) SELECT ?, seen_at FROM news_seen WHERE user_id = ? ON CONFLICT(user_id) DO UPDATE SET seen_at = MAX(news_seen.seen_at, excluded.seen_at)")
                 .bind(user_id).bind(owner).execute(&mut *tx).await?;
+            sqlx::query("UPDATE users SET telegram_chat_id = '' WHERE id = ?")
+                .bind(owner)
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("UPDATE users SET telegram_chat_id = ?, news_last_seen_at = MAX(news_last_seen_at, (SELECT news_last_seen_at FROM users WHERE id = ?)) WHERE id = ?")
                 .bind(identity).bind(owner).bind(user_id).execute(&mut *tx).await?;
             sqlx::query(
@@ -3775,16 +3866,26 @@ impl Db {
             .is_some())
     }
 
-    pub async fn push_targets(&self, kol_id: i64) -> Result<Vec<PushTarget>, sqlx::Error> {
+    /// 只返回订阅类型匹配、且没有把该 KOL 设为"次要"（特别关注除外）的订阅者，
+    /// 与 `should_push` 的闸门条件一致。
+    pub async fn push_targets(
+        &self,
+        kol_id: i64,
+        post_type: &str,
+    ) -> Result<Vec<PushTarget>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT s.user_id, u.notify_enabled, u.push_channels, u.dnd_start, u.dnd_end,
                     u.dnd_allow_favorite, u.wecom_webhook, u.bark_key,
                     u.telegram_chat_id, u.telegram_bot_token, s.favorite
              FROM subscriptions s
              JOIN users u ON u.id = s.user_id
-             WHERE s.kol_id = ?",
+             JOIN kols k ON k.id = s.kol_id
+             WHERE s.kol_id = ?
+               AND s.type IN (?, 'both', 'all')
+               AND (s.favorite = 1 OR (k.secondary = 0 AND s.secondary = 0))",
         )
         .bind(kol_id)
+        .bind(post_type)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
@@ -4009,22 +4110,16 @@ impl Db {
         password_hash: Option<&str>,
         is_admin: Option<bool>,
     ) -> Result<(), CatalogError> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        if exists.is_none() {
-            return Err(CatalogError::Missing("用户不存在"));
-        }
         if is_admin == Some(false) && actor == id {
             return Err(CatalogError::Bad("不能取消自己的管理员权限"));
         }
-        if let Some(on) = is_admin {
-            sqlx::query("UPDATE users SET is_admin = ? WHERE id = ?")
-                .bind(i64::from(on))
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(CatalogError::Missing("用户不存在"));
         }
         if let Some(name) = username {
             let taken: Option<i64> = sqlx::query_scalar(
@@ -4032,7 +4127,7 @@ impl Db {
             )
             .bind(name)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
             if taken.is_some() {
                 return Err(CatalogError::Bad("用户名已存在"));
@@ -4040,32 +4135,56 @@ impl Db {
             sqlx::query("UPDATE users SET username = ? WHERE id = ?")
                 .bind(name)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(on) = is_admin {
+            sqlx::query("UPDATE users SET is_admin = ? WHERE id = ?")
+                .bind(i64::from(on))
+                .bind(id)
+                .execute(&mut *tx)
                 .await?;
         }
         if let Some(hash) = password_hash {
-            self.set_password(id, hash).await?;
+            sqlx::query(
+                "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
+            )
+            .bind(hash)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn delete_user(&self, actor: i64, id: i64) -> Result<(), CatalogError> {
+        if actor == id {
+            return Err(CatalogError::Bad("不能删除自己的账号"));
+        }
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT is_admin FROM users WHERE id = ?")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
             return Err(CatalogError::Missing("用户不存在"));
         };
-        if actor == id {
-            return Err(CatalogError::Bad("不能删除自己的账号"));
-        }
         if row.get::<i64, _>("is_admin") != 0 {
             return Err(CatalogError::Bad("不能删除管理员"));
         }
-        let mut tx = self.pool.begin().await?;
         let tables = tables_with_column(&mut tx, "user_id").await?;
         for table in tables {
+            if table == "push_logs" {
+                sqlx::query("UPDATE push_logs SET user_id = NULL WHERE user_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                continue;
+            }
+            if AUDIT_TABLES.contains(&table.as_str()) {
+                continue;
+            }
             sqlx::query(&format!("DELETE FROM \"{table}\" WHERE user_id = ?"))
                 .bind(id)
                 .execute(&mut *tx)
@@ -4196,6 +4315,50 @@ impl Db {
         Ok(removed)
     }
 
+    /// 按批删除过期帖子，每批一个短事务，避免长时间占住唯一的写连接。
+    /// 删除前把 `(platform, external_id)` 记进 `seen_posts`，`has_post` 会查它，
+    /// 置顶帖或低频 KOL 的旧帖再次出现时就不会被当成新帖重推。
+    async fn purge_old_posts(&self, days: i64) -> Result<u64, sqlx::Error> {
+        let cutoff: String = sqlx::query_scalar("SELECT datetime('now', ?)")
+            .bind(format!("-{days} days"))
+            .fetch_one(&self.pool)
+            .await?;
+        let mut total = 0;
+        loop {
+            let mut tx = self.pool.begin().await?;
+            let ids: Vec<i64> =
+                sqlx::query_scalar("SELECT id FROM posts WHERE fetched_at < ? LIMIT 2000")
+                    .bind(&cutoff)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            if ids.is_empty() {
+                tx.commit().await?;
+                break;
+            }
+            let list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+            sqlx::query(&format!(
+                "INSERT INTO seen_posts (platform, external_id, seen_at)
+                 SELECT platform, external_id, datetime('now') FROM posts WHERE id IN ({list})
+                 ON CONFLICT(platform, external_id) DO UPDATE SET seen_at = excluded.seen_at"
+            ))
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query(&format!("DELETE FROM push_logs WHERE post_id IN ({list})"))
+                .execute(&mut *tx)
+                .await?;
+            total += sqlx::query(&format!("DELETE FROM posts WHERE id IN ({list})"))
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+            tx.commit().await?;
+            tokio::task::yield_now().await;
+        }
+        sqlx::query("DELETE FROM seen_posts WHERE seen_at < datetime('now', '-400 days')")
+            .execute(&self.pool)
+            .await?;
+        Ok(total)
+    }
+
     pub async fn prune_retention_if_due(&self) -> Result<(i64, i64, i64, i64), sqlx::Error> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -4224,59 +4387,52 @@ impl Db {
         let posts = if posts_days == 0 {
             0
         } else {
-            sqlx::query(&format!("DELETE FROM push_logs WHERE post_id IN (SELECT id FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
-            sqlx::query(&format!("DELETE FROM news_reads WHERE article_id IN (SELECT id FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
-            let news = sqlx::query(&format!("DELETE FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days')")).execute(&self.pool).await?.rows_affected();
-            let posts = sqlx::query(&format!(
-                "DELETE FROM posts WHERE fetched_at < datetime('now', '-{posts_days} days')"
-            ))
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
+            let cutoff =
+                format!("strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now', '-{posts_days} days')");
+            let old_news = format!("published_at != '' AND published_at < {cutoff}");
+            delete_in_batches(
+                &self.pool,
+                "news_reads",
+                &format!("article_id IN (SELECT id FROM news_articles WHERE {old_news})"),
+            )
+            .await?;
+            let news = delete_in_batches(&self.pool, "news_articles", &old_news).await?;
+            let posts = self.purge_old_posts(posts_days).await?;
             self.set_setting("maintenance_last_cleanup", &now.to_string())
                 .await?;
-            let logs = if log_days == 0 {
-                0
-            } else {
-                sqlx::query(&format!(
-                    "DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')"
-                ))
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-            };
-            let admin = sqlx::query(
-                "DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')",
-            )
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-            sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')")
-                .execute(&self.pool)
-                .await?;
-            return Ok((posts as i64, news as i64, logs as i64, admin as i64));
+            let (logs, admin) = self.prune_logs(log_days).await?;
+            return Ok((posts as i64, news as i64, logs, admin));
         };
-        let logs = if log_days == 0 {
-            0
-        } else {
-            sqlx::query(&format!(
-                "DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')"
-            ))
-            .execute(&self.pool)
-            .await?
-            .rows_affected() as i64
-        };
-        let admin =
-            sqlx::query("DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')")
-                .execute(&self.pool)
-                .await?
-                .rows_affected() as i64;
-        sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')")
-            .execute(&self.pool)
-            .await?;
+        let (logs, admin) = self.prune_logs(log_days).await?;
         self.set_setting("maintenance_last_cleanup", &now.to_string())
             .await?;
         Ok((posts, 0, logs, admin))
+    }
+
+    async fn prune_logs(&self, log_days: i64) -> Result<(i64, i64), sqlx::Error> {
+        let logs = if log_days == 0 {
+            0
+        } else {
+            delete_in_batches(
+                &self.pool,
+                "push_logs",
+                &format!("created_at < datetime('now', '-{log_days} days')"),
+            )
+            .await? as i64
+        };
+        let admin = delete_in_batches(
+            &self.pool,
+            "admin_logs",
+            "created_at < datetime('now', '-180 days')",
+        )
+        .await? as i64;
+        delete_in_batches(
+            &self.pool,
+            "source_events",
+            "created_at < datetime('now', '-7 days')",
+        )
+        .await?;
+        Ok((logs, admin))
     }
 
     pub async fn register(
@@ -5111,7 +5267,7 @@ impl Db {
                 "SELECT a.id, a.title, a.summary, a.author, s.name AS source_name FROM news_articles a
                  JOIN news_sources s ON s.id = a.source_id
                  WHERE s.archived_at IS NULL AND s.internal = 0
-                 AND COALESCE(NULLIF(a.fetched_at, ''), a.published_at) >= ?
+                 AND datetime(COALESCE(NULLIF(a.fetched_at, ''), a.published_at)) >= datetime(?)
                  AND NOT EXISTS (SELECT 1 FROM news_keyword_notified n WHERE n.user_id = ? AND n.article_id = a.id)
                  ORDER BY a.id DESC LIMIT 400",
             )
@@ -6285,7 +6441,10 @@ impl Db {
 
     pub async fn has_post(&self, platform: &str, external_id: &str) -> Result<bool, sqlx::Error> {
         let hit: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM posts WHERE platform = ? AND external_id = ? LIMIT 1",
+            "SELECT 1 FROM posts WHERE platform = ?1 AND external_id = ?2
+             UNION ALL
+             SELECT 1 FROM seen_posts WHERE platform = ?1 AND external_id = ?2
+             LIMIT 1",
         )
         .bind(platform)
         .bind(external_id)
@@ -6592,7 +6751,7 @@ impl Db {
             "SELECT 1 FROM subscriptions s
              JOIN kols k ON k.id = s.kol_id
              WHERE s.kol_id = ?
-               AND (s.type = 'all' OR s.type = ?)
+               AND s.type IN (?, 'both', 'all')
                AND (s.favorite = 1 OR (k.secondary = 0 AND s.secondary = 0))
              LIMIT 1",
         )
@@ -7802,7 +7961,7 @@ fn news_item(row: &sqlx::sqlite::SqliteRow, full: bool) -> Value {
         "feed_name": row.get::<Option<String>, _>("feed_name").unwrap_or_default(),
         "title": row.get::<String, _>("title"),
         "summary": row.get::<String, _>("summary"),
-        "url": row.get::<String, _>("url"),
+        "url": crate::news::web_url(&row.get::<String, _>("url")),
         "author": row.get::<String, _>("author"),
         "published_at": row.get::<String, _>("published_at"),
         "is_read": is_read,
@@ -7836,12 +7995,13 @@ fn topics_of(raw: &str) -> Value {
 }
 
 fn reader_html(content: &str, summary: &str) -> String {
-    if !crate::news::plain(content).trim().is_empty() {
-        return content.to_string();
+    let content = crate::news::sanitize_html(content);
+    if !crate::news::plain(&content).trim().is_empty() {
+        return content;
     }
     let summary = summary.trim();
     if summary.is_empty() {
-        return content.to_string();
+        return content;
     }
     let para = format!("<p>{}</p>", escape_html(summary));
     if content.contains("<img") {
@@ -8352,6 +8512,9 @@ async fn rebuild_users_autoincrement(
         }
     }
     for table in &tables {
+        if AUDIT_TABLES.contains(&table.as_str()) {
+            continue;
+        }
         sqlx::query(&format!(
             "DELETE FROM \"{table}\" WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)"
         ))
@@ -8485,6 +8648,232 @@ fn read_sql_name(sql: &str, index: usize) -> Result<(usize, String), String> {
         return Err(invalid.into());
     }
     Ok((index + end, rest[..end].to_string()))
+}
+
+/// Rewrites legacy `news_articles.published_at` values (RFC 822 strings, naive
+/// Beijing-time stamps, other offsets) into the canonical UTC form. Rows already
+/// canonical are skipped, so this is cheap and safe to run on every start.
+async fn normalize_news_timestamps(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    const CANONICAL: &str =
+        "[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]+00:00";
+    let mut last_id = 0i64;
+    let mut fixed = 0usize;
+    loop {
+        let rows: Vec<(i64, String, String)> = sqlx::query_as(&format!(
+            "SELECT id, published_at, fetched_at FROM news_articles
+             WHERE id > ? AND published_at != '' AND published_at NOT GLOB '{CANONICAL}'
+             ORDER BY id LIMIT 1000"
+        ))
+        .bind(last_id)
+        .fetch_all(pool)
+        .await?;
+        let Some((id, _, _)) = rows.last() else {
+            break;
+        };
+        last_id = *id;
+        let mut tx = pool.begin().await?;
+        for (id, published, fetched) in &rows {
+            let value = crate::news::utc_stamp(published)
+                .or_else(|| crate::news::utc_stamp_zoneless_utc(fetched))
+                .unwrap_or_default();
+            sqlx::query(
+                "UPDATE news_articles SET published_at = COALESCE(NULLIF(?, ''),
+                     strftime('%Y-%m-%dT%H:%M:%S+00:00', 'now')) WHERE id = ?",
+            )
+            .bind(value)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        fixed += rows.len();
+    }
+    if fixed > 0 {
+        tracing::info!(fixed, "资讯发布时间已统一为 UTC");
+    }
+    Ok(())
+}
+
+/// Deletes matching rows a few thousand at a time. The pool has a single
+/// connection, so one huge DELETE would stall every request behind it; between
+/// batches other callers get the connection back.
+async fn delete_in_batches(
+    pool: &SqlitePool,
+    table: &str,
+    filter: &str,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {filter} LIMIT 5000)"
+    );
+    let mut total = 0;
+    loop {
+        let deleted = sqlx::query(&sql).execute(pool).await?.rows_affected();
+        total += deleted;
+        if deleted < 5000 {
+            return Ok(total);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Splits `SCHEMA` into table/data statements and index statements so indexes
+/// are only built after legacy tables have been brought up to date.
+fn split_schema(schema: &str) -> (String, Vec<String>) {
+    let mut tables = String::new();
+    let mut indexes = Vec::new();
+    for statement in schema.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        let head = statement.to_ascii_uppercase();
+        if head.starts_with("CREATE INDEX") || head.starts_with("CREATE UNIQUE INDEX") {
+            indexes.push(statement.to_string());
+        } else {
+            tables.push_str(statement);
+            tables.push_str(";\n");
+        }
+    }
+    (tables, indexes)
+}
+
+async fn create_schema_indexes(pool: &SqlitePool, indexes: &[String]) -> Result<(), sqlx::Error> {
+    for statement in indexes {
+        // A legacy table that still lacks a column must not abort startup; the
+        // index is an optimisation (or a guard that the app also enforces).
+        if let Err(err) = sqlx::raw_sql(statement).execute(pool).await {
+            tracing::warn!(%err, statement, "索引创建失败，已跳过");
+        }
+    }
+    Ok(())
+}
+
+struct SchemaColumn {
+    table: String,
+    name: String,
+    definition: String,
+}
+
+fn schema_columns(schema: &str) -> Vec<SchemaColumn> {
+    let mut out = Vec::new();
+    for statement in schema.split(';') {
+        let statement = statement.trim();
+        let Some(rest) = statement
+            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+        let (Some(open), Some(close)) = (rest.find('('), rest.rfind(')')) else {
+            continue;
+        };
+        let table = rest[..open].trim().to_string();
+        let mut depth = 0usize;
+        let mut start = open + 1;
+        let body_end = close;
+        let mut parts = Vec::new();
+        for (i, ch) in rest[..body_end]
+            .char_indices()
+            .skip_while(|(i, _)| *i <= open)
+        {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(&rest[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&rest[start..body_end]);
+        for part in parts {
+            let part = part.trim();
+            let upper = part.to_ascii_uppercase();
+            if [
+                "PRIMARY KEY",
+                "FOREIGN KEY",
+                "UNIQUE",
+                "CHECK",
+                "CONSTRAINT",
+            ]
+            .iter()
+            .any(|kw| upper.starts_with(kw))
+            {
+                continue;
+            }
+            let Some((name, definition)) = part.split_once(char::is_whitespace) else {
+                continue;
+            };
+            out.push(SchemaColumn {
+                table: table.clone(),
+                name: name.to_string(),
+                definition: definition.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// A definition SQLite's `ALTER TABLE ... ADD COLUMN` accepts, if any. Text
+/// columns whose default is an expression fall back to an empty string, which
+/// is what the app already treats as "unknown".
+fn addable_definition(definition: &str) -> Option<String> {
+    let upper = definition.to_ascii_uppercase();
+    if upper.contains("PRIMARY KEY") || upper.contains("UNIQUE") || upper.contains("REFERENCES") {
+        return None;
+    }
+    if let Some(at) = upper
+        .find("DEFAULT (")
+        .or_else(|| upper.find("DEFAULT CURRENT_"))
+    {
+        if !upper.starts_with("TEXT") {
+            return None;
+        }
+        return Some(format!("{}DEFAULT ''", &definition[..at]));
+    }
+    (!upper.contains("NOT NULL") || upper.contains("DEFAULT")).then(|| definition.to_string())
+}
+
+/// Adds any column the current `SCHEMA` declares but an old database (Python
+/// era, old backup) lacks, as long as SQLite can add it in place.
+async fn ensure_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let mut known: HashMap<String, Vec<String>> = HashMap::new();
+    for column in schema_columns(SCHEMA) {
+        if !known.contains_key(&column.table) {
+            let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+                .bind(&column.table)
+                .fetch_all(pool)
+                .await?;
+            known.insert(column.table.clone(), existing);
+        }
+        let existing = &known[&column.table];
+        if existing.is_empty()
+            || existing
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name))
+        {
+            continue;
+        }
+        let Some(definition) = addable_definition(&column.definition) else {
+            tracing::warn!(
+                table = column.table,
+                column = column.name,
+                "旧库缺少该列且无法在线补齐"
+            );
+            continue;
+        };
+        add_column(
+            pool,
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {definition}",
+                column.table, column.name
+            ),
+        )
+        .await?;
+        tracing::info!(table = column.table, column = column.name, "已为旧库补齐列");
+    }
+    Ok(())
 }
 
 async fn add_column(pool: &SqlitePool, sql: &str) -> Result<(), sqlx::Error> {
@@ -8766,13 +9155,98 @@ async fn ensure_etf_premium_columns(pool: &SqlitePool) -> Result<(), sqlx::Error
     Ok(())
 }
 
+/// 旧版 IMA PDF 落盘为 `MMDD/标题`，不同库或不同年份的同名研报会互相覆盖。
+/// 对仍指向同一旧路径的多行，只保留最后写入的那一行（文件内容属于它），其余清空
+/// `pdf_path` 让下一轮同步按新路径重下。可重复执行。
+/// Collision repairs that keep failing stop being retried after this many rounds.
+pub(crate) const IMA_REDOWNLOAD_MAX_ATTEMPTS: i64 = 5;
+
+async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO ima_redownload (group_id, media_id)
+         SELECT d.group_id, d.media_id FROM ima_document_index AS d
+         WHERE d.pdf_path != '' AND d.pdf_path NOT LIKE 'ima/%'
+           AND d.group_id NOT LIKE 'local-%' AND d.group_id NOT LIKE 'feishu-%'
+           AND EXISTS (
+             SELECT 1 FROM ima_document_index o
+             WHERE o.pdf_path = d.pdf_path
+               AND o.group_id NOT LIKE 'local-%' AND o.group_id NOT LIKE 'feishu-%'
+               AND (o.group_id != d.group_id OR o.media_id != d.media_id)
+               AND (o.downloaded_at > d.downloaded_at
+                    OR (o.downloaded_at = d.downloaded_at
+                        AND (o.group_id > d.group_id
+                             OR (o.group_id = d.group_id AND o.media_id > d.media_id))))
+           )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    let cleared = sqlx::query(
+        "UPDATE ima_document_index SET pdf_path = ''
+         WHERE pdf_path != '' AND pdf_path NOT LIKE 'ima/%'
+           AND (group_id, media_id) IN (SELECT group_id, media_id FROM ima_redownload)",
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    tx.commit().await?;
+    if cleared > 0 {
+        tracing::warn!(cleared, "IMA PDF 旧路径存在碰撞，已清空待重新下载");
+    }
+    Ok(())
+}
+
+/// Unique partial indexes for push binding IDs and feed URLs. Legacy databases
+/// might already hold duplicates; those are left untouched (the index is
+/// skipped with a warning) so no user silently loses a binding on upgrade.
+async fn ensure_binding_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    // A failed add_news_source used to leave a row stuck on slug 'pending',
+    // which then made every later insert collide on the UNIQUE slug.
+    sqlx::query("UPDATE OR IGNORE news_sources SET slug = 's' || id WHERE slug = 'pending'")
+        .execute(pool)
+        .await?;
+    for (table, column, index) in [
+        ("users", "telegram_chat_id", "idx_users_telegram_chat_id"),
+        ("users", "feishu_open_id", "idx_users_feishu_open_id"),
+        ("news_feeds", "url", "idx_news_feeds_url"),
+    ] {
+        let duplicates: i64 = sqlx::query_scalar(&format!(
+            "SELECT COUNT(*) FROM (SELECT {column} FROM {table} WHERE {column} != ''
+             GROUP BY {column} HAVING COUNT(*) > 1)"
+        ))
+        .fetch_one(pool)
+        .await?;
+        if duplicates > 0 {
+            tracing::warn!(
+                column,
+                duplicates,
+                "存在重复绑定，暂不建立唯一索引，请在后台解绑重复项"
+            );
+            continue;
+        }
+        sqlx::raw_sql(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table}({column}) WHERE {column} != ''"
+        ))
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 async fn ensure_hot_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     sqlx::raw_sql(
         "CREATE INDEX IF NOT EXISTS idx_push_logs_post ON push_logs(post_id, channel, user_id);
          CREATE INDEX IF NOT EXISTS idx_push_logs_created ON push_logs(created_at);
          CREATE INDEX IF NOT EXISTS idx_push_logs_user ON push_logs(user_id);
          CREATE INDEX IF NOT EXISTS idx_posts_fetched ON posts(fetched_at);
-         CREATE INDEX IF NOT EXISTS idx_news_articles_published ON news_articles(published_at);",
+         CREATE INDEX IF NOT EXISTS idx_news_articles_published ON news_articles(published_at);
+         CREATE INDEX IF NOT EXISTS idx_subscriptions_kol ON subscriptions(kol_id);
+         CREATE INDEX IF NOT EXISTS idx_source_events_platform_created ON source_events(platform, created_at);
+         CREATE INDEX IF NOT EXISTS idx_source_events_created ON source_events(created_at);
+         CREATE INDEX IF NOT EXISTS idx_news_reads_article ON news_reads(article_id);
+         CREATE INDEX IF NOT EXISTS idx_report_tickers_code ON report_extraction_tickers(code);
+         CREATE INDEX IF NOT EXISTS idx_report_tickers_name ON report_extraction_tickers(name);
+         CREATE INDEX IF NOT EXISTS idx_ima_doc_downloaded ON ima_document_index(downloaded_at);",
     )
     .execute(pool)
     .await?;
@@ -9598,7 +10072,7 @@ mod tests {
             .await
             .unwrap();
         db.subscribe(user.id, true, kol, "post").await.unwrap();
-        let targets = db.push_targets(kol).await.unwrap();
+        let targets = db.push_targets(kol, "post").await.unwrap();
         assert_eq!(targets.len(), 1);
         assert!(!targets[0].notify_enabled);
         assert!(targets[0].wecom_webhook.contains("qyapi"));
@@ -11088,7 +11562,8 @@ mod tests {
                 .id,
             id
         );
-        sqlx::query("INSERT INTO users (username, telegram_chat_id) VALUES ('duplicate1', 'shared'), ('duplicate2', 'shared')")
+        sqlx::raw_sql("DROP INDEX idx_users_telegram_chat_id;
+             INSERT INTO users (username, telegram_chat_id) VALUES ('duplicate1', 'shared'), ('duplicate2', 'shared')")
             .execute(db.pool()).await.unwrap();
         let (code, _) = db.issue_bind_code(target, 6600).await.unwrap();
         assert!(matches!(
@@ -11726,7 +12201,13 @@ mod tests {
         assert!(count_user_rows(&db, reader.id).await >= 14);
         db.delete_user(admin.id, reader.id).await.unwrap();
         assert!(db.user_by_id(reader.id).await.unwrap().is_none());
-        assert_eq!(count_user_rows(&db, reader.id).await, 0);
+        let audit: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_logs WHERE user_id = ?")
+            .bind(reader.id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(audit, 1);
+        assert_eq!(count_user_rows(&db, reader.id).await, audit);
         let admin_push: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM webpush_subscriptions WHERE user_id = ?")
                 .bind(admin.id)
@@ -11773,5 +12254,535 @@ mod tests {
             total += n;
         }
         total
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+
+    async fn fresh_db(tag: &str) -> (Db, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-{tag}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        (Db::open(&path).await.unwrap(), path)
+    }
+
+    async fn add_user(db: &Db, name: &str) -> i64 {
+        sqlx::query("INSERT INTO users (username, password_hash) VALUES (?, 'x')")
+            .bind(name)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.user_by_username(name).await.unwrap().unwrap().id
+    }
+
+    #[tokio::test]
+    async fn both_subscribers_open_the_gate_and_fanout_filters_per_user() {
+        let (db, path) = fresh_db("push-both").await;
+        let kol = db
+            .add_kol("xueqiu", "甲", "both-1", None, false, false, false)
+            .await
+            .unwrap();
+        let both = add_user(&db, "both").await;
+        db.subscribe(both, true, kol, "both").await.unwrap();
+        assert!(db.should_push(kol, "post").await.unwrap());
+        assert!(db.should_push(kol, "reply").await.unwrap());
+
+        let reply_only = add_user(&db, "reply_only").await;
+        db.subscribe(reply_only, true, kol, "reply").await.unwrap();
+        let side = add_user(&db, "side").await;
+        db.subscribe(side, true, kol, "post").await.unwrap();
+        db.set_secondary(side, kol, true).await.unwrap();
+        let side_fav = add_user(&db, "side_fav").await;
+        db.subscribe(side_fav, true, kol, "post").await.unwrap();
+        db.set_secondary(side_fav, kol, true).await.unwrap();
+        db.set_favorite(side_fav, kol, true).await.unwrap();
+
+        let ids = |targets: Vec<PushTarget>| {
+            let mut ids: Vec<i64> = targets.iter().map(|t| t.user_id).collect();
+            ids.sort();
+            ids
+        };
+        let mut want_post = vec![both, side_fav];
+        want_post.sort();
+        assert_eq!(ids(db.push_targets(kol, "post").await.unwrap()), want_post);
+        let mut want_reply = vec![both, reply_only];
+        want_reply.sort();
+        assert_eq!(
+            ids(db.push_targets(kol, "reply").await.unwrap()),
+            want_reply
+        );
+
+        let quiet = db
+            .add_kol("xueqiu", "乙", "both-2", None, false, true, false)
+            .await
+            .unwrap();
+        db.subscribe(both, true, quiet, "both").await.unwrap();
+        assert!(!db.should_push(quiet, "post").await.unwrap());
+        assert!(db.push_targets(quiet, "post").await.unwrap().is_empty());
+        db.set_favorite(both, quiet, true).await.unwrap();
+        assert!(db.should_push(quiet, "post").await.unwrap());
+        assert_eq!(
+            ids(db.push_targets(quiet, "post").await.unwrap()),
+            vec![both]
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn retention_keeps_purged_posts_known_so_they_are_not_pushed_again() {
+        let (db, path) = fresh_db("seen-posts").await;
+        let kol = db
+            .add_kol("xueqiu", "甲", "seen-1", None, false, false, false)
+            .await
+            .unwrap();
+        db.save_fetched(
+            kol,
+            "pinned",
+            "",
+            "置顶",
+            "post",
+            "[]",
+            "",
+            "2025-01-01 00:00",
+        )
+        .await
+        .unwrap();
+        db.save_fetched(
+            kol,
+            "fresh",
+            "",
+            "新帖",
+            "post",
+            "[]",
+            "",
+            "2026-10-01 00:00",
+        )
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE posts SET fetched_at = datetime('now', '-40 days') WHERE external_id = 'pinned'",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let (removed, _, _, _) = db.prune_retention_if_due().await.unwrap();
+        assert_eq!(removed, 1);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM posts")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 1);
+        assert!(db.has_post("xueqiu", "pinned").await.unwrap());
+        assert!(db.has_post("xueqiu", "fresh").await.unwrap());
+        assert!(!db.has_post("xueqiu", "never").await.unwrap());
+        assert!(!db.has_post("weibo", "pinned").await.unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn colliding_legacy_ima_pdf_paths_are_cleared_for_redownload() {
+        let (db, path) = fresh_db("ima-collide").await;
+        for (group, media, pdf, at) in [
+            ("g1", "m1", "1114/晨会纪要.pdf", "2026-01-01 00:00:00"),
+            ("g2", "m2", "1114/晨会纪要.pdf", "2026-02-01 00:00:00"),
+            ("local-x", "m3", "1114/晨会纪要.pdf", "2026-03-01 00:00:00"),
+            ("g3", "m4", "0101/独有.pdf", "2026-01-01 00:00:00"),
+            ("g4", "m5", "ima/g4/2026/0101/m5.pdf", "2026-01-01 00:00:00"),
+            ("g1", "m9", "", "2025-01-01 00:00:00"),
+            ("g5", "m10", "", "2025-01-01 00:00:00"),
+        ] {
+            sqlx::query(
+                "INSERT INTO ima_document_index (group_id, media_id, pdf_path, downloaded_at) VALUES (?, ?, ?, ?)",
+            )
+            .bind(group)
+            .bind(media)
+            .bind(pdf)
+            .bind(at)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        }
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let pdf = |group: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT pdf_path FROM ima_document_index WHERE group_id = ?",
+                )
+                .bind(group)
+                .fetch_one(db.pool())
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(pdf("g1").await, "");
+        assert_eq!(pdf("g2").await, "1114/晨会纪要.pdf");
+        assert_eq!(pdf("local-x").await, "1114/晨会纪要.pdf");
+        assert_eq!(pdf("g3").await, "0101/独有.pdf");
+        assert_eq!(pdf("g4").await, "ima/g4/2026/0101/m5.pdf");
+        let g1 = db.ima_redownload_ids("g1").await.unwrap();
+        assert_eq!(g1, HashSet::from(["m1".to_string()]));
+        assert!(db.ima_redownload_ids("g2").await.unwrap().is_empty());
+        assert!(db.ima_redownload_ids("g5").await.unwrap().is_empty());
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let kept: String =
+            sqlx::query_scalar("SELECT pdf_path FROM ima_document_index WHERE group_id = 'g2'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(kept, "1114/晨会纪要.pdf");
+        assert_eq!(
+            db.ima_redownload_ids("g1").await.unwrap(),
+            HashSet::from(["m1".to_string()])
+        );
+        assert!(db.ima_redownload_ids("g5").await.unwrap().is_empty());
+        for _ in 0..IMA_REDOWNLOAD_MAX_ATTEMPTS {
+            db.note_ima_redownload_failure("g1", "m1").await.unwrap();
+        }
+        assert!(db.ima_redownload_ids("g1").await.unwrap().is_empty());
+        db.mark_ima_pdf("g1", "m1", "ima/g1/2026/0101/m1.pdf")
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ima_redownload")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn binding_ids_are_unique_unless_legacy_duplicates_exist() {
+        let (db, path) = fresh_db("binding-unique").await;
+        let a = add_user(&db, "a").await;
+        let b = add_user(&db, "b").await;
+        sqlx::query("UPDATE users SET telegram_chat_id = '7' WHERE id = ?")
+            .bind(a)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            sqlx::query("UPDATE users SET telegram_chat_id = '7' WHERE id = ?")
+                .bind(b)
+                .execute(db.pool())
+                .await
+                .is_err()
+        );
+        sqlx::raw_sql(
+            "DROP INDEX idx_users_feishu_open_id;
+             UPDATE users SET feishu_open_id = 'ou_dup';",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        assert!(db.user_by_feishu_open_id("ou_dup").await.unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn minimal_legacy_schema_upgrades_in_place_and_is_rerunnable() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-legacy-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                     password_hash TEXT NOT NULL DEFAULT '', is_admin INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO users (username, password_hash, is_admin) VALUES ('old-admin', 'h', 1);
+                 CREATE TABLE kol_requests (id INTEGER PRIMARY KEY, platform TEXT NOT NULL,
+                     external_id TEXT NOT NULL, user_id INTEGER NOT NULL);
+                 INSERT INTO kol_requests (platform, external_id, user_id) VALUES ('xueqiu', '1', 1);
+                 CREATE TABLE ima_document_index (group_id TEXT NOT NULL, media_id TEXT NOT NULL,
+                     name TEXT NOT NULL DEFAULT '', PRIMARY KEY (group_id, media_id));
+                 INSERT INTO ima_document_index (group_id, media_id, name) VALUES ('g', 'm', 'old.pdf');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        for _ in 0..2 {
+            let db = Db::open(&path).await.unwrap();
+            let user = db.user_by_username("old-admin").await.unwrap().unwrap();
+            assert!(user.is_admin);
+            assert_eq!(user.wechat_openid, "");
+            let indexes: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            for expected in [
+                "idx_users_wechat_openid",
+                "uq_kol_requests_pending",
+                "idx_ima_doc_latest",
+                "idx_ima_doc_group_latest",
+            ] {
+                assert!(indexes.iter().any(|name| name == expected), "{expected}");
+            }
+            let status: String = sqlx::query_scalar("SELECT status FROM kol_requests")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(status, "pending");
+            db.pool().close().await;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_split_keeps_every_statement_and_defers_indexes() {
+        let (tables, indexes) = split_schema(SCHEMA);
+        assert!(!tables.to_ascii_uppercase().contains("CREATE INDEX"));
+        assert!(!tables.to_ascii_uppercase().contains("CREATE UNIQUE INDEX"));
+        assert!(indexes.len() >= 10);
+        assert_eq!(
+            addable_definition("TEXT NOT NULL DEFAULT (datetime('now'))").as_deref(),
+            Some("TEXT NOT NULL DEFAULT ''")
+        );
+        assert_eq!(addable_definition("INTEGER PRIMARY KEY"), None);
+        assert_eq!(addable_definition("INTEGER NOT NULL"), None);
+        assert!(schema_columns(SCHEMA)
+            .iter()
+            .any(|column| column.table == "users" && column.name == "wechat_openid"));
+    }
+
+    #[tokio::test]
+    async fn batched_deletes_remove_everything_that_matches() {
+        let (db, path) = fresh_db("batched-delete").await;
+        sqlx::raw_sql(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12001)
+             INSERT INTO source_events (platform, status, created_at)
+             SELECT CASE WHEN i % 3 = 0 THEN 'keep' ELSE 'x' END, 'ok',
+                    CASE WHEN i % 3 = 0 THEN datetime('now') ELSE datetime('now', '-30 days') END
+             FROM n",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let deleted = delete_in_batches(
+            db.pool(),
+            "source_events",
+            "created_at < datetime('now', '-7 days')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 8001);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 4000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn legacy_news_timestamps_are_migrated_and_compare_correctly() {
+        let (db, path) = fresh_db("news-ts").await;
+        sqlx::raw_sql(
+            "INSERT INTO news_sources (id, name, slug) VALUES (1, 'S', 's');
+             INSERT INTO news_articles (id, source_id, external_id, title, published_at) VALUES
+                 (1, 1, 'rfc', 'old rfc', 'Sat, 01 Aug 2020 08:00:00 GMT'),
+                 (2, 1, 'naive', 'naive beijing', '2026-10-17 08:00'),
+                 (3, 1, 'offset', 'offset', '2026-10-17T08:00:00+08:00'),
+                 (4, 1, 'junk', 'junk', 'not a date');
+             INSERT INTO news_articles (id, source_id, external_id, title, published_at, fetched_at) VALUES
+                 (5, 1, 'fallback', 'fallback', 'not a date', '2026-10-16 18:30:00'),
+                 (6, 1, 'fallback-z', 'fallback z', 'garbage', '2026-10-16T18:30:00Z');",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let rows: Vec<(i64, String)> =
+            sqlx::query_as("SELECT id, published_at FROM news_articles ORDER BY id")
+                .fetch_all(db.pool())
+                .await
+                .unwrap();
+        assert_eq!(rows[0].1, "2020-08-01T08:00:00+00:00");
+        assert_eq!(rows[1].1, "2026-10-17T00:00:00+00:00");
+        assert_eq!(rows[2].1, "2026-10-17T00:00:00+00:00");
+        assert!(crate::news::utc_stamp(&rows[3].1).is_some());
+        assert_eq!(rows[4].1, "2026-10-16T18:30:00+00:00");
+        assert_eq!(rows[5].1, "2026-10-16T18:30:00+00:00");
+        let unread_after_seen: bool = sqlx::query_scalar(
+            "SELECT datetime(published_at) <= datetime('2026-10-17 00:30:00') FROM news_articles WHERE id = 2",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert!(unread_after_seen);
+        db.set_setting("stats_posts_retention_days", "30")
+            .await
+            .unwrap();
+        db.prune_retention_if_due().await.unwrap();
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM news_articles ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(!ids.contains(&1), "RFC 822 articles must age out");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_update_is_all_or_nothing() {
+        let (db, path) = fresh_db("admin-update-tx").await;
+        let a = add_user(&db, "alice").await;
+        add_user(&db, "bob").await;
+        let err = db
+            .update_admin_user(999, a, Some("BOB"), Some("new-hash"), Some(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::Bad("用户名已存在")));
+        let alice = db.user_by_id(a).await.unwrap().unwrap();
+        assert!(!alice.is_admin);
+        assert_eq!(alice.password_hash, "x");
+        assert_eq!(alice.token_version, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stuck_pending_news_source_is_repaired_and_feed_urls_are_unique() {
+        let (db, path) = fresh_db("news-source-tx").await;
+        sqlx::query("INSERT INTO news_sources (slug, name) VALUES ('pending', 'half-created')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let first = db.add_news_source("甲", "").await.unwrap();
+        let second = db.add_news_source("乙", "").await.unwrap();
+        let slugs: Vec<String> = sqlx::query_scalar("SELECT slug FROM news_sources ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(!slugs.iter().any(|slug| slug.starts_with("pending")));
+        assert_eq!(slugs[1], format!("s{first}"));
+        assert_eq!(slugs[2], format!("s{second}"));
+        db.add_news_feed(first, "feed", "https://example.com/rss")
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.add_news_feed(second, "dup", "https://example.com/rss")
+                .await,
+            Err(CatalogError::Bad("Feed URL 已存在"))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_keeps_audit_history() {
+        let (db, path) = fresh_db("delete-audit").await;
+        let admin = add_user(&db, "root").await;
+        let gone = add_user(&db, "gone").await;
+        sqlx::query(
+            "INSERT INTO admin_logs (user_id, action) VALUES (?, 'grant'), (0, 'system');
+             ",
+        )
+        .bind(gone)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO push_logs (post_id, channel, status, user_id) VALUES (1, 'bark', 'ok', ?)",
+        )
+        .bind(gone)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.delete_user(admin, gone).await.unwrap();
+        let admin_logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_logs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(admin_logs, 2);
+        let push_owner: Option<i64> = sqlx::query_scalar("SELECT user_id FROM push_logs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(push_owner, None);
+        assert!(db.user_by_id(gone).await.unwrap().is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn hot_lookup_indexes_are_added_and_used() {
+        let (db, path) = fresh_db("hot-lookups").await;
+        let names = [
+            "idx_ima_doc_downloaded",
+            "idx_news_reads_article",
+            "idx_report_tickers_code",
+            "idx_report_tickers_name",
+            "idx_source_events_created",
+            "idx_source_events_platform_created",
+            "idx_subscriptions_kol",
+        ];
+        for name in names {
+            sqlx::query(&format!("DROP INDEX {name}"))
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let plan = |sql: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+        };
+        for (sql, index) in [
+            ("SELECT user_id FROM subscriptions WHERE kol_id = 1", "idx_subscriptions_kol"),
+            (
+                "SELECT status FROM source_events WHERE platform = 'xueqiu' AND created_at >= datetime('now', '-24 hours')",
+                "idx_source_events_platform_created",
+            ),
+            (
+                "SELECT id FROM source_events WHERE created_at < datetime('now', '-7 days')",
+                "idx_source_events_created",
+            ),
+            ("SELECT user_id FROM news_reads WHERE article_id = 1", "idx_news_reads_article"),
+            ("SELECT media_id FROM report_extraction_tickers WHERE code = '600519'", "idx_report_tickers_code"),
+            ("SELECT media_id FROM report_extraction_tickers WHERE name = '茅台'", "idx_report_tickers_name"),
+            (
+                "SELECT media_id FROM ima_document_index WHERE downloaded_at >= '2026-01-01'",
+                "idx_ima_doc_downloaded",
+            ),
+        ] {
+            let detail = plan(sql).await;
+            assert!(detail.contains(index), "{sql}: {detail}");
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

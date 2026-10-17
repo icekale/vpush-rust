@@ -57,24 +57,31 @@ pub async fn read_file(
     }
     let name = file_name(&hits, file_id);
     let root = cache_dir(db).await?;
-    if let Some(path) = root.as_ref().and_then(|dir| existing(dir, file_id)) {
-        let bytes = std::fs::read(&path).map_err(|_| fail(502, "附件下载失败"))?;
-        let fallback = path
-            .file_name()
-            .and_then(|item| item.to_str())
-            .unwrap_or("download")
-            .to_string();
-        return Ok(Downloaded {
-            disposition: content_disposition(&name, &fallback),
-            bytes,
-        });
+    if let Some(dir) = root.clone() {
+        let id = file_id.to_string();
+        let cached = tokio::task::spawn_blocking(move || {
+            existing(&dir, &id).map(|path| std::fs::read(&path).map(|bytes| (path, bytes)))
+        })
+        .await
+        .map_err(|_| fail(502, "附件下载失败"))?;
+        if let Some(cached) = cached {
+            let (path, bytes) = cached.map_err(|_| fail(502, "附件下载失败"))?;
+            let fallback = path
+                .file_name()
+                .and_then(|item| item.to_str())
+                .unwrap_or("download")
+                .to_string();
+            return Ok(Downloaded {
+                disposition: content_disposition(&name, &fallback),
+                bytes,
+            });
+        }
     }
-    let remote = fresh_url(&hits, file_id).filter(|url| url_allowed(url, system_resolve));
-    let remote = match remote {
-        Some(url) => url,
-        None => resolve_remote(db, file_id).await?,
+    let remote = match fresh_url(&hits, file_id) {
+        Some(url) if allowed_off_thread(url.clone()).await => url,
+        _ => resolve_remote(db, file_id).await?,
     };
-    if !url_allowed(&remote, system_resolve) {
+    if !allowed_off_thread(remote.clone()).await {
         return Err(fail(502, "附件地址不安全"));
     }
     let Some(dir) = root else {
@@ -97,6 +104,12 @@ pub async fn read_file(
         disposition: content_disposition(&name, &saved.file_name),
         bytes: saved.bytes,
     })
+}
+
+async fn allowed_off_thread(url: String) -> bool {
+    tokio::task::spawn_blocking(move || url_allowed(&url, system_resolve))
+        .await
+        .unwrap_or(false)
 }
 
 struct Stored {
@@ -722,14 +735,16 @@ mod tests {
 
     #[tokio::test]
     async fn purge_removes_only_unreferenced_files() {
-        let path = std::env::temp_dir().join(format!(
-            "vpush-zsxq-purge-{}-{}.db",
+        let home = std::env::temp_dir().join(format!(
+            "vpush-zsxq-purge-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
+        std::fs::create_dir_all(&home).unwrap();
+        let path = home.join("vpush.db");
         let db = Db::open(&path).await.unwrap();
         let kol = db
             .add_kol("zsxq", "g", "123", None, false, false, false)
@@ -759,7 +774,6 @@ mod tests {
         assert!(dir.join("22.pdf").is_file());
         assert!(dir.join("notes.txt").is_file());
         assert!(!dir.join("99.pdf").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

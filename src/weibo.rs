@@ -61,15 +61,18 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("微博抓取: {err}");
-                let _ = db.note_platform("weibo", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("weibo", None).await;
+    crate::supervise::spawn("weibo", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("微博抓取: {err}");
+                    let _ = db.note_platform("weibo", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("weibo", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }
@@ -305,13 +308,38 @@ fn fetch_timeline(
         req = req.set("X-XSRF-TOKEN", &xsrf);
     }
     let (status, text) = read_response(req.call()).map_err(FetchErr::Other)?;
+    classify_timeline(status, &text)
+}
+
+/// `Dead` triggers a cookie refresh, so it is reserved for answers that really
+/// mean "logged out"; proxy/CDN error pages and 5xx stay ordinary failures.
+fn classify_timeline(status: u16, text: &str) -> Result<Value, FetchErr> {
     if status == 432 {
         return Err(FetchErr::Other("微博反爬拦截（HTTP 432）".into()));
     }
-    if status == 401 || status == 403 || text.trim_start().starts_with('<') {
+    if status == 401 || status == 403 {
         return Err(FetchErr::Dead);
     }
-    let value: Value = serde_json::from_str(&text).map_err(|_| FetchErr::Dead)?;
+    if status == 429 || status >= 500 {
+        return Err(FetchErr::Other(format!("微博接口 HTTP {status}")));
+    }
+    if text.trim_start().starts_with('<') {
+        let lower = text.to_ascii_lowercase();
+        let login_page = [
+            "passport.weibo.com",
+            "login.sina.com.cn",
+            "sina visitor system",
+        ]
+        .iter()
+        .any(|marker| lower.contains(marker));
+        return Err(if login_page {
+            FetchErr::Dead
+        } else {
+            FetchErr::Other(format!("微博返回了非 JSON 页面（HTTP {status}）"))
+        });
+    }
+    let value: Value = serde_json::from_str(text)
+        .map_err(|_| FetchErr::Other(format!("微博响应无法解析（HTTP {status}）")))?;
     let msg = field_str(&value, "msg").to_lowercase();
     if value.get("ok") == Some(&json!(0)) && (msg.contains("login") || msg.contains("登录")) {
         return Err(FetchErr::Dead);
@@ -591,8 +619,8 @@ fn zone_minutes(raw: &str) -> Option<i64> {
     if raw.len() != 5 {
         return None;
     }
-    let hour: i64 = raw[1..3].parse().ok()?;
-    let minute: i64 = raw[3..5].parse().ok()?;
+    let hour: i64 = raw.get(1..3)?.parse().ok()?;
+    let minute: i64 = raw.get(3..5)?.parse().ok()?;
     Some(sign * (hour * 60 + minute))
 }
 
@@ -942,5 +970,33 @@ mod tests {
         assert_eq!(page[0]["platform"], "weibo");
         assert_eq!(page[0]["content"], "一条微博");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zone_offset_with_multibyte_input_does_not_panic() {
+        assert_eq!(zone_minutes("+中a"), None);
+        assert_eq!(zone_minutes("+0800"), Some(480));
+    }
+
+    #[test]
+    fn only_real_logouts_are_treated_as_dead_cookies() {
+        let dead =
+            |status, text: &str| matches!(classify_timeline(status, text), Err(FetchErr::Dead));
+        let other =
+            |status, text: &str| matches!(classify_timeline(status, text), Err(FetchErr::Other(_)));
+        assert!(dead(401, ""));
+        assert!(dead(403, "{}"));
+        assert!(dead(
+            200,
+            "<html><script src=\"https://passport.weibo.com/visitor\"></script>"
+        ));
+        assert!(dead(200, r#"{"ok":0,"msg":"请先登录"}"#));
+        assert!(other(502, "<html>Bad Gateway</html>"));
+        assert!(other(200, "<html>cdn error</html>"));
+        assert!(other(503, ""));
+        assert!(other(429, "{}"));
+        assert!(other(432, ""));
+        assert!(other(200, "not json"));
+        assert!(classify_timeline(200, r#"{"ok":1,"data":{"list":[]}}"#).is_ok());
     }
 }

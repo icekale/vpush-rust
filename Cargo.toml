@@ -1,6 +1,6 @@
 [package]
 name = "vpush"
-version = "1.12.279"
+version = "1.12.281"
 edition = "2021"
 rust-version = "1.95"
 
@@ -38,3 +38,4 @@ zhconv = { version = "0.3", default-features = false, features = ["compress", "o
 tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 pdf-extract = "0.12.1"
+ammonia = "4"

@@ -1,8 +1,9 @@
 //! 已落盘的飞书文档时间线。不采集、不写文件。
 //! `feishu-` 开头的库登录即可读。其它库要同时有授权和订阅。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
@@ -66,6 +67,23 @@ pub async fn timeline_all(
     if !group.is_empty() && !readable.iter().any(|source| source["group_id"] == group) {
         return Err("文档不存在");
     }
+    let wanted: Vec<String> = readable
+        .iter()
+        .filter(|source| group.is_empty() || source["group_id"] == group)
+        .map(|source| source["timeline_path"].as_str().unwrap_or("").to_string())
+        .collect();
+    let mut timelines = {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            wanted
+                .iter()
+                .map(|relative| read_timeline(&root, relative))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| "读取文档失败")?
+        .into_iter()
+    };
     let mut public_sources = Vec::new();
     let mut entries = Vec::new();
     let mut notices = Vec::new();
@@ -84,7 +102,7 @@ pub async fn timeline_all(
         if !group.is_empty() && gid != group {
             continue;
         }
-        let Some(data) = read_timeline(root, source["timeline_path"].as_str().unwrap_or("")) else {
+        let Some(data) = timelines.next().flatten() else {
             continue;
         };
         for item in data["notices"].as_array().into_iter().flatten() {
@@ -777,7 +795,7 @@ pub async fn translate_document<F>(
     translate: F,
 ) -> Result<Value, &'static str>
 where
-    F: FnOnce(&str) -> String,
+    F: FnOnce(&str) -> String + Send + 'static,
 {
     let meta = document_meta(db, user_id, is_admin, media_id, group, root).await?;
     let source = meta["abstract"].as_str().unwrap_or("");
@@ -788,7 +806,13 @@ where
             .unwrap_or(source);
         return Ok(json!({"abstract_zh": cached}));
     }
-    let translated = translate(source);
+    if !remote_translation_enabled() {
+        return Ok(json!({"abstract_zh": source}));
+    }
+    let owned = source.to_string();
+    let translated = tokio::task::spawn_blocking(move || translate(&owned))
+        .await
+        .unwrap_or_else(|_| source.to_string());
     let chosen = if collapsed(&translated, source) {
         source.to_string()
     } else {
@@ -801,6 +825,19 @@ where
             .map_err(|_| "读取文档失败")?;
     }
     Ok(json!({"abstract_zh": chosen}))
+}
+
+/// `RESEARCH_TRANSLATE=0` stops research abstracts from being sent to the
+/// third-party MyMemory API; unset keeps the existing behaviour (enabled).
+fn remote_translation_enabled() -> bool {
+    !matches!(
+        std::env::var("RESEARCH_TRANSLATE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 pub fn my_memory(text: &str) -> String {
@@ -1005,11 +1042,41 @@ pub fn asset_type(path: &Path) -> &'static str {
     }
 }
 
-fn read_timeline(root: &Path, relative: &str) -> Option<Value> {
+type TimelineCache = HashMap<PathBuf, (std::time::SystemTime, u64, Arc<Value>)>;
+
+/// Parsed timelines keyed by path and validated against mtime/size, so a page
+/// load only stats the files instead of re-reading and re-parsing every one.
+fn read_timeline(root: &Path, relative: &str) -> Option<Arc<Value>> {
+    const CAPACITY: usize = 64;
+    static CACHE: Mutex<Option<TimelineCache>> = Mutex::new(None);
     let root = root.canonicalize().ok()?;
     let path = safe_path(&root, relative)?;
-    let data: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    data.is_object().then_some(data)
+    let meta = std::fs::metadata(&path).ok()?;
+    let stamp = (meta.modified().ok()?, meta.len());
+    if let Some((modified, len, data)) = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&path)
+    {
+        if (*modified, *len) == stamp {
+            return Some(data.clone());
+        }
+    }
+    let data: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    if !data.is_object() {
+        return None;
+    }
+    let data = Arc::new(data);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if cache.len() >= CAPACITY && !cache.contains_key(&path) {
+        cache.clear();
+    }
+    cache.insert(path, (stamp.0, stamp.1, data.clone()));
+    Some(data)
 }
 
 fn safe_path(root: &Path, relative: &str) -> Option<PathBuf> {
@@ -1452,6 +1519,11 @@ mod tests {
 
     #[tokio::test]
     async fn translates_an_english_abstract_once() {
+        let _env = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
         let path = std::env::temp_dir().join(format!(
             "vpush-tr-{}-{}.db",
             std::process::id(),
@@ -1682,6 +1754,45 @@ mod tests {
             .unwrap();
         assert_eq!(timeline["type"], "feishu_timeline");
         assert!(timeline.get("extraction").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn remote_translation_can_be_switched_off() {
+        let _env = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
+        let path = std::env::temp_dir().join(format!(
+            "vpush-tr-off-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.insert_ima_document("reports", "en2", "Note", "2024-01-02", "", "")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ima_document_index SET abstract = ? WHERE media_id = 'en2'")
+            .bind("Private research that must stay on this server.")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.set_ima_kb_acl("reports", &[7]).await.unwrap();
+        db.ima_kb_subscribe(7, "reports").await.unwrap();
+        std::env::set_var("RESEARCH_TRANSLATE", "0");
+        let kept = translate_document(&db, 7, false, "en2", "reports", &PathBuf::new(), |_| {
+            panic!("must not leave the server")
+        })
+        .await;
+        std::env::remove_var("RESEARCH_TRANSLATE");
+        assert_eq!(
+            kept.unwrap()["abstract_zh"],
+            "Private research that must stay on this server."
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

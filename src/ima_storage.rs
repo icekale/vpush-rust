@@ -81,7 +81,7 @@ pub fn safe_child(root: &Path, relative: &str) -> Result<PathBuf, StorageError> 
 }
 
 pub async fn health(db: &Db, root: &Path) -> Result<Value, StorageError> {
-    let (files, bytes) = scan_files(root)?;
+    let (files, bytes) = scan_files_off(root).await?;
     let documents: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ima_document_index")
         .fetch_one(db.pool())
         .await
@@ -119,7 +119,7 @@ pub async fn consistency(db: &Db, root: &Path) -> Result<Value, StorageError> {
 
 pub async fn run_consistency(db: &Db, root: &Path) -> Result<Value, StorageError> {
     let references = referenced_files(db).await?;
-    let (files, _) = scan_files(root)?;
+    let (files, _) = scan_files_off(root).await?;
     let mut missing = Vec::new();
     for path in &references {
         if path.ends_with('/') {
@@ -158,44 +158,81 @@ pub async fn run_consistency(db: &Db, root: &Path) -> Result<Value, StorageError
     Ok(report)
 }
 
+/// Only collector downloads under `ima/` are deduplicated: local libraries,
+/// sidecars and files that have not been indexed yet are someone's real data,
+/// and identical bytes in two libraries are not a mistake.
+fn dedup_candidate(path: &str) -> bool {
+    path.starts_with("ima/")
+        && path.to_ascii_lowercase().ends_with(".pdf")
+        && !path.split('/').any(|part| part.starts_with('.'))
+}
+
+fn hash_file(path: &Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hasher.finalize().to_vec());
+        }
+        hasher.update(&buf[..n]);
+    }
+}
+
 pub async fn dedup(db: &Db, root: &Path) -> Result<Value, StorageError> {
     let references = referenced_files(db).await?;
-    let (files, _) = scan_files(root)?;
-    let mut by_hash: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
-    for (path, _) in files {
-        if references.contains(&path)
-            || references
-                .iter()
-                .filter(|reference| reference.ends_with('/'))
-                .any(|reference| path.starts_with(reference.as_str()))
-        {
-            continue;
-        }
-        let absolute = safe_child(root, &path)?;
-        let digest = Sha256::digest(
-            fs::read(&absolute).map_err(|_| StorageError::internal("读取归档文件失败"))?,
-        );
-        by_hash.entry(digest.to_vec()).or_default().push(path);
-    }
-    let mut removed = Vec::new();
-    for paths in by_hash.values_mut() {
-        paths.sort();
-        for path in paths.iter().skip(1) {
-            let absolute = safe_child(root, path)?;
-            if absolute
-                .symlink_metadata()
-                .map(|meta| meta.file_type().is_symlink())
-                .unwrap_or(true)
+    let root_owned = root.to_path_buf();
+    let removed = tokio::task::spawn_blocking(move || -> Result<Vec<String>, StorageError> {
+        let root = root_owned.as_path();
+        let (files, _) = scan_files(root)?;
+        let mut by_hash: BTreeMap<Vec<u8>, Vec<String>> = BTreeMap::new();
+        for (path, _) in files {
+            if !dedup_candidate(&path)
+                || references.contains(&path)
+                || references
+                    .iter()
+                    .filter(|reference| reference.ends_with('/'))
+                    .any(|reference| path.starts_with(reference.as_str()))
             {
                 continue;
             }
-            fs::remove_file(absolute)
-                .map_err(|_| StorageError::internal("删除重复归档文件失败"))?;
-            removed.push(path.clone());
+            let absolute = safe_child(root, &path)?;
+            let digest =
+                hash_file(&absolute).map_err(|_| StorageError::internal("读取归档文件失败"))?;
+            by_hash.entry(digest).or_default().push(path);
         }
-    }
+        let mut removed = Vec::new();
+        for paths in by_hash.values_mut() {
+            paths.sort();
+            for path in paths.iter().skip(1) {
+                let absolute = safe_child(root, path)?;
+                if absolute
+                    .symlink_metadata()
+                    .map(|meta| meta.file_type().is_symlink())
+                    .unwrap_or(true)
+                {
+                    continue;
+                }
+                fs::remove_file(absolute)
+                    .map_err(|_| StorageError::internal("删除重复归档文件失败"))?;
+                removed.push(path.clone());
+            }
+        }
+        Ok(removed)
+    })
+    .await
+    .map_err(|_| StorageError::internal("去重任务失败"))??;
     let report = run_consistency(db, root).await?;
     Ok(json!({"removed": removed, "report": report}))
+}
+
+async fn scan_files_off(root: &Path) -> Result<(Vec<(String, u64)>, u64), StorageError> {
+    let root = root.to_path_buf();
+    tokio::task::spawn_blocking(move || scan_files(&root))
+        .await
+        .map_err(|_| StorageError::internal("读取知识库存储失败"))?
 }
 
 pub async fn refresh(db: &Db, root: &Path) -> Result<Value, StorageError> {
@@ -376,6 +413,10 @@ mod tests {
         fs::write(root.join("local/orphan.pdf"), b"orphan").unwrap();
         fs::write(root.join("local/duplicate-a.pdf"), b"duplicate").unwrap();
         fs::write(root.join("local/duplicate-b.pdf"), b"duplicate").unwrap();
+        fs::create_dir_all(root.join("ima/g/2026/1017")).unwrap();
+        fs::write(root.join("ima/g/2026/1017/x.pdf"), b"downloaded twice").unwrap();
+        fs::write(root.join("ima/g/2026/1017/y.pdf"), b"downloaded twice").unwrap();
+        fs::write(root.join("ima/g/2026/1017/x.json"), b"downloaded twice").unwrap();
 
         let db_path =
             std::env::temp_dir().join(format!("vpush-ima-storage-db-{}", std::process::id()));
@@ -390,6 +431,9 @@ mod tests {
         assert_eq!(
             report["orphan"],
             json!([
+                "ima/g/2026/1017/x.json",
+                "ima/g/2026/1017/x.pdf",
+                "ima/g/2026/1017/y.pdf",
                 "local/duplicate-a.pdf",
                 "local/duplicate-b.pdf",
                 "local/orphan.pdf"
@@ -397,8 +441,11 @@ mod tests {
         );
 
         let dedup = dedup(&db, &root).await.unwrap();
-        assert_eq!(dedup["removed"], json!(["local/duplicate-b.pdf"]));
+        assert_eq!(dedup["removed"], json!(["ima/g/2026/1017/y.pdf"]));
+        assert!(root.join("ima/g/2026/1017/x.pdf").is_file());
+        assert!(root.join("ima/g/2026/1017/x.json").is_file());
         assert!(root.join("local/duplicate-a.pdf").is_file());
+        assert!(root.join("local/duplicate-b.pdf").is_file());
         assert!(root.join("local/a.pdf").is_file());
         let _ = fs::remove_dir_all(root);
         let _ = fs::remove_file(db_path);

@@ -25,8 +25,8 @@ pub fn enabled() -> bool {
 }
 
 pub fn mask_app_id(app_id: &str) -> String {
-    if app_id.len() > 8 {
-        format!("{}…", &app_id[..8])
+    if app_id.chars().count() > 8 {
+        format!("{}…", app_id.chars().take(8).collect::<String>())
     } else {
         "…".into()
     }
@@ -531,11 +531,12 @@ async fn issue_code(db: &Db, session: &FeishuSession, now: i64) -> Result<(), Pe
     let expires = now + BIND_TTL;
     db.save_feishu_bind_code(&session.session_id, &hash_code(&code), expires)
         .await?;
-    CODES
-        .lock()
-        .expect("feishu codes")
-        .get_or_insert_with(HashMap::new)
-        .insert(session.session_id.clone(), (code, expires));
+    {
+        let mut guard = CODES.lock().expect("feishu codes");
+        let codes = guard.get_or_insert_with(HashMap::new);
+        codes.retain(|_, (_, expires)| *expires >= now);
+        codes.insert(session.session_id.clone(), (code, expires));
+    }
     crate::feishu_ws::ensure_listener(db.clone(), session.session_id.clone());
     Ok(())
 }
@@ -607,7 +608,7 @@ fn open_secret(key_b64: &str, stored: &str) -> Result<String, String> {
     String::from_utf8(plain).map_err(|_| "密文无效".into())
 }
 
-fn decode_key(key_b64: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_key(key_b64: &str) -> Result<Vec<u8>, String> {
     let bytes = URL_SAFE
         .decode(key_b64)
         .map_err(|_| "FEISHU_CREDENTIAL_KEY 无效".to_string())?;
@@ -894,5 +895,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::env::remove_var("FEISHU_CREDENTIAL_KEY");
         std::env::remove_var("FEISHU_PERSONAL_LISTENER");
+    }
+
+    #[test]
+    fn mask_app_id_handles_multibyte_ids() {
+        assert_eq!(mask_app_id("cli_a1b2c3d4e5"), "cli_a1b2…");
+        assert_eq!(mask_app_id("应用编号一二三四五六"), "应用编号一二三四…");
+        assert_eq!(mask_app_id("short"), "…");
     }
 }

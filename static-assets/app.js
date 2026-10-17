@@ -54,7 +54,7 @@ const CHANNEL_ICONS = {
 const GROK_TRANSLATE_ICON = `<svg class="p-tr-grok" viewBox="0 0 33 32" fill="currentColor" aria-hidden="true"><path d="M12.745 20.54l10.97-8.19c.539-.4 1.307-.244 1.564.38 1.349 3.288.746 7.241-1.938 9.955-2.683 2.714-6.417 3.31-9.83 1.954l-3.728 1.745c5.347 3.697 11.84 2.782 15.898-1.324 3.219-3.255 4.216-7.692 3.284-11.693l.008.009c-1.351-5.878.332-8.227 3.782-13.031L33 0l-4.54 4.59v-.014L12.743 20.544m-2.263 1.987c-3.837-3.707-3.175-9.446.1-12.755 2.42-2.449 6.388-3.448 9.852-1.979l3.72-1.737c-.67-.49-1.53-1.017-2.515-1.387-4.455-1.854-9.789-.931-13.41 2.728-3.483 3.523-4.579 8.94-2.697 13.561 1.405 3.454-.899 5.898-3.22 8.364C1.49 30.2.666 31.074 0 32l10.478-9.466"/></svg>`;
 const CHANNEL_LABELS = { telegram: "Telegram", feishu: "飞书", wecom: "企业微信", bark: "Bark", webpush: "浏览器通知" };
 const USER_CHANNEL_KEYS = ["telegram", "feishu", "wecom", "bark", "webpush"];
-const APP_VERSION = "1.12.279";
+const APP_VERSION = "1.12.281";
 const STATIC_ASSET_VERSION = "a500-watchlist-1";
 const KEYWORDS_MAX_COUNT = 20;
 const REPORT_WATCH_BLOCKED_TAGS = new Set([
@@ -198,14 +198,18 @@ async function api(path, options = {}) {
   // 登录/注册的 401 是「凭据错误」业务响应：透出后端 detail，不清会话
   if (resp.status === 401 && !path.startsWith("/api/auth/") && state.token === requestToken) {
     logout();
-    throw new Error("登录已过期，请重新登录");
+    const error = new Error("登录已过期，请重新登录");
+    error.status = 401;
+    throw error;
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     // FastAPI 422 等校验错误的 detail 是数组/对象，直接拼接会显示 [object Object]
     const detail = data.detail;
     const msg = typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : resp.statusText);
-    throw new Error(msg);
+    const error = new Error(msg);
+    error.status = resp.status;
+    throw error;
   }
   return data;
 }
@@ -223,7 +227,9 @@ async function apiBlob(path, options = {}) {
     const data = await resp.json().catch(() => ({}));
     const detail = data.detail;
     const msg = typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : resp.statusText);
-    throw new Error(msg);
+    const error = new Error(msg);
+    error.status = resp.status;
+    throw error;
   }
   return resp.blob();
 }
@@ -332,19 +338,38 @@ function clearSessionCaches() {
 
 async function logout() {
   const token = state.token;
-  try {
-    if (token) await api("/api/auth/logout", { method: "POST" });
-  } catch {
-    /* 本地清会话优先，服务端失效失败不挡住登出 */
-  }
+  // 先同步清掉本地会话：并发中的请求和 router 立刻看到「未登录」
   state.token = "";
   state.user = null;
   localStorage.removeItem("dav_token");
   clearSessionCaches();
-  replaceRoute("timeline");
-  $("#app-view").classList.add("hidden");
-  $("#auth-view").classList.remove("hidden");
-  resetAuthButtons();
+  resetAuthForms();
+  try {
+    if (token) {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      });
+    }
+  } catch {
+    /* 本地清会话优先，服务端失效失败不挡住登出 */
+  }
+  // 整页重载，确保上一个用户的 DOM（表单、列表、弹窗）不会残留在共享设备上
+  location.replace("/");
+}
+
+function resetAuthForms() {
+  for (const id of ["login-form", "register-form"]) {
+    const form = document.getElementById(id);
+    if (form) form.reset();
+  }
+  document.querySelectorAll(".pw-toggle.visible").forEach((btn) => {
+    const input = btn.parentElement?.querySelector("input");
+    if (input) input.type = "password";
+    btn.classList.remove("visible");
+    btn.setAttribute("aria-label", "显示密码");
+    btn.setAttribute("aria-pressed", "false");
+  });
 }
 
 function resetAuthButtons() {
@@ -1135,36 +1160,79 @@ async function checkFeishuTimelineUpdate(mediaId, groupId, baseline, seq, reader
   }
 }
 
-async function checkUpdate() {
+const VERSION_CHECK_INTERVAL_MS = 5 * 60_000;
+let versionCheckAt = 0;
+let versionInfo = null;
+
+function renderVersionMeta() {
+  const link = $("#sidebar-gh-link");
+  const meta = $("#sidebar-version");
+  const v = versionInfo;
+  if (!link || !meta || !v) return;
+  // 始终显示服务端返回的当前版本，避免本地硬编码版本过期
+  meta.innerHTML = `v${escapeHtml(v.current)}`;
+  if (v.update_available && v.latest) {
+    link.classList.add("has-update");
+    meta.innerHTML += ` <a class="sidebar-update" href="${escapeHtml(v.url)}" target="_blank" rel="noopener" title="有新版本">↑ ${escapeHtml(v.latest)}</a>`;
+  }
+}
+
+// 正在输入（焦点在表单控件上，或页面里有改过但没提交的输入）时不自动刷新
+function userIsEditing() {
+  const active = document.activeElement;
+  if (active && (active.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(active.tagName))) return true;
+  return [...document.querySelectorAll("#main input, #main textarea, dialog[open] input, dialog[open] textarea")]
+    .some((el) => (el.type === "checkbox" || el.type === "radio" ? el.checked !== el.defaultChecked : el.value !== el.defaultValue));
+}
+
+function reloadForNewVersion(guardKey, guardValue) {
+  if (sessionStorage.getItem(guardKey) === guardValue) return false;
+  if (userIsEditing()) {
+    showUpdateBanner();
+    return true;
+  }
+  sessionStorage.setItem(guardKey, guardValue);
+  location.reload();
+  return true;
+}
+
+function showUpdateBanner() {
+  if (document.getElementById("update-banner")) return;
+  const bar = document.createElement("div");
+  bar.id = "update-banner";
+  bar.className = "update-banner";
+  bar.setAttribute("role", "status");
+  bar.innerHTML = `<span>有新版本可用，保存好正在编辑的内容后刷新。</span>
+    <button type="button" class="btn-primary btn-sm">刷新</button>
+    <button type="button" class="btn-ghost btn-sm" aria-label="稍后">稍后</button>`;
+  const [reload, later] = bar.querySelectorAll("button");
+  reload.addEventListener("click", () => location.reload());
+  later.addEventListener("click", () => bar.remove());
+  document.body.appendChild(bar);
+}
+
+// 路由切换会重绘侧栏并调用这里：5 分钟内只复用上次结果，不重复打 3 个请求
+async function checkUpdate(force = false) {
+  if (!force && Date.now() - versionCheckAt < VERSION_CHECK_INTERVAL_MS) {
+    renderVersionMeta();
+    return;
+  }
+  versionCheckAt = Date.now();
   try {
     const v = await api("/api/version");
     if (v.current && v.current !== APP_VERSION) {
-      const refreshKey = `dav_version_refresh_${v.current}`;
-      if (!sessionStorage.getItem(refreshKey)) {
-        sessionStorage.setItem(refreshKey, "1");
-        location.reload();
-        return;
-      }
+      if (reloadForNewVersion(`dav_version_refresh_${v.current}`, "1")) return;
     }
     const response = await fetch("/", { cache: "no-store" });
     if (response.ok) {
       const latest = new DOMParser().parseFromString(await response.text(), "text/html");
       const revision = shellRevision(latest);
-      if (revision && revision !== shellRevision(document) && sessionStorage.getItem("dav_shell_refresh") !== revision) {
-        sessionStorage.setItem("dav_shell_refresh", revision);
-        location.reload();
-        return;
+      if (revision && revision !== shellRevision(document)) {
+        if (reloadForNewVersion("dav_shell_refresh", revision)) return;
       }
     }
-    const link = $("#sidebar-gh-link");
-    const meta = $("#sidebar-version");
-    if (!link || !meta) return;
-    // 始终显示服务端返回的当前版本，避免本地硬编码版本过期
-    meta.innerHTML = `v${escapeHtml(v.current)}`;
-    if (v.update_available && v.latest) {
-      link.classList.add("has-update");
-      meta.innerHTML += ` <a class="sidebar-update" href="${escapeHtml(v.url)}" target="_blank" rel="noopener" title="有新版本">↑ ${escapeHtml(v.latest)}</a>`;
-    }
+    versionInfo = v;
+    renderVersionMeta();
   } catch {
     /* 更新检查失败不打扰，保留本地硬编码版本兜底 */
   }
@@ -1176,7 +1244,7 @@ function ensureVersionRefreshCheck() {
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") checkUpdate();
   });
-  window.addEventListener("focus", checkUpdate);
+  window.addEventListener("focus", () => checkUpdate());
 }
 
 function renderTopbar(user) {
@@ -1511,7 +1579,7 @@ function kolCard(kol) {
           ${kol.subscribed ? "✓ 已订阅" : "订阅"}
         </button>
         ${kol.subscribed ? `<button class="fav-btn ${kol.favorite ? "fav-on" : ""}" onclick="toggleFavorite(${kol.id}, this)" title="特别关注：优先推送" aria-label="${kol.favorite ? "取消特别关注" : "设为特别关注"}">${STAR_SVG}</button>` : ""}
-        ${kol.subscribed ? `<button class="fav-btn ${kol.secondary ? "sec-on" : "sec-off"}" onclick="toggleSecondary(${kol.id}, this)" title="次要：新帖合并进摘要推送（降频）" aria-label="${kol.secondary ? "取消次要" : "设为次要"}">${kol.secondary ? BELL_OFF_ICON : BELL_ICON}</button>` : ""}
+        ${kol.subscribed ? `<button class="fav-btn ${kol.secondary ? "sec-on" : "sec-off"}" onclick="toggleSecondary(${kol.id}, this)" title="次要：新帖不推送（特别关注除外），只在动态页打开「次要大V」后显示" aria-label="${kol.secondary ? "取消次要" : "设为次要"}">${kol.secondary ? BELL_OFF_ICON : BELL_ICON}</button>` : ""}
         ${state.user?.is_admin ? `<button class="btn-sm danger kol-del" onclick="adminDeleteKolFromHome(${kol.id})" title="删除该大V" aria-label="删除该大V">${TRASH_ICON}</button>` : ""}
       </div>
     </div>`;
@@ -1574,7 +1642,7 @@ async function toggleSecondary(kolId, btn) {
     });
     if (kol) kol.secondary = next;
     if (btn) btn.classList.toggle("sec-on", next);
-    flash(next ? "已设为次要（降频推送）" : "已取消次要");
+    flash(next ? "已设为次要：新帖不再推送，仅在动态页显示" : "已取消次要，恢复实时推送");
     if (isRoute("home")) renderHomeList();
   } catch (err) {
     alert("操作失败: " + err.message);
@@ -5248,23 +5316,41 @@ let knowledgeView, loadAdminKnowledge, switchKnowledgeSettingsTab, onKnowledgeTa
 // router 序章 / feishuSourceRowsHtml）。
 let adminViewsLoaded = false;
 let adminViewsPromise = null;
-let adminViewsRetry = 0;
+
+// 懒加载失败多半是发版后旧页面引用的带 hash 模块已不存在；带 ?retry 重试会绕过
+// importmap、把新版裸模块和旧 app.js 混跑，所以直接整页刷新一次（60 秒内不重复）。
+function reloadForStaleAssets() {
+  const KEY = "vpush-stale-asset-reload";
+  let last = 0;
+  try {
+    last = Number(sessionStorage.getItem(KEY) || 0);
+  } catch {
+    /* 隐私模式 */
+  }
+  if (Date.now() - last < 60_000) return false;
+  try {
+    sessionStorage.setItem(KEY, String(Date.now()));
+  } catch {
+    /* 隐私模式 */
+  }
+  location.reload();
+  return true;
+}
 
 async function ensureAdminViews() {
   if (adminViewsLoaded) return; // 并发去重：多个 await 同时进来只跑一次
   if (adminViewsPromise) return adminViewsPromise;
-  const retry = adminViewsRetry ? `?retry=${adminViewsRetry}` : "";
   adminViewsPromise = (async () => {
     const [modCicc, modCodes, modNews, modUsers, modKol, modInfra, modIma, modDashboard, modKnowledge] = await Promise.all([
-      import(`./views/admin/cicc.js${retry}`),
-      import(`./views/admin/codes.js${retry}`),
-      import(`./views/admin/news.js${retry}`),
-      import(`./views/admin/users.js${retry}`),
-      import(`./views/admin/kol.js${retry}`),
-      import(`./views/admin/infra.js${retry}`),
-      import(`./views/admin/ima-collector.js${retry}`),
-      import(`./views/admin/dashboard.js${retry}`),
-      import(`./views/admin/knowledge.js${retry}`),
+      import("./views/admin/cicc.js"),
+      import("./views/admin/codes.js"),
+      import("./views/admin/news.js"),
+      import("./views/admin/users.js"),
+      import("./views/admin/kol.js"),
+      import("./views/admin/infra.js"),
+      import("./views/admin/ima-collector.js"),
+      import("./views/admin/dashboard.js"),
+      import("./views/admin/knowledge.js"),
     ]);
 
     ciccView = modCicc.createCiccView({
@@ -5668,12 +5754,38 @@ async function ensureAdminViews() {
     await adminViewsPromise;
   } catch (error) {
     adminViewsPromise = null;
-    adminViewsRetry += 1;
+    reloadForStaleAssets();
     throw error;
   }
 }
 
 
+
+function showBootError(err) {
+  let box = document.getElementById("boot-error");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "boot-error";
+    box.className = "boot-error";
+    box.setAttribute("role", "alert");
+    box.innerHTML = `<p class="boot-error-title">网络异常，暂时无法加载</p>
+      <p class="boot-error-detail"></p>
+      <button type="button" class="btn-primary">重试</button>`;
+    box.querySelector("button").addEventListener("click", () => router());
+    document.body.appendChild(box);
+  }
+  box.querySelector(".boot-error-detail").textContent = navigator.onLine === false
+    ? "设备当前离线，联网后点「重试」。"
+    : String((err && err.message) || "服务暂时不可用，请稍后重试。");
+  box.hidden = false;
+  $("#auth-view").classList.add("hidden");
+  $("#app-view").classList.add("hidden");
+}
+
+function hideBootError() {
+  const box = document.getElementById("boot-error");
+  if (box) box.hidden = true;
+}
 
 function replaceRoute(path) {
   const url = normalizeRoute(path);
@@ -5691,6 +5803,8 @@ function migrateHashRoute() {
 async function router() {
   stopMarketQuotes();
   stopWatchlist();
+  // 飞书个人机器人注册轮询绑定在发起时的路由上，切路由即停
+  if (typeof stopFeishuPersonalPoll === "function") stopFeishuPersonalPoll();
   // admin 视图懒加载：这三个 stop 来自 admin 模块，未加载时没有在跑的轮询要停
   if (adminViewsLoaded) {
     stopCiccPoll();
@@ -5726,11 +5840,14 @@ async function router() {
   let user;
   try {
     user = await api("/api/me");
-  } catch {
+  } catch (err) {
     if (!sessionOwnerStillActive(renderSeq, token, sessionGeneration)) return;
+    // 401 已在 api() 里登出并切到登录页；其余（离线 / 5xx）显示外壳和重试，避免白屏
+    if (state.token) showBootError(err);
     return;
   }
   if (!sessionOwnerStillActive(renderSeq, token, sessionGeneration)) return;
+  hideBootError();
   $("#app-view").classList.remove("hidden");
   $("#auth-view").classList.add("hidden");
   state.user = user;
@@ -5905,6 +6022,7 @@ async function doLogin(e) {
     });
     state.token = data.token;
     localStorage.setItem("dav_token", data.token);
+    resetAuthForms();
     go("timeline");
   } catch (err) {
     $("#auth-error").textContent = err.message;
@@ -5938,6 +6056,7 @@ async function doRegister(e) {
     });
     state.token = data.token;
     localStorage.setItem("dav_token", data.token);
+    resetAuthForms();
     go("timeline");
   } catch (err) {
     $("#reg-error").textContent = err.message;

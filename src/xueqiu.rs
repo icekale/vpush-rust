@@ -59,16 +59,19 @@ pub fn spawn(db: Db) {
         tracing::info!("雪球抓取已关闭");
         return;
     }
-    tokio::spawn(async move {
-        let mut streak = HashMap::new();
-        loop {
-            if let Err(err) = poll(&db, &mut streak).await {
-                tracing::warn!("雪球抓取: {err}");
-                let _ = db.note_platform("xueqiu", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("xueqiu", None).await;
+    crate::supervise::spawn("xueqiu", move || {
+        let db = db.clone();
+        async move {
+            let mut streak = HashMap::new();
+            loop {
+                if let Err(err) = poll(&db, &mut streak).await {
+                    tracing::warn!("雪球抓取: {err}");
+                    let _ = db.note_platform("xueqiu", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("xueqiu", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(poll_wait(&db).await)).await;
         }
     });
 }
@@ -117,6 +120,108 @@ fn poll_secs() -> u64 {
         .unwrap_or(180)
 }
 
+pub(crate) type Kol = (i64, String, String);
+
+pub(crate) enum Pulled<B> {
+    Got(B),
+    Dead,
+    Failed(String),
+}
+
+/// One Xueqiu-backed source (timeline or combination) as seen by `run_round`.
+pub(crate) trait KolSource {
+    type Batch;
+    async fn pull(&mut self, kol: &Kol) -> Pulled<Self::Batch>;
+    async fn rotate(&mut self) -> Result<(), String>;
+    async fn save(&mut self, kol: &Kol, batch: Self::Batch) -> Result<(), String>;
+}
+
+/// Pulls every KOL through one proxy exit. Only network failures count
+/// against the proxy: a failed identity rotation is a Xueqiu account problem,
+/// and since every later KOL would hit the same dead identity the round ends
+/// there instead of burning the proxy's failure budget.
+pub(crate) async fn run_round<S: KolSource>(
+    db: &Db,
+    proxy_id: Option<i64>,
+    kols: Vec<Kol>,
+    source: &mut S,
+) -> Result<(), String> {
+    for kol in kols {
+        let id = kol.0;
+        match source.pull(&kol).await {
+            Pulled::Got(batch) => {
+                crate::proxy_admin::note(db, proxy_id, true, "").await;
+                let _ = db.note_kol_fetch(id, None).await;
+                source.save(&kol, batch).await?;
+            }
+            Pulled::Dead => {
+                tracing::warn!(kol = id, "雪球身份失效，重新注册");
+                if let Err(err) = source.rotate().await {
+                    let detail = format!("雪球身份轮换失败: {err}");
+                    let _ = db.note_kol_fetch(id, Some(&detail)).await;
+                    return Err(format!("{detail}，本轮结束"));
+                }
+                match source.pull(&kol).await {
+                    Pulled::Got(batch) => {
+                        let _ = db.note_kol_fetch(id, None).await;
+                        source.save(&kol, batch).await?;
+                    }
+                    Pulled::Dead => {
+                        let _ = db.note_kol_fetch(id, Some("cookie 失效")).await;
+                    }
+                    Pulled::Failed(msg) => {
+                        let _ = db.note_kol_fetch(id, Some(&msg)).await;
+                        tracing::warn!(kol = id, "{msg}");
+                    }
+                }
+            }
+            Pulled::Failed(msg) => {
+                crate::proxy_admin::note(db, proxy_id, false, &msg).await;
+                let _ = db.note_kol_fetch(id, Some(&msg)).await;
+                tracing::warn!(kol = id, name = kol.1, "{msg}");
+            }
+        }
+    }
+    Ok(())
+}
+
+struct Timeline<'a> {
+    db: &'a Db,
+    ident: Identity,
+    streak: &'a mut HashMap<i64, u32>,
+    proxy: Option<String>,
+}
+
+impl KolSource for Timeline<'_> {
+    type Batch = Batch;
+
+    async fn pull(&mut self, kol: &Kol) -> Pulled<Batch> {
+        match pull(
+            self.db,
+            &self.ident,
+            kol.0,
+            &kol.2,
+            self.streak,
+            self.proxy.clone(),
+        )
+        .await
+        {
+            Ok(batch) => Pulled::Got(batch),
+            Err(PullErr::Dead) => Pulled::Dead,
+            Err(PullErr::Other(msg)) => Pulled::Failed(msg),
+        }
+    }
+
+    async fn rotate(&mut self) -> Result<(), String> {
+        self.ident = rotate_identity(self.db).await?;
+        Ok(())
+    }
+
+    async fn save(&mut self, kol: &Kol, batch: Batch) -> Result<(), String> {
+        save(self.db, kol.0, &kol.1, batch).await
+    }
+}
+
 async fn poll(db: &Db, streak: &mut HashMap<i64, u32>) -> Result<(), String> {
     let kols = db
         .kols_to_fetch("xueqiu")
@@ -128,33 +233,14 @@ async fn poll(db: &Db, streak: &mut HashMap<i64, u32>) -> Result<(), String> {
     let exit = crate::proxy_admin::acquire(db, "xueqiu").await?;
     let proxy = exit.as_ref().map(|item| item.url.clone());
     let proxy_id = exit.map(|item| item.id);
-    let mut ident = ensure_identity(db).await?;
-    for (id, name, external_id) in kols {
-        let pulled = pull(db, &ident, id, &external_id, streak, proxy.clone()).await;
-        match pulled {
-            Ok(batch) => {
-                crate::proxy_admin::note(db, proxy_id, true, "").await;
-                let _ = db.note_kol_fetch(id, None).await;
-                save(db, id, &name, batch).await?;
-            }
-            Err(PullErr::Dead) => {
-                tracing::warn!("雪球身份失效，重新注册");
-                ident = rotate_identity(db).await?;
-                if let Ok(batch) = pull(db, &ident, id, &external_id, streak, proxy.clone()).await {
-                    let _ = db.note_kol_fetch(id, None).await;
-                    save(db, id, &name, batch).await?;
-                } else {
-                    let _ = db.note_kol_fetch(id, Some("cookie 失效")).await;
-                }
-            }
-            Err(PullErr::Other(msg)) => {
-                crate::proxy_admin::note(db, proxy_id, false, &msg).await;
-                let _ = db.note_kol_fetch(id, Some(&msg)).await;
-                tracing::warn!(kol = id, name, "{msg}");
-            }
-        }
-    }
-    Ok(())
+    let ident = ensure_identity(db).await?;
+    let mut source = Timeline {
+        db,
+        ident,
+        streak,
+        proxy,
+    };
+    run_round(db, proxy_id, kols, &mut source).await
 }
 
 async fn save(db: &Db, kol_id: i64, kol_name: &str, batch: Batch) -> Result<(), String> {
@@ -879,5 +965,128 @@ mod tests {
             normalize_id("https://xueqiu.com/u/4514680565"),
             "4514680565"
         );
+    }
+
+    struct FakeSource {
+        script: Vec<Pulled<()>>,
+        pulls: Vec<i64>,
+        rotate_ok: bool,
+    }
+
+    impl KolSource for FakeSource {
+        type Batch = ();
+
+        async fn pull(&mut self, kol: &Kol) -> Pulled<()> {
+            self.pulls.push(kol.0);
+            if self.script.is_empty() {
+                Pulled::Got(())
+            } else {
+                self.script.remove(0)
+            }
+        }
+
+        async fn rotate(&mut self) -> Result<(), String> {
+            if self.rotate_ok {
+                Ok(())
+            } else {
+                Err("注册被拒".into())
+            }
+        }
+
+        async fn save(&mut self, _kol: &Kol, _batch: ()) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    async fn round_fixture(tag: &str) -> (Db, std::path::PathBuf, i64, Vec<Kol>) {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-xq-round-{tag}-{}-{}.db",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        let proxy: i64 = sqlx::query_scalar(
+            "INSERT INTO proxies (pool_id, protocol, host, port, status, fail_count)
+             VALUES (1, 'http', '127.0.0.1', 8080, 'ok', 2) RETURNING id",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        let mut kols = Vec::new();
+        for name in ["甲", "乙", "丙"] {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO kols (platform, name, external_id) VALUES ('xueqiu', ?, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(name)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+            kols.push((id, name.to_string(), name.to_string()));
+        }
+        (db, path, proxy, kols)
+    }
+
+    async fn proxy_state(db: &Db, id: i64) -> (String, i64) {
+        sqlx::query_as("SELECT status, fail_count FROM proxies WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn fetch_error(db: &Db, id: i64) -> String {
+        sqlx::query_scalar("SELECT last_fetch_error FROM kols WHERE id = ?")
+            .bind(id)
+            .fetch_one(db.pool())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn failed_rotation_ends_the_round_without_blaming_the_proxy() {
+        let (db, path, proxy, kols) = round_fixture("rotate-fail").await;
+        let ids: Vec<i64> = kols.iter().map(|kol| kol.0).collect();
+        let mut source = FakeSource {
+            script: vec![Pulled::Dead, Pulled::Dead, Pulled::Dead],
+            pulls: Vec::new(),
+            rotate_ok: false,
+        };
+        let err = run_round(&db, Some(proxy), kols, &mut source)
+            .await
+            .unwrap_err();
+        assert!(err.contains("轮换失败"), "{err}");
+        assert_eq!(source.pulls, vec![ids[0]]);
+        assert_eq!(proxy_state(&db, proxy).await, ("ok".to_string(), 2));
+        assert!(fetch_error(&db, ids[0]).await.contains("注册被拒"));
+        assert_eq!(fetch_error(&db, ids[1]).await, "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn rotation_recovers_and_network_failures_still_count_against_the_proxy() {
+        let (db, path, proxy, kols) = round_fixture("rotate-ok").await;
+        let ids: Vec<i64> = kols.iter().map(|kol| kol.0).collect();
+        let mut source = FakeSource {
+            script: vec![
+                Pulled::Dead,
+                Pulled::Got(()),
+                Pulled::Got(()),
+                Pulled::Failed("connect timeout".into()),
+            ],
+            pulls: Vec::new(),
+            rotate_ok: true,
+        };
+        run_round(&db, Some(proxy), kols, &mut source)
+            .await
+            .unwrap();
+        assert_eq!(source.pulls, vec![ids[0], ids[0], ids[1], ids[2]]);
+        assert_eq!(proxy_state(&db, proxy).await, ("ok".to_string(), 1));
+        assert_eq!(fetch_error(&db, ids[0]).await, "");
+        assert_eq!(fetch_error(&db, ids[2]).await, "connect timeout");
+        let _ = std::fs::remove_file(&path);
     }
 }

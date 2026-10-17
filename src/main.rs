@@ -26,11 +26,13 @@ mod proxy_admin;
 mod push;
 mod reports;
 mod stock_watchlist;
+mod supervise;
 mod syslogs;
 mod tags;
 mod telegram_adapter;
 mod telegram_bot;
 mod telegram_poll;
+mod textutil;
 mod translate;
 mod truth;
 mod twitter;
@@ -51,7 +53,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::body::{Body, Bytes};
 use axum::extract::{
@@ -68,7 +70,7 @@ use sha2::{Digest, Sha256};
 
 use crate::db::{CatalogError, Db, FeedFilter, KolPatch, RegisterError, User};
 
-const APP_VERSION: &str = "1.12.279";
+const APP_VERSION: &str = "1.12.281";
 const LOGIN_MAX_FAILURES: usize = 8;
 const LOGIN_ACCOUNT_SOFT: usize = 64;
 const LOGIN_ACCOUNT_DELAY_MAX: u64 = 15;
@@ -177,7 +179,7 @@ struct WechatIn {
     invite_code: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct MeUpdate {
     telegram_chat_id: Option<String>,
     telegram_bot_token: Option<String>,
@@ -607,10 +609,7 @@ fn router(state: AppState) -> Router {
         .route("/api/ima-documents/{media_id}/pdf", get(ima_pdf))
         .route("/api/ima-documents/{media_id}/text", get(ima_text))
         .route("/api/ima-documents/{media_id}", get(feishu_document))
-        .route(
-            "/api/xincai/ingest",
-            post(xincai_ingest).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
-        )
+        .route("/api/xincai/ingest", post(xincai_ingest))
         .route("/api/news/sources", get(news_sources))
         .route("/api/news", get(news_list))
         .route("/api/news/seen", post(news_seen))
@@ -1767,6 +1766,14 @@ async fn img_proxy(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let target = img_proxy::validate(&q.url).map_err(img_err)?;
+    img_proxy::take_quota(target.video, &ip, now_secs()).map_err(img_err)?;
+    let permit = tokio::time::timeout(Duration::from_secs(10), img_proxy::UPSTREAM.acquire())
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .ok_or_else(|| {
+            ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "图片代理繁忙，请稍后再试")
+        })?;
     let host = target.host.clone();
     let ips = tokio::task::spawn_blocking(move || img_proxy::resolve(&host))
         .await
@@ -1774,7 +1781,6 @@ async fn img_proxy(
     if !img_proxy::resolution_ok(&ips) {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "不支持的图片地址"));
     }
-    img_proxy::take_quota(target.video, &ip, now_secs()).map_err(img_err)?;
     let range = headers
         .get(header::RANGE)
         .and_then(|v| v.to_str().ok())
@@ -1789,8 +1795,14 @@ async fn img_proxy(
     for (name, value) in proxied.headers {
         response = response.header(name, value);
     }
+    let body = match proxied.body {
+        img_proxy::ProxiedBody::Full(bytes) => Body::from(bytes),
+        img_proxy::ProxiedBody::Stream(reader) => {
+            Body::from_stream(img_proxy::stream_body(reader, permit))
+        }
+    };
     response
-        .body(Body::from(proxied.body))
+        .body(body)
         .map_err(|_| ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "图片源请求失败"))
 }
 
@@ -2817,6 +2829,7 @@ async fn ima_translate(
     if group.len() > 128 || media_id.len() > 128 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "参数过长"));
     }
+    throttle_user(&state, "translate", user.id, 60)?;
     match feishu_docs::translate_document(
         &state.db,
         user.id,
@@ -3177,10 +3190,11 @@ fn news_topic_from_query(q: &NewsQuery) -> Result<String, ApiError> {
         .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))
 }
 
+/// 请求体在鉴权通过之后才读取和解析，匿名请求不会占用内存。
 async fn xincai_ingest(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Body,
 ) -> Result<Json<Value>, ApiError> {
     let expected = std::env::var("XINCAI_INGEST_TOKEN").unwrap_or_default();
     let header = headers
@@ -3196,6 +3210,16 @@ async fn xincai_ingest(
         Err(msg) => return Err(ApiError::new(StatusCode::UNAUTHORIZED, msg)),
         Ok(()) => {}
     }
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let _slot = SLOTS
+        .try_acquire()
+        .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "入库请求过多，请稍后重试"))?;
+    let bytes = axum::body::to_bytes(body, xincai::max_request_bytes())
+        .await
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "请求体过大"))?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "请求体必须是 JSON 对象"))?;
+    drop(bytes);
     match xincai::ingest(&state.db, &body).await {
         Ok(value) => Ok(Json(value)),
         Err(CatalogError::Bad(msg)) => Err(ApiError::new(StatusCode::BAD_REQUEST, msg)),
@@ -3447,7 +3471,7 @@ async fn sync_ima_collector(
     Json(body): Json<ima_collector::SyncBody>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    ima_collector::sync(&state.db, &body)
+    ima_collector::start_sync(&state.db, &body)
         .await
         .map(Json)
         .map_err(collector_err)
@@ -5210,6 +5234,7 @@ async fn llm_test(
     Json(body): Json<LlmForm>,
 ) -> Result<Json<Value>, ApiError> {
     let user = require_user(&state, &headers).await?;
+    throttle_user(&state, "llm-test", user.id, 10)?;
     let started = std::time::Instant::now();
     let cfg = llm_config(&user, &body)?;
     let key = cfg.key.clone();
@@ -5475,10 +5500,42 @@ fn validate_profile_fields(body: &MeUpdate) -> Result<(), ApiError> {
 
 async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result<(), ApiError> {
     validate_profile_fields(body)?;
+    // Everything that can reject the request is checked before the first
+    // write, so a bad field never leaves the profile half-updated.
+    if let Some(ids) = &body.news_source_ids {
+        state
+            .db
+            .validate_news_sources(ids)
+            .await
+            .map_err(catalog_err)?;
+    }
     let replacing_token = body
         .telegram_bot_token
         .as_ref()
         .is_some_and(|value| !masked_secret(value.trim()));
+    // Chat/open IDs are only ever set by the bind-code flows (or the bot token
+    // resolver); the profile endpoint may clear them or echo the current value.
+    let bound_ids = [
+        (
+            (!replacing_token)
+                .then_some(&body.telegram_chat_id)
+                .and_then(Option::as_ref),
+            &user.telegram_chat_id,
+        ),
+        (body.feishu_open_id.as_ref(), &user.feishu_open_id),
+        (body.feishu_chat_id.as_ref(), &user.feishu_chat_id),
+    ];
+    for (requested, current) in bound_ids {
+        if let Some(value) = requested {
+            let value = value.trim();
+            if !value.is_empty() && value != current.trim() {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "请通过绑定码完成绑定，这里只能解绑",
+                ));
+            }
+        }
+    }
     if !replacing_token {
         if let Some(value) = &body.telegram_chat_id {
             let value = value.trim();
@@ -5846,10 +5903,13 @@ async fn change_password(
     if body.new_password.len() > auth::PASSWORD_MAX {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "新密码最长128位"));
     }
-    if !user.password_hash.is_empty()
-        && !verify_password_off(body.old_password.clone(), user.password_hash.clone()).await
-    {
-        return Err(ApiError::new(StatusCode::BAD_REQUEST, "原密码错误"));
+    if !user.password_hash.is_empty() {
+        let bucket = format!("uid:{}", user.id);
+        admit_password_attempt(&state, &bucket, &user.username).await?;
+        if !verify_password_off(body.old_password.clone(), user.password_hash.clone()).await {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "原密码错误"));
+        }
+        release_login_success(&state, &bucket, &user.username);
     }
     let hash = hash_password_off(body.new_password.clone()).await?;
     state
@@ -6092,6 +6152,7 @@ async fn feishu_docs_oauth_callback_post(
         feishu_secret(&state.db).await?
     };
     let token = feishu_admin::exchange_code(app_id, &secret, redirect, &body.code, &verifier)
+        .await
         .map_err(feishu_admin_err)?;
     feishu_admin::save_token(&state.db, &token)
         .await
@@ -6129,10 +6190,11 @@ async fn feishu_docs_oauth_callback(
     } else {
         secret
     };
-    let body = match feishu_admin::exchange_code(app_id, &secret, redirect, &q.code, &verifier) {
-        Ok(body) => body,
-        Err(_) => return failed.into_response(),
-    };
+    let body =
+        match feishu_admin::exchange_code(app_id, &secret, redirect, &q.code, &verifier).await {
+            Ok(body) => body,
+            Err(_) => return failed.into_response(),
+        };
     if feishu_admin::save_token(&state.db, &body).await.is_err() {
         return failed.into_response();
     }
@@ -6328,6 +6390,7 @@ async fn attach_ip(mut req: Request<Body>, next: Next) -> Response {
             .headers()
             .get("x-real-ip")
             .and_then(|value| value.to_str().ok());
+        warn_untrusted_proxy(peer, !forwarded.is_empty() || real_ip.is_some());
         client_ip::resolve_client_ip(
             peer,
             &forwarded,
@@ -6338,6 +6401,28 @@ async fn attach_ip(mut req: Request<Body>, next: Next) -> Response {
     };
     req.extensions_mut().insert(ClientIp(ip));
     next.run(req).await
+}
+
+/// A private-network peer sending forwarding headers is almost certainly the
+/// reverse proxy; if it is not trusted every visitor collapses onto its IP and
+/// a handful of failed logins locks out the whole site.
+fn warn_untrusted_proxy(peer: Option<std::net::IpAddr>, forwarded: bool) {
+    static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let Some(peer) = peer else { return };
+    let private = match peer {
+        std::net::IpAddr::V4(v4) => v4.is_private() || v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || (v6.segments()[0] & 0xfe00) == 0xfc00,
+    };
+    if forwarded
+        && private
+        && !trusted_proxy_nets().iter().any(|net| net.contains(peer))
+        && !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        tracing::warn!(
+            %peer,
+            "反向代理地址不在 TRUSTED_PROXIES 内，转发头被忽略，所有访客会共用同一个限流 IP"
+        );
+    }
 }
 
 fn trusted_proxy_nets() -> &'static [client_ip::Net] {
@@ -6418,8 +6503,22 @@ fn account_token(account: &str) -> Option<String> {
     )))
 }
 
+/// IPv6 clients usually control a whole /64, so the limiter buckets them by
+/// prefix; anything else (IPv4, unparsable test labels) is kept verbatim.
+fn limit_ip_key(ip: &str) -> String {
+    match ip.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V6(v6)) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            format!("{:x}:{:x}:{:x}:{:x}::/64", s[0], s[1], s[2], s[3])
+        }
+        Ok(std::net::IpAddr::V6(v6)) => v6.to_ipv4_mapped().unwrap().to_string(),
+        _ => ip.to_string(),
+    }
+}
+
 fn login_keys(ip: &str, account: &str) -> LoginKeys {
     let token = account_token(account);
+    let ip = limit_ip_key(ip);
     LoginKeys {
         ip: format!("ip:{ip}"),
         pair: token.as_ref().map(|token| format!("pair:{ip}:{token}")),
@@ -6441,9 +6540,25 @@ fn prune_login_limit(limit: &mut LoginLimit, now: u64) {
     limit.pruned_at = now;
 }
 
+/// Upper bound on tracked limiter keys. Past it, the keys whose latest hit is
+/// oldest are evicted first, so active offenders stay tracked.
+const LOGIN_LIMIT_CAP: usize = 50_000;
+
 fn maybe_prune_login_limit(limit: &mut LoginLimit, now: u64) {
-    if now.saturating_sub(limit.pruned_at) >= 60 {
+    if now.saturating_sub(limit.pruned_at) >= 60 || limit.hits.len() > LOGIN_LIMIT_CAP {
         prune_login_limit(limit, now);
+    }
+    if limit.hits.len() > LOGIN_LIMIT_CAP {
+        let mut latest: Vec<(u64, String)> = limit
+            .hits
+            .iter()
+            .map(|(key, hits)| (hits.iter().copied().max().unwrap_or(0), key.clone()))
+            .collect();
+        latest.sort_unstable();
+        let excess = limit.hits.len() - LOGIN_LIMIT_CAP * 9 / 10;
+        for (_, key) in latest.into_iter().take(excess) {
+            limit.hits.remove(&key);
+        }
     }
 }
 
@@ -6563,6 +6678,27 @@ fn reserve_account_limited(limit: &mut LoginLimit, ip: &str, account: &str, now:
     true
 }
 
+/// Sliding-window cap for expensive per-user actions (outbound probes,
+/// third-party lookups), sharing the login limiter's map and window.
+fn throttle_user(state: &AppState, action: &str, user_id: i64, max: usize) -> Result<(), ApiError> {
+    let now = now_secs();
+    let mut limit = state.fails.lock().expect("login limit");
+    maybe_prune_login_limit(&mut limit, now);
+    let hits = limit
+        .hits
+        .entry(format!("act:{action}:{user_id}"))
+        .or_default();
+    hits.retain(|t| now.saturating_sub(*t) < LOGIN_WINDOW_SECS);
+    if hits.len() >= max {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "操作太频繁，请稍后再试",
+        ));
+    }
+    hits.push(now);
+    Ok(())
+}
+
 fn login_limited_error() -> ApiError {
     ApiError::new(
         StatusCode::TOO_MANY_REQUESTS,
@@ -6646,6 +6782,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The frontend still relies on inline `on*=` handlers, so the enforced policy
+/// keeps `'unsafe-inline'`; `CSP_STRICT_REPORT_ONLY=1` additionally sends the
+/// strict variant as report-only to surface what still needs migrating.
+fn content_security_policy(allow_inline: bool) -> String {
+    let inline = if allow_inline { " 'unsafe-inline'" } else { "" };
+    format!(
+        "default-src 'self'; script-src 'self'{inline} https://challenges.cloudflare.com; style-src 'self'{inline}; img-src 'self' data: blob: https:; connect-src 'self' https://challenges.cloudflare.com https://icekale.github.io; frame-src 'self' blob: https://challenges.cloudflare.com; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
+    )
+}
+
+fn strict_csp_report_only() -> bool {
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        matches!(
+            std::env::var("CSP_STRICT_REPORT_ONLY")
+                .unwrap_or_default()
+                .trim()
+                .to_ascii_lowercase()
+                .as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 async fn security_headers(req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_string();
     let mut res = next.run(req).await;
@@ -6655,10 +6815,14 @@ async fn security_headers(req: Request<Body>, next: Next) -> Response {
     headers.insert(header::REFERRER_POLICY, "no-referrer".parse().unwrap());
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'self'; script-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob: https:; connect-src 'self' https://challenges.cloudflare.com https://jinleiviva.github.io https://icekale.github.io; frame-src 'self' blob: https://challenges.cloudflare.com; worker-src 'self'; manifest-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'"
-            .parse()
-            .unwrap(),
+        content_security_policy(true).parse().unwrap(),
     );
+    if strict_csp_report_only() {
+        headers.insert(
+            header::CONTENT_SECURITY_POLICY_REPORT_ONLY,
+            content_security_policy(false).parse().unwrap(),
+        );
+    }
     if path == "/news"
         || path.starts_with("/news/")
         || path == "/api/news"
@@ -6683,44 +6847,131 @@ async fn static_or_spa(State(state): State<AppState>, req: Request<Body>) -> Res
         return StatusCode::NOT_FOUND.into_response();
     }
     let head = req.method() == axum::http::Method::HEAD;
-    if let Some((path, fingerprinted, bytes)) = load_static(&state.static_dir, rel, !head).await {
-        return file_response(&path, fingerprinted, head, bytes);
+    if let Some(found) = load_static(&state.static_dir, rel, !head).await {
+        let not_modified = req
+            .headers()
+            .get(header::IF_NONE_MATCH)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|tag| tag.trim() == found.etag || tag.trim() == "*")
+            });
+        let mut res = if not_modified {
+            let mut res = file_response(&found.path, found.fingerprinted, true, Vec::new());
+            *res.status_mut() = StatusCode::NOT_MODIFIED;
+            res.headers_mut().remove(header::CONTENT_TYPE);
+            res
+        } else {
+            file_response(&found.path, found.fingerprinted, head, found.bytes)
+        };
+        if let Ok(etag) = found.etag.parse() {
+            res.headers_mut().insert(header::ETAG, etag);
+        }
+        return res;
     }
     let first = rel.split('/').next().unwrap_or("");
     if rel.is_empty() || SPA.contains(&first) {
         let index = state.static_dir.join("index.html");
-        if index.is_file() {
+        if tokio::fs::metadata(&index)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
             return file_from_path(&index, false, head).await;
         }
     }
     StatusCode::NOT_FOUND.into_response()
 }
 
-async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf, bool, Vec<u8>)> {
+struct StaticFile {
+    path: PathBuf,
+    fingerprinted: bool,
+    bytes: Vec<u8>,
+    etag: String,
+}
+
+async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<StaticFile> {
     if rel.is_empty() {
         return None;
     }
+    let root = root.to_path_buf();
+    let rel = rel.to_string();
+    tokio::task::spawn_blocking(move || resolve_static(&root, &rel, read_body))
+        .await
+        .ok()?
+}
+
+fn resolve_static(root: &Path, rel: &str, read_body: bool) -> Option<StaticFile> {
     let direct = root.join(rel);
     if direct.is_file() && inside(root, &direct) {
+        let meta = std::fs::metadata(&direct).ok()?;
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
         let bytes = if read_body {
-            tokio::fs::read(&direct).await.ok()?
+            std::fs::read(&direct).ok()?
         } else {
             Vec::new()
         };
-        return Some((direct, false, bytes));
+        return Some(StaticFile {
+            path: direct,
+            fingerprinted: false,
+            bytes,
+            etag: format!("W/\"{:x}-{modified:x}\"", meta.len()),
+        });
     }
     let logical = unhash(rel)?;
     let path = root.join(&logical);
     if !path.is_file() || !inside(root, &path) {
         return None;
     }
-    let bytes = tokio::fs::read(&path).await.ok()?;
-    let digest = hex::encode(Sha256::digest(&bytes));
     let hashed = rel.rsplit_once('.')?.0.rsplit_once('.')?.1;
+    let (digest, bytes) = static_digest(&path, read_body)?;
     if !digest.starts_with(hashed) {
         return None;
     }
-    Some((path, true, bytes))
+    Some(StaticFile {
+        path,
+        fingerprinted: true,
+        bytes,
+        etag: format!("\"{}\"", &digest[..16]),
+    })
+}
+
+type DigestCache = HashMap<PathBuf, (std::time::SystemTime, u64, String)>;
+
+/// Content digest of a static file, recomputed only when its mtime or size
+/// changes. Keys are limited to files that exist under the static root.
+fn static_digest(path: &Path, read_body: bool) -> Option<(String, Vec<u8>)> {
+    static CACHE: std::sync::Mutex<Option<DigestCache>> = std::sync::Mutex::new(None);
+    let meta = std::fs::metadata(path).ok()?;
+    let stamp = (meta.modified().ok()?, meta.len());
+    let cached = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(path)
+        .filter(|(modified, len, _)| (*modified, *len) == stamp)
+        .map(|(_, _, digest)| digest.clone());
+    if let Some(digest) = cached {
+        let bytes = if read_body {
+            std::fs::read(path).ok()?
+        } else {
+            Vec::new()
+        };
+        return Some((digest, bytes));
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(path.to_path_buf(), (stamp.0, stamp.1, digest.clone()));
+    Some((digest, if read_body { bytes } else { Vec::new() }))
 }
 
 fn unhash(rel: &str) -> Option<String> {
@@ -8322,5 +8573,331 @@ mod tests {
             revived.id
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn xincai_ingest_rejects_before_reading_the_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let app = router(AppState {
+            db,
+            secret: "xincai-test".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        });
+        std::env::set_var("XINCAI_INGEST_TOKEN", "ingest-secret");
+        let polled = Arc::new(AtomicBool::new(false));
+        let watch = polled.clone();
+        let stream = futures_util::stream::poll_fn(move |_| {
+            watch.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(Bytes::from_static(b"{"))))
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/xincai/ingest")
+                    .header(header::AUTHORIZATION, "Bearer wrong")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/xincai/ingest")
+                    .header(header::AUTHORIZATION, "Bearer ingest-secret")
+                    .body(Body::from(
+                        r#"{"articles":[{"externalId":"a","title":"t","html":"<p>x</p>"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/xincai/ingest")
+                    .header(header::AUTHORIZATION, "Bearer ingest-secret")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn profile_update_cannot_claim_push_identities() {
+        let path =
+            std::env::temp_dir().join(format!("vpush-m1-{}-{}.db", std::process::id(), now_secs()));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        sqlx::query("UPDATE users SET telegram_chat_id = '42', feishu_open_id = 'ou_me'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "test-secret".into(),
+            allow_register: false,
+            static_dir: path.clone(),
+            fails: new_login_limit(),
+        };
+        for update in [
+            MeUpdate {
+                telegram_chat_id: Some("-100999".into()),
+                ..MeUpdate::default()
+            },
+            MeUpdate {
+                feishu_open_id: Some("ou_victim".into()),
+                ..MeUpdate::default()
+            },
+            MeUpdate {
+                feishu_chat_id: Some("oc_group".into()),
+                ..MeUpdate::default()
+            },
+        ] {
+            let err = apply_profile(&state, &user, &update).await.unwrap_err();
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        }
+        apply_profile(
+            &state,
+            &user,
+            &MeUpdate {
+                telegram_chat_id: Some(" 42 ".into()),
+                feishu_open_id: Some(String::new()),
+                ..MeUpdate::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|err| panic!("{}", err.detail));
+        let saved = state.db.user_by_id(user.id).await.unwrap().unwrap();
+        assert_eq!(saved.telegram_chat_id, "42");
+        assert_eq!(saved.feishu_open_id, "");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn ipv6_clients_share_a_limiter_bucket_per_64() {
+        assert_eq!(
+            limit_ip_key("2001:db8:1:2:aaaa::1"),
+            limit_ip_key("2001:db8:1:2:ffff:ffff:ffff:fffe")
+        );
+        assert_ne!(
+            limit_ip_key("2001:db8:1:2::1"),
+            limit_ip_key("2001:db8:1:3::1")
+        );
+        assert_eq!(limit_ip_key("::ffff:1.2.3.4"), "1.2.3.4");
+        assert_eq!(limit_ip_key("1.2.3.4"), "1.2.3.4");
+        let mut limit = LoginLimit::default();
+        for n in 0..LOGIN_MAX_FAILURES {
+            assert!(reserve_limited(
+                &mut limit,
+                &format!("2001:db8::{n:x}"),
+                "victim",
+                1_000
+            ));
+        }
+        assert!(!reserve_limited(
+            &mut limit,
+            "2001:db8::ffff",
+            "victim",
+            1_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn password_change_and_llm_probe_are_rate_limited() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin(&auth::hash_password("correct-horse-1", None))
+            .await
+            .unwrap();
+        let admin = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "pw-test".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let bearer = format!(
+            "Bearer {}",
+            auth::create_token(
+                admin.id,
+                &admin.username,
+                &state.secret,
+                admin.token_version,
+                now_secs(),
+                &admin.created_at,
+            )
+        );
+        let app = router(state.clone());
+        let attempt = |app: axum::Router, bearer: String| async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/me/password")
+                    .header(header::AUTHORIZATION, bearer)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"old_password":"wrong-guess-0","new_password":"another-pass-1"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+        };
+        for _ in 0..LOGIN_MAX_FAILURES {
+            assert_eq!(
+                attempt(app.clone(), bearer.clone()).await,
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(
+            attempt(app.clone(), bearer.clone()).await,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        for _ in 0..10 {
+            throttle_user(&state, "llm-test", admin.id, 10)
+                .unwrap_or_else(|err| panic!("{}", err.detail));
+        }
+        assert!(throttle_user(&state, "llm-test", admin.id, 10).is_err());
+        assert!(throttle_user(&state, "llm-test", admin.id + 1, 10).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_profile_update_writes_nothing() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "profile-tx".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let err = apply_profile(
+            &state,
+            &user,
+            &MeUpdate {
+                bark_key: Some("AAAAAAAAAAAAAAAAAAAA".into()),
+                dnd_start: Some("22:00".into()),
+                news_source_ids: Some(vec![424242]),
+                ..MeUpdate::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let saved = state.db.user_by_id(user.id).await.unwrap().unwrap();
+        assert_eq!(saved.bark_key, "");
+        assert_eq!(saved.dnd_start, "");
+    }
+
+    #[test]
+    fn static_digest_cache_follows_file_changes() {
+        let dir = std::env::temp_dir().join(format!("vpush-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.js");
+        std::fs::write(&file, b"one").unwrap();
+        let (first, body) = static_digest(&file, true).unwrap();
+        assert_eq!(first, hex::encode(Sha256::digest(b"one")));
+        assert_eq!(body, b"one");
+        let (cached, empty) = static_digest(&file, false).unwrap();
+        assert_eq!(cached, first);
+        assert!(empty.is_empty());
+        std::fs::write(&file, b"second").unwrap();
+        let (changed, _) = static_digest(&file, false).unwrap();
+        assert_eq!(changed, hex::encode(Sha256::digest(b"second")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn csp_drops_unused_origins_and_has_a_strict_variant() {
+        let enforced = content_security_policy(true);
+        assert!(enforced.contains("script-src 'self' 'unsafe-inline'"));
+        assert!(!enforced.contains("jinleiviva"));
+        assert!(enforced.contains("https://icekale.github.io"));
+        let strict = content_security_policy(false);
+        assert!(!strict.contains("unsafe-inline"));
+        assert!(strict.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn login_limiter_map_is_bounded() {
+        let mut limit = LoginLimit::default();
+        let now = 10_000;
+        limit.pruned_at = now;
+        for index in 0..(LOGIN_LIMIT_CAP + 10) {
+            limit
+                .hits
+                .insert(format!("ip:{index}"), vec![now - 100 + (index % 50) as u64]);
+        }
+        limit.hits.insert("ip:hot".into(), vec![now]);
+        maybe_prune_login_limit(&mut limit, now);
+        assert!(limit.hits.len() <= LOGIN_LIMIT_CAP);
+        assert!(limit.hits.contains_key("ip:hot"));
+    }
+
+    #[tokio::test]
+    async fn static_assets_answer_conditional_requests_with_304() {
+        let dir =
+            std::env::temp_dir().join(format!("vpush-etag-{}-{}", std::process::id(), now_secs()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("static")).unwrap();
+        std::fs::write(dir.join("static/app.js"), b"console.log(2)").unwrap();
+        std::fs::write(dir.join("static/logo.svg"), b"<svg/>").unwrap();
+        let db = Db::open(Path::new(":memory:")).await.unwrap();
+        let app = router(AppState {
+            db,
+            secret: "test-secret".into(),
+            allow_register: false,
+            static_dir: dir.join("static"),
+            fails: new_login_limit(),
+        });
+        let digest = hex::encode(Sha256::digest(b"console.log(2)"));
+        for uri in [
+            format!("/app.{}.js", &digest[..12]),
+            "/logo.svg".to_string(),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(&uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            let etag = res.headers().get(header::ETAG).unwrap().clone();
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(&uri)
+                        .header(header::IF_NONE_MATCH, etag.clone())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_MODIFIED, "{uri}");
+            assert_eq!(res.headers().get(header::ETAG), Some(&etag));
+            assert!(to_bytes(res.into_body(), 1024).await.unwrap().is_empty());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

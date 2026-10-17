@@ -9,6 +9,17 @@ use crate::news::plain;
 const MAX_BATCH: usize = 200;
 const MAX_BODY: usize = 512 * 1024;
 
+/// 单次 ingest 请求体上限，`XINCAI_INGEST_MAX_MB` 可调（1–128，默认 128，与旧版一致）。
+pub fn max_request_bytes() -> usize {
+    std::env::var("XINCAI_INGEST_MAX_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(128)
+        .clamp(1, 128)
+        * 1024
+        * 1024
+}
+
 pub fn authorize(authorization: Option<&str>, expected: &str) -> Result<(), &'static str> {
     let expected = expected.trim();
     if expected.is_empty() {
@@ -330,15 +341,7 @@ fn public_url(raw: &str) -> String {
 }
 
 fn normalize_ts(raw: &str, fallback: &str) -> String {
-    let text = raw.trim();
-    if text.len() < 10 || text.as_bytes().get(4) != Some(&b'-') {
-        return fallback.to_string();
-    }
-    if text.ends_with('Z') || text.ends_with('z') {
-        format!("{}+00:00", &text[..text.len() - 1])
-    } else {
-        text.to_string()
-    }
+    crate::news::utc_stamp(raw).unwrap_or_else(|| fallback.to_string())
 }
 
 fn now_iso() -> String {
@@ -518,6 +521,46 @@ mod tests {
         );
         assert!(db.news_image_url(user.id, first, 3).await.is_err());
         assert!(db.magazine(user.id, source_id + 9).await.is_err());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stored_article_html_is_sanitized_before_reaching_the_reader() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-xincai-xss-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let body = json!({"articles": [{
+            "sourceId": "x", "sourceName": "源", "externalId": "x1", "title": "坏",
+            "html": "<p>正文</p><img src=x onerror=alert(1)><script>alert(2)</script><a href=\"javascript:alert(3)\">链</a>",
+            "url": "https://example.com/x"
+        }]});
+        ingest(&db, &body).await.unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let listed = db
+            .list_news(user.id, 0, "", "", false, 20, 0)
+            .await
+            .unwrap();
+        let id = listed["items"][0]["id"].as_i64().unwrap();
+        let article = db.news_article(user.id, id).await.unwrap().unwrap();
+        let html = article["content_html"].as_str().unwrap();
+        assert!(html.contains("<p>正文</p>"));
+        assert!(!html.contains("onerror"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("javascript:"));
+        sqlx::query("UPDATE news_articles SET url = 'javascript:alert(1)' WHERE id = ?")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let article = db.news_article(user.id, id).await.unwrap().unwrap();
+        assert_eq!(article["url"], "");
         let _ = std::fs::remove_file(&path);
     }
 }

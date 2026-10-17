@@ -24,10 +24,11 @@ pub fn spawn(db: Db) {
     every_round(db, |db| Box::pin(daily_reports(db)));
 }
 
+/// 每轮单独捕获 panic：某一轮被外部数据触发 panic 时只丢这一轮，循环继续。
 fn every_round(db: Db, round: Round) {
     tokio::spawn(async move {
         loop {
-            round(&db).await;
+            crate::supervise::catch("maintenance", round(&db)).await;
             tokio::time::sleep(ROUND_GAP).await;
         }
     });
@@ -516,9 +517,13 @@ async fn cleanup_and_backup(db: &Db) {
             match crate::imgbed::process_due(
                 db,
                 cfg.retention_days,
-                crate::imgbed::live_download,
-                |url, bytes, kind| crate::imgbed::live_upload(&cfg, url, bytes, kind),
-                |url| crate::imgbed::live_delete(&cfg, url),
+                |url| tokio::task::block_in_place(|| crate::imgbed::live_download(url)),
+                |url, bytes, kind| {
+                    tokio::task::block_in_place(|| {
+                        crate::imgbed::live_upload(&cfg, url, bytes, kind)
+                    })
+                },
+                |url| tokio::task::block_in_place(|| crate::imgbed::live_delete(&cfg, url)),
             )
             .await
             {
@@ -530,8 +535,10 @@ async fn cleanup_and_backup(db: &Db) {
     })
     .await;
     timed(GROUP, "代理池刷新", async {
-        if let Err(err) =
-            crate::proxy_admin::refresh_due(db, unix_now(), crate::proxy_admin::live_get).await
+        if let Err(err) = crate::proxy_admin::refresh_due(db, unix_now(), |url| {
+            tokio::task::block_in_place(|| crate::proxy_admin::live_get(url))
+        })
+        .await
         {
             tracing::warn!("代理池刷新失败: {err}");
         }

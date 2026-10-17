@@ -83,44 +83,48 @@ pub async fn snapshot(db: &crate::db::Db, group: &str) -> Value {
         group
     };
     let (start, previous) = begin(group);
-    let cookie = if matches!(start, Start::Idle) {
-        None
-    } else {
-        crate::xueqiu::app_cookie(db).await.ok()
-    };
-    match start {
-        Start::Cold => {
+    let cold = matches!(start, Start::Cold);
+    if !matches!(start, Start::Idle) {
+        // The refresh runs detached so a cancelled request (client disconnect,
+        // timeout) can never leave `refreshing` stuck; the guard resets it even
+        // if the task itself panics.
+        let db = db.clone();
+        let group = group.to_string();
+        let task = tokio::spawn(async move {
+            let guard = SlotReset(group.clone());
+            let cookie = crate::xueqiu::app_cookie(&db).await.ok();
             let fetched = tokio::task::spawn_blocking({
+                let group = group.clone();
                 let previous = previous.clone();
-                let group = group.to_string();
-                let cookie = cookie.clone();
                 move || fetch_group(&group, &previous, cookie.as_deref())
             })
             .await
-            .unwrap_or(previous);
-            finish(group, fetched);
+            .unwrap_or_default();
+            if !fetched.is_empty() {
+                finish(&group, fetched);
+            } else if cold {
+                finish(&group, previous);
+            } else {
+                mark_stale(&group);
+            }
+            drop(guard);
+        });
+        if cold {
+            let _ = task.await;
         }
-        Start::Warm => {
-            let previous = previous.clone();
-            let group = group.to_string();
-            tokio::spawn(async move {
-                let fetched = tokio::task::spawn_blocking({
-                    let group = group.clone();
-                    let cookie = cookie.clone();
-                    move || fetch_group(&group, &previous, cookie.as_deref())
-                })
-                .await
-                .unwrap_or_default();
-                if fetched.is_empty() {
-                    mark_stale(&group);
-                } else {
-                    finish(&group, fetched);
-                }
-            });
-        }
-        Start::Idle => {}
     }
     render(group, &current(group), now)
+}
+
+struct SlotReset(String);
+
+impl Drop for SlotReset {
+    fn drop(&mut self) {
+        let mut slots = slots().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(slot) = slots.get_mut(&self.0) {
+            slot.refreshing = false;
+        }
+    }
 }
 
 fn begin(group: &str) -> (Start, Vec<Item>) {
@@ -812,28 +816,100 @@ fn quote_status(symbol: &str, quoted_at: Option<&str>, now: i64) -> &'static str
     }
 }
 
+/// (month, first day, last day) closures, inclusive.
+type Closures = &'static [(u32, u32, u32)];
+
+// 2027 tables are derived from the statutory rules and the lunar calendar before the
+// State Council / HKEX notices were published (待核对): replace them once official.
+fn cn_holidays(year: i32) -> Option<Closures> {
+    match year {
+        2026 => Some(&[
+            (1, 1, 3),
+            (2, 15, 23),
+            (4, 4, 6),
+            (5, 1, 5),
+            (6, 19, 19),
+            (9, 25, 25),
+            (10, 1, 7),
+        ]),
+        2027 => Some(&[
+            (1, 1, 1),
+            (2, 5, 12),
+            (4, 5, 5),
+            (5, 3, 5),
+            (6, 9, 9),
+            (9, 15, 15),
+            (10, 1, 7),
+        ]),
+        _ => None,
+    }
+}
+
+fn hk_holidays(year: i32) -> Option<Closures> {
+    match year {
+        2026 => Some(&[
+            (1, 1, 1),
+            (2, 17, 19),
+            (4, 3, 7),
+            (5, 1, 1),
+            (5, 25, 25),
+            (6, 19, 19),
+            (7, 1, 1),
+            (10, 1, 1),
+            (10, 19, 19),
+            (12, 25, 26),
+        ]),
+        2027 => Some(&[
+            (1, 1, 1),
+            (2, 8, 9),
+            (3, 26, 26),
+            (3, 29, 29),
+            (4, 5, 5),
+            (5, 13, 13),
+            (6, 9, 9),
+            (7, 1, 1),
+            (9, 16, 16),
+            (10, 1, 1),
+            (10, 8, 8),
+            (12, 27, 27),
+        ]),
+        _ => None,
+    }
+}
+
+fn hk_half_days(year: i32) -> Option<Closures> {
+    match year {
+        2026 => Some(&[(2, 16, 16), (12, 24, 24), (12, 31, 31)]),
+        2027 => Some(&[(2, 5, 5), (12, 24, 24), (12, 31, 31)]),
+        _ => None,
+    }
+}
+
+fn in_closures(table: Option<Closures>, month: u32, day: u32) -> bool {
+    table.is_some_and(|table| {
+        table
+            .iter()
+            .any(|&(m, first, last)| m == month && (first..=last).contains(&day))
+    })
+}
+
 fn is_cn_holiday(year: i32, month: u32, day: u32) -> bool {
-    year == 2026
-        && ((month == 1 && (1..=3).contains(&day))
-            || (month == 2 && (15..=23).contains(&day))
-            || (month == 4 && (4..=6).contains(&day))
-            || (month == 5 && (1..=5).contains(&day))
-            || (month == 6 && day == 19)
-            || (month == 9 && day == 25)
-            || (month == 10 && (1..=7).contains(&day)))
+    in_closures(cn_holidays(year), month, day)
 }
 
 fn is_hk_holiday(year: i32, month: u32, day: u32) -> bool {
-    year == 2026
-        && ((month == 1 && day == 1)
-            || (month == 2 && (17..=19).contains(&day))
-            || (month == 4 && (3..=7).contains(&day))
-            || (month == 5 && (day == 1 || day == 25))
-            || (month == 6 && day == 19)
-            || (month == 7 && day == 1)
-            || (month == 10 && day == 1)
-            || (month == 10 && day == 19)
-            || (month == 12 && (day == 25 || day == 26)))
+    in_closures(hk_holidays(year), month, day)
+}
+
+fn warn_unknown_calendar(market: &str, year: i32) {
+    static WARNED: OnceLock<Mutex<std::collections::HashSet<(String, i32)>>> = OnceLock::new();
+    let mut warned = WARNED
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if warned.insert((market.to_string(), year)) {
+        tracing::warn!("{market} {year} 年交易日历缺失，按普通工作日判断开市，请补充节假日表");
+    }
 }
 
 fn default_group(now: i64) -> &'static str {
@@ -1073,7 +1149,23 @@ pub(crate) fn exchange_timestamp(market: &str, timestamp_ms: i64) -> Option<(Str
 }
 
 pub(crate) fn exchange_calendar_known(market: &str, now: i64) -> bool {
-    matches!(market, "us") || (matches!(market, "cn" | "hk") && to_cn(now).year == 2026)
+    let year = to_cn(now).year;
+    match market {
+        "us" => true,
+        "cn" => cn_holidays(year).is_some(),
+        "hk" => hk_holidays(year).is_some(),
+        _ => false,
+    }
+}
+
+/// Years whose CN table is still the pre-notice estimate (待核对).
+const CN_ESTIMATED_YEARS: &[i32] = &[2027];
+
+/// Whether the closures for `now`'s year come from an official notice; false
+/// for unknown years and for the estimated CN tables.
+pub(crate) fn exchange_calendar_verified(market: &str, now: i64) -> bool {
+    exchange_calendar_known(market, now)
+        && !(market == "cn" && CN_ESTIMATED_YEARS.contains(&to_cn(now).year))
 }
 
 pub(crate) fn regular_session_open(market: &str, now: i64) -> bool {
@@ -1091,14 +1183,11 @@ pub(crate) fn regular_session_open(market: &str, now: i64) -> bool {
     {
         return false;
     }
-    // ponytail: CN/HK use the verified 2026 exchange calendars; update before accepting another year.
     if !exchange_calendar_known(market, now) {
-        return false;
+        warn_unknown_calendar(market, local.year);
     }
     let minute = local.hour * 60 + local.minute;
-    let hk_half_day = local.year == 2026
-        && ((local.month == 2 && local.day == 16)
-            || (local.month == 12 && matches!(local.day, 24 | 31)));
+    let hk_half_day = in_closures(hk_half_days(local.year), local.month, local.day);
     let us_early_close = (local.month == 11 && local.day == nth_date(local.year, 11, 3, 4).2 + 1)
         || (local.month == 12 && local.day == 24)
         || (local.month == 7 && local.day == 3);
@@ -1442,5 +1531,46 @@ mod tests {
             "hkHSI"
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_guard_clears_the_flag_even_when_the_task_panics() {
+        let group = "h9-guard-test";
+        assert!(matches!(begin(group).0, Start::Cold));
+        assert!(matches!(begin(group).0, Start::Idle));
+        let task = tokio::spawn(async move {
+            let _guard = SlotReset(group.to_string());
+            panic!("simulated refresh failure");
+        });
+        assert!(task.await.is_err());
+        assert!(matches!(begin(group).0, Start::Cold));
+        drop(SlotReset(group.to_string()));
+    }
+
+    #[test]
+    fn calendars_cover_2027_and_unknown_years_fall_back_to_weekdays() {
+        // 2027-02-08 (Mon) is closed in both markets around Lunar New Year.
+        let lny = cn_unix("2027-02-08T10:00:00");
+        assert!(exchange_calendar_known("cn", lny));
+        assert!(exchange_calendar_known("hk", lny));
+        assert!(!exchange_calendar_verified("cn", lny));
+        assert!(exchange_calendar_verified("hk", lny));
+        assert!(exchange_calendar_verified(
+            "cn",
+            cn_unix("2026-10-09T10:00:00")
+        ));
+        assert!(!regular_session_open("cn", lny));
+        assert!(!regular_session_open("hk", lny));
+        assert!(!regular_session_open("cn", cn_unix("2027-10-04T10:00:00")));
+        assert!(!regular_session_open("hk", cn_unix("2027-03-26T10:00:00")));
+        assert!(regular_session_open("cn", cn_unix("2027-02-15T10:00:00")));
+        assert!(regular_session_open("hk", cn_unix("2027-12-24T10:00:00")));
+        assert!(!regular_session_open("hk", cn_unix("2027-12-24T14:00:00")));
+        // 2028-01-04 is a Tuesday with no table: treated as an ordinary trading day.
+        let unknown = cn_unix("2028-01-04T10:00:00");
+        assert!(!exchange_calendar_known("cn", unknown));
+        assert!(regular_session_open("cn", unknown));
+        assert!(regular_session_open("hk", unknown));
+        assert!(!regular_session_open("cn", cn_unix("2028-01-08T10:00:00")));
     }
 }

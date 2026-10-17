@@ -3,7 +3,7 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, KeyInit, Nonce};
 use base64::Engine;
-use futures_util::{stream, StreamExt, TryStreamExt};
+use futures_util::{stream, StreamExt};
 use rand::rngs::OsRng;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Oaep, RsaPublicKey};
@@ -21,6 +21,7 @@ NIGdfITwmiBmS+R1Mr8P/ssNq0ptvr9+VqUvsJD7ASVCPo9EG658fZYGil6oH5JN\n\
 OQIDAQAB\n\
 -----END PUBLIC KEY-----\n";
 
+#[derive(Clone)]
 pub struct File {
     pub media_id: String,
     pub name: String,
@@ -185,35 +186,45 @@ pub async fn list_pdfs(
 
 /// 递归列出根目录下所有 PDF。原来只调 list_pdfs 列挂载根目录的直接文件，
 /// 上游三万个研报就只能看到两个 —— 子目录得自己走下去。
+/// 子目录读取失败只跳过该目录（计入返回的失败数），不拖垮整组。
 pub async fn list_pdfs_deep(
     http: &impl Transport,
     base: &str,
     session: &Session,
     knowledge_base_id: &str,
     roots: &[String],
-) -> Result<Vec<File>, String> {
+) -> Result<(Vec<File>, usize), String> {
     let mut files = list_pdfs(http, base, session, knowledge_base_id, roots).await?;
     let mut seen: HashSet<String> = roots.iter().cloned().collect();
     let mut level = child_folders(http, base, session, knowledge_base_id, roots, None).await?;
+    let mut failed = 0usize;
     // seen 同时挡环形 parent，所以不需要深度上限
     while !level.is_empty() {
         let results = stream::iter(level.into_iter().map(|(id, day)| async move {
             scan_folder(http, base, session, knowledge_base_id, id, day).await
         }))
         .buffer_unordered(8)
-        .try_collect::<Vec<_>>()
-        .await?;
+        .collect::<Vec<_>>()
+        .await;
         let mut next = Vec::new();
-        for (mut folder_files, children) in results {
-            files.append(&mut folder_files);
-            next.extend(children);
+        for result in results {
+            match result {
+                Ok((mut folder_files, children)) => {
+                    files.append(&mut folder_files);
+                    next.extend(children);
+                }
+                Err(err) => {
+                    failed += 1;
+                    tracing::warn!(knowledge_base_id, "IMA 子目录读取失败，已跳过: {err}");
+                }
+            }
         }
         level = next
             .into_iter()
             .filter(|(id, _)| seen.insert(id.clone()))
             .collect();
     }
-    Ok(files)
+    Ok((files, failed))
 }
 
 async fn scan_folder(
@@ -920,7 +931,7 @@ mod tests {
             token: "t".into(),
             uid: "u".into(),
         };
-        let files = list_pdfs_deep(
+        let (files, failed) = list_pdfs_deep(
             &Tree,
             "https://ima.test",
             &session,
@@ -929,6 +940,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert_eq!(failed, 0);
         let mut ids: Vec<String> = files.iter().map(|file| file.media_id.clone()).collect();
         ids.sort();
         assert_eq!(ids, ["f-a", "f-b", "f-root"]);

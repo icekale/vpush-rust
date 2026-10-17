@@ -162,6 +162,10 @@ struct CacheEntry {
     error: Option<String>,
 }
 
+/// Search results are cached so a just-added symbol renders immediately; the
+/// next refresh keeps only watched symbols, and this caps growth in between.
+const SEARCH_CACHE_CAP: usize = 4096;
+
 struct QuoteCache {
     at: Option<Instant>,
     refreshing: bool,
@@ -573,6 +577,29 @@ async fn refresh_cache(db: &Db) -> Result<(), WatchlistError> {
         }
         cache.refreshing = true;
     }
+    // Detached so a cancelled request cannot strand `refreshing = true`; the
+    // guard resets the flag on every exit path, including panics.
+    let db = db.clone();
+    tokio::spawn(async move {
+        let _guard = RefreshReset;
+        refresh_quotes(&db, instruments).await
+    })
+    .await
+    .unwrap_or_else(|err| Err(WatchlistError::gateway(err.to_string())))
+}
+
+struct RefreshReset;
+
+impl Drop for RefreshReset {
+    fn drop(&mut self) {
+        cache()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .refreshing = false;
+    }
+}
+
+async fn refresh_quotes(db: &Db, instruments: Vec<Instrument>) -> Result<(), WatchlistError> {
     let result = async {
         let cookie = crate::xueqiu::app_cookie(db)
             .await
@@ -604,6 +631,9 @@ async fn refresh_cache(db: &Db) -> Result<(), WatchlistError> {
             }
         }
         let mut cache = cache().lock().unwrap_or_else(|err| err.into_inner());
+        let watched: std::collections::HashSet<String> =
+            instruments.iter().map(Instrument::key).collect();
+        cache.entries.retain(|key, _| watched.contains(key));
         for instrument in instruments {
             let key = instrument.key();
             if let Some(quote) = quotes.remove(&key) {
@@ -665,13 +695,9 @@ pub async fn list(db: &Db, user_id: i64) -> Result<Value, WatchlistError> {
         let instrument = normalize_symbol(&market, &symbol).map_err(WatchlistError::bad)?;
         let entry = cached(&instrument.key());
         let quote = entry.as_ref().and_then(|entry| entry.quote.as_ref());
-        let error = entry
-            .as_ref()
-            .and_then(|entry| entry.error.clone())
-            .or_else(|| {
-                (!crate::market::exchange_calendar_known(market.as_str(), now / 1000))
-                    .then(|| "该年度交易日历尚未核验".to_string())
-            });
+        let error = entry.as_ref().and_then(|entry| entry.error.clone());
+        let calendar_verified =
+            crate::market::exchange_calendar_verified(market.as_str(), now / 1000);
         let status = if error.is_some()
             || quote.is_none()
             || quote.is_some_and(|quote| quote.observed_at_ms > now)
@@ -692,6 +718,7 @@ pub async fn list(db: &Db, user_id: i64) -> Result<Value, WatchlistError> {
             "percent": visible_quote.and_then(|quote| quote.percent),
             "tick_size": quote.and_then(|quote| quote.tick_size),
             "quoted_at": quote.map(|quote| quote.quoted_at.clone()), "status": status,
+            "calendar_verified": calendar_verified,
             "alerts": {"above": alert_json_from_columns(row, "above"), "below": alert_json_from_columns(row, "below")},
         });
         if let Some(error) = error {
@@ -1040,6 +1067,9 @@ pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError
     for instrument in candidates {
         if let Some(quote) = verified.remove(&instrument.key()) {
             items.push(json!({"market": quote.instrument.market.as_str(), "symbol": quote.instrument.symbol, "name": quote.name, "currency": quote.instrument.currency()}));
+            if shared.entries.len() >= SEARCH_CACHE_CAP {
+                continue;
+            }
             shared.entries.insert(
                 instrument.key(),
                 CacheEntry {
@@ -1183,12 +1213,15 @@ pub fn spawn(db: Db) {
     ) {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = monitor_once(&db).await {
-                tracing::warn!("自选股行情监控: {}", err.detail);
+    crate::supervise::spawn("stock_watchlist", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = monitor_once(&db).await {
+                    tracing::warn!("自选股行情监控: {}", err.detail);
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
-            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
 }
@@ -1646,7 +1679,7 @@ mod tests {
         let mut at_lunch = quote.clone();
         at_lunch.observed_at_ms = lunch;
         assert!(!alertable_at(&at_lunch, lunch));
-        let unknown_calendar = crate::market::mainland_quote_time("20270104100000")
+        let unknown_calendar = crate::market::mainland_quote_time("20280104100000")
             .unwrap()
             .1;
         assert!(!crate::market::exchange_calendar_known(
@@ -1785,5 +1818,24 @@ mod tests {
         assert!(valid_target("us", 10.01));
         assert!(valid_target("us", 0.001));
         assert!(!valid_target("us", 0.00001));
+    }
+
+    #[tokio::test]
+    async fn refresh_guard_clears_the_flag_even_when_the_task_panics() {
+        cache()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .refreshing = true;
+        let task = tokio::spawn(async {
+            let _guard = RefreshReset;
+            panic!("simulated refresh failure");
+        });
+        assert!(task.await.is_err());
+        assert!(
+            !cache()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .refreshing
+        );
     }
 }

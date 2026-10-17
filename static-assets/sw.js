@@ -1,8 +1,8 @@
 /* V Push Service Worker —— network-first：静态外壳离线可用，API 永不缓存 */
-const CACHE = "dav-shell-1.12.279";
+const CACHE = "dav-shell-1.12.281";
 const SHELL = [
   "/",
-  "/app.5d0237645ca7.js",
+  "/app.df92a0557485.js",
   // asset-modules:start
   "/core/dialog.b2db015b3a5e.js",
   "/core/html.98867022c29c.js",
@@ -11,23 +11,23 @@ const SHELL = [
   "/core/platforms.e3f9b30aa971.js",
   "/views/admin/cicc.0cd7529b8514.js",
   "/views/admin/codes.2b9b97a7ba6e.js",
-  "/views/admin/dashboard.7985406ff5a8.js",
+  "/views/admin/dashboard.0568e6b584be.js",
   "/views/admin/ima-collector.f5df4416f5ed.js",
   "/views/admin/infra.e13cdf4ab5b3.js",
   "/views/admin/knowledge.42883ccab396.js",
-  "/views/admin/kol.9fb9705ffce4.js",
-  "/views/admin/news.269a9edcf5f0.js",
+  "/views/admin/kol.03d7ac3cb101.js",
+  "/views/admin/news.32ea0a36f095.js",
   "/views/admin/users.171b6837216e.js",
-  "/views/feishu-personal.d74ec140be8a.js",
+  "/views/feishu-personal.58cf0bedfed5.js",
   "/views/ima.b966b5e3284e.js",
   "/views/market.4e2ffc62abf0.js",
-  "/views/news.bfd291dc84d6.js",
+  "/views/news.f073a0b77a85.js",
   "/views/post-card-export.27dbd2f5c5fa.js",
   "/views/push-settings.147a37ee9001.js",
   "/views/etf-premium.b096b76ff531.js",
-  "/views/watchlist.6bcf8b0152e5.js",
+  "/views/watchlist.b1c1d464e2d3.js",
   // asset-modules:end
-  "/style.0fb7291126ad.css",
+  "/style.ad9eb87f0835.css",
   "/vendor/design-tokens.a9ab42f1db7a.css",
   "/logo-mark.svg",
   "/icon-192.png",
@@ -65,6 +65,10 @@ self.addEventListener("fetch", (e) => {
   if (url.pathname.startsWith("/api/")) return; // 动态数据永不缓存
   if (e.request.mode === "navigate") {
     e.respondWith(networkFirstNavigate(e.request));
+    return;
+  }
+  if (FINGERPRINTED.test(url.pathname)) {
+    e.respondWith(cacheFirst(e.request));
     return;
   }
   e.respondWith(networkFirst(e.request));
@@ -112,6 +116,15 @@ async function networkFirstNavigate(req) {
   return (await caches.match("/")) || Response.error();
 }
 
+// 带 12 位内容 hash 的路径内容永不变：命中缓存直接用，不必每次冷启动全量重下
+const FINGERPRINTED = /\.[0-9a-f]{12}\.(?:js|css)$/;
+
+async function cacheFirst(req) {
+  const cached = await caches.match(req, { ignoreSearch: true });
+  if (cached) return cached;
+  return networkFirst(req);
+}
+
 async function networkFirst(req) {
   let fresh;
   try {
@@ -121,6 +134,11 @@ async function networkFirst(req) {
   } catch {
     const cached = await caches.match(req, { ignoreSearch: true });
     return cached || Response.error();
+  }
+  if (fresh && !fresh.ok) {
+    // 5xx / 404（如发版瞬间）时有旧缓存就先用旧的，避免把错误页当模块执行
+    const cached = await caches.match(req, { ignoreSearch: true });
+    if (cached) return cached;
   }
   if (fresh && fresh.ok && fresh.type === "basic") {
     // 后台写缓存：Cache.put 对 206（大文件 Range）等响应会抛错，

@@ -367,7 +367,8 @@ where
     if retention_days > 0 {
         let expired = sqlx::query(
             "SELECT source_url, hosted_url FROM hosted_images
-             WHERE status = 'ready' AND hosted_url != '' AND created_at <= datetime('now', ?)",
+             WHERE status = 'ready' AND hosted_url != '' AND created_at <= datetime('now', ?)
+             ORDER BY created_at LIMIT 200",
         )
         .bind(format!("-{retention_days} days"))
         .fetch_all(db.pool())

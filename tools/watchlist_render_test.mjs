@@ -259,3 +259,10 @@ test("alert payload preserves zero and clears blank targets", () => {
     below: { target: null, enabled: false },
   });
 });
+
+test("unverified exchange calendars are flagged", () => {
+  const item = { market: "cn", symbol: "600519", name: "贵州茅台", currency: "CNY", price: 1, percent: 0, quoted_at: "2027-02-01T01:02:03Z", status: "closed", alerts: {} };
+  assert.match(renderWatchlistMarkup({ items: [{ ...item, calendar_verified: false }] }), /交易日历待核对/);
+  assert.doesNotMatch(renderWatchlistMarkup({ items: [{ ...item, calendar_verified: true }] }), /交易日历待核对/);
+  assert.doesNotMatch(renderWatchlistMarkup({ items: [item] }), /交易日历待核对/);
+});

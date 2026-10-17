@@ -43,15 +43,18 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("X 抓取: {err}");
-                let _ = db.note_platform("twitter", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("twitter", None).await;
+    crate::supervise::spawn("twitter", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("X 抓取: {err}");
+                    let _ = db.note_platform("twitter", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("twitter", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }
@@ -691,8 +694,8 @@ fn zone_secs(raw: &str) -> Option<i64> {
     if raw.len() < 5 {
         return None;
     }
-    let hour: i64 = raw[1..3].parse().ok()?;
-    let minute: i64 = raw[3..5].parse().ok()?;
+    let hour: i64 = raw.get(1..3)?.parse().ok()?;
+    let minute: i64 = raw.get(3..5)?.parse().ok()?;
     Some(sign * (hour * 3600 + minute * 60))
 }
 
@@ -1008,7 +1011,8 @@ fn find_query_id(text: &str, operation: &str) -> Option<String> {
     let mut from = 0;
     while let Some(pos) = text[from..].find(&needle) {
         let abs = from + pos;
-        let window = &text[abs.saturating_sub(320)..abs];
+        let window =
+            &text[crate::textutil::floor_char_boundary(text, abs.saturating_sub(320))..abs];
         if let Some(id) = query_in(window) {
             return Some(id);
         }
@@ -1185,5 +1189,18 @@ mod tests {
                 .await;
         });
         reader.join().unwrap()
+    }
+
+    #[test]
+    fn external_text_slicing_does_not_panic_on_multibyte_input() {
+        assert_eq!(zone_secs("+中a"), None);
+        assert_eq!(zone_secs("-0130"), Some(-5400));
+        let bundle = format!(
+            "{}queryId:\"abc123\",operationName:\"UserTweets\"",
+            "中".repeat(200)
+        );
+        let _ = find_query_id(&bundle, "UserTweets");
+        let bundle = format!("{}operationName:\"UserTweets\"", "文".repeat(150));
+        assert_eq!(find_query_id(&bundle, "UserTweets"), None);
     }
 }

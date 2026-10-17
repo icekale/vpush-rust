@@ -1,3 +1,13 @@
+// 期刊日期按北京时间显示：库里规范格式是 UTC（…+00:00），直接截前 10 位会把
+// 北京时间 0–8 点发布的期刊显示成前一天。不带时区的旧值本来就是北京时间。
+export function beijingDay(value) {
+  const raw = String(value || "").trim();
+  if (/^\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}(?::\d{2})?)?$/.test(raw)) return raw.slice(0, 10);
+  const parsed = new Date(raw);
+  if (!raw || isNaN(parsed.getTime())) return raw.slice(0, 10);
+  return new Date(parsed.getTime() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+}
+
 export function createNewsView(dependencies) {
   const {
     $,
@@ -200,7 +210,7 @@ export function createNewsView(dependencies) {
   function magazineShelfHtml(issues) {
     const years = new Map();
     for (const issue of issues) {
-      const year = String(issue.published_at || "").slice(0, 4) || "更早";
+      const year = beijingDay(issue.published_at).slice(0, 4) || "更早";
       if (!years.has(year)) years.set(year, []);
       years.get(year).push(issue);
     }
@@ -220,7 +230,7 @@ export function createNewsView(dependencies) {
             return `${section}<a class="news-issue-article ${article.is_read ? "is-read" : ""}" href="/news/${article.id}"><strong>${escapeHtml(article.title)}</strong>${article.author ? `<span>${escapeHtml(article.author)}</span>` : ""}</a>`;
           }).join("");
           return `<details class="news-issue" ${index === 0 && issueIndex === 0 ? "open" : ""}>
-            <summary class="news-issue-head">${cover}<span class="news-issue-meta"><b>${escapeHtml(issue.label || "")}</b>${issue.title ? `<em>${escapeHtml(issue.title)}</em>` : ""}<small>${escapeHtml(String(issue.published_at || "").slice(0, 10))} · 已读 ${read} / ${issue.articles.length} 篇</small></span></summary>
+            <summary class="news-issue-head">${cover}<span class="news-issue-meta"><b>${escapeHtml(issue.label || "")}</b>${issue.title ? `<em>${escapeHtml(issue.title)}</em>` : ""}<small>${escapeHtml(beijingDay(issue.published_at))} · 已读 ${read} / ${issue.articles.length} 篇</small></span></summary>
             <div class="news-issue-body">${articles}</div>
           </details>`;
         }).join("")}</div>
@@ -763,7 +773,7 @@ export function createNewsView(dependencies) {
             <h1>${escapeHtml(article.title)}</h1>
             ${article.author ? `<p class="section-meta">作者：${escapeHtml(article.author)}</p>` : ""}
             <div class="news-article-tools">
-              <a class="btn-ghost news-original-link" href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer nofollow">打开原文 ${externalLinkIcon}</a>
+              ${/^https?:\/\//i.test(article.url || "") ? `<a class="btn-ghost news-original-link" href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer nofollow">打开原文 ${externalLinkIcon}</a>` : ""}
               <div class="news-font-switch" role="group" aria-label="正文字号">
                 ${[["small", "小"], ["", "标准"], ["large", "大"]].map(([value, label]) => `
                   <button type="button" class="${((state.user && state.user.news_font_size) || "") === value ? "is-on" : ""}" onclick="setNewsFontSize('${value}')" aria-pressed="${((state.user && state.user.news_font_size) || "") === value}">${label}</button>`).join("")}

@@ -151,12 +151,13 @@ pub async fn restore_bytes(db: &Db, data: &[u8]) -> Result<(), BackupError> {
     if data.is_empty() || data.len() > UPLOAD_MAX {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
     }
-    if data.starts_with(MAGIC) {
-        return Err(fail(
-            400,
-            "备份已加密，请配置 FEISHU_CREDENTIAL_KEY 后再恢复",
-        ));
-    }
+    let decrypted;
+    let data = if data.starts_with(MAGIC) {
+        decrypted = decrypt_backup(data)?;
+        decrypted.as_slice()
+    } else {
+        data
+    };
     if !data.starts_with(b"SQLite format 3\0") {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
     }
@@ -172,6 +173,11 @@ pub async fn restore_bytes(db: &Db, data: &[u8]) -> Result<(), BackupError> {
         .map_err(|_| fail(500, "读取数据库失败"))?;
     let result = restore_candidate(db, &live, &candidate).await;
     let _ = std::fs::remove_file(&candidate);
+    for suffix in ["-wal", "-shm"] {
+        let mut side = candidate.clone().into_os_string();
+        side.push(suffix);
+        let _ = std::fs::remove_file(side);
+    }
     result
 }
 
@@ -221,15 +227,50 @@ async fn restore_candidate(db: &Db, live: &Path, candidate: &Path) -> Result<(),
     if !sqlite_ok_off(candidate).await {
         return Err(fail(400, "备份文件损坏，已取消恢复，当前数据未改"));
     }
+    migrate_candidate(candidate).await?;
     let snap = snapshot_unlocked(db).await?;
     if !restore_into_off(live, candidate).await {
         let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
     }
+    // The live connection must reload the schema (reading sqlite_master
+    // notices the new schema cookie) before cached statements, which still
+    // carry the pre-restore column layout, are dropped.
+    if let Ok(mut conn) = db.pool().acquire().await {
+        let _ = sqlx::query("SELECT COUNT(*) FROM sqlite_master")
+            .execute(&mut *conn)
+            .await;
+        let _ = sqlx::Connection::clear_cached_statements(&mut *conn).await;
+    }
     if sqlx::query("SELECT 1").execute(db.pool()).await.is_err() {
         let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
     }
+    Ok(())
+}
+
+/// Brings an (possibly old) backup up to the current schema on the side copy,
+/// so the live database is only replaced by something the app can run on.
+async fn migrate_candidate(candidate: &Path) -> Result<(), BackupError> {
+    let migrated = Db::open(candidate).await.map_err(|err| {
+        tracing::warn!(%err, "备份迁移失败");
+        fail(400, "备份无法升级到当前版本，已取消恢复，当前数据未改")
+    })?;
+    let violations: Vec<(String,)> =
+        sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check")
+            .fetch_all(migrated.pool())
+            .await
+            .unwrap_or_default();
+    if !violations.is_empty() {
+        tracing::warn!(count = violations.len(), "恢复的备份存在外键孤儿记录");
+    }
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(migrated.pool())
+        .await;
+    let _ = sqlx::query("PRAGMA journal_mode = DELETE")
+        .execute(migrated.pool())
+        .await;
+    migrated.pool().close().await;
     Ok(())
 }
 
@@ -239,10 +280,24 @@ async fn snapshot_unlocked(db: &Db) -> Result<PathBuf, BackupError> {
     std::fs::create_dir_all(&folder).map_err(|_| fail(500, "读取数据库失败"))?;
     let target = unique_snapshot(&folder);
     let escaped = target.to_string_lossy().replace('\'', "''");
-    sqlx::query(&format!("VACUUM INTO '{escaped}'"))
-        .execute(db.pool())
-        .await
-        .map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
+    // A dedicated read-only connection: WAL lets it copy a consistent snapshot
+    // while the app's single pooled connection keeps serving requests.
+    let mut conn = {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use sqlx::ConnectOptions;
+        SqliteConnectOptions::new()
+            .filename(&live)
+            .read_only(true)
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .connect()
+            .await
+            .map_err(|_| fail(500, "读取数据库失败"))?
+    };
+    let vacuumed = sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+        .execute(&mut conn)
+        .await;
+    let _ = sqlx::Connection::close(conn).await;
+    vacuumed.map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
     if !sqlite_ok_off(&target).await {
         let _ = std::fs::remove_file(&target);
         return Err(fail(500, "备份校验失败，请稍后重试"));
@@ -394,21 +449,7 @@ fn backup_names(xml: &str) -> Vec<String> {
 }
 
 fn percent_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(byte) = u8::from_str_radix(&value[i + 1..i + 3], 16) {
-                out.push(byte);
-                i += 3;
-                continue;
-            }
-        }
-        out.push(bytes[i]);
-        i += 1;
-    }
-    String::from_utf8_lossy(&out).into_owned()
+    crate::textutil::percent_decode(value)
 }
 
 fn dav(
@@ -562,16 +603,11 @@ async fn setting(db: &Db, key: &str) -> Result<String, BackupError> {
 }
 
 async fn db_file(db: &Db) -> Result<PathBuf, BackupError> {
-    let file: Option<String> =
-        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-            .fetch_optional(db.pool())
-            .await
-            .map_err(|_| fail(500, "读取数据库失败"))?;
-    let file = file.unwrap_or_default();
-    if file.is_empty() {
+    let path = db.path();
+    if path.as_os_str().is_empty() || path.to_string_lossy().starts_with(":memory:") {
         return Err(fail(400, "当前数据库不能导出"));
     }
-    Ok(PathBuf::from(file))
+    Ok(path.to_path_buf())
 }
 
 fn valid_https(url: &str) -> bool {
@@ -668,6 +704,16 @@ pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
             return Ok(false);
         }
     };
+    let bytes = match backup_key() {
+        Some(key) => match encrypt_backup(&key, &bytes) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                let _ = db.set_setting(LAST_ERR, err.detail).await;
+                return Ok(false);
+            }
+        },
+        None => bytes,
+    };
     let folder = join(&cfg.url, &cfg.path);
     if let Err(err) = upload_pruned_off(&cfg, &folder, &name, bytes).await {
         let _ = db.set_setting(LAST_ERR, err.detail).await;
@@ -677,6 +723,73 @@ pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
     let _ = db.set_setting(LAST_ERR, "").await;
     let _ = db.set_setting(LAST_NAME, &name).await;
     Ok(true)
+}
+
+/// Opt-in: when `BACKUP_ENCRYPTION_KEY` (32 bytes, URL-safe base64 like
+/// `FEISHU_CREDENTIAL_KEY`) is set, uploads are AES-256-GCM sealed as
+/// `MAGIC || nonce || ciphertext`. Unset keeps the historical plaintext upload.
+fn backup_key() -> Option<Vec<u8>> {
+    let raw = std::env::var("BACKUP_ENCRYPTION_KEY").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match crate::feishu_personal::decode_key(raw) {
+        Ok(key) => Some(key),
+        Err(_) => {
+            tracing::error!(
+                "BACKUP_ENCRYPTION_KEY 无效（需要 32 字节 URL-safe base64），备份将不上传"
+            );
+            Some(Vec::new())
+        }
+    }
+}
+
+fn encrypt_backup(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, BackupError> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)
+        .map_err(|_| fail(500, "BACKUP_ENCRYPTION_KEY 无效"))?;
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce).map_err(|_| fail(500, "备份加密失败"))?;
+    let sealed = cipher
+        .encrypt(aes_gcm::Nonce::from_slice(&nonce), plain)
+        .map_err(|_| fail(500, "备份加密失败"))?;
+    let mut out = Vec::with_capacity(MAGIC.len() + nonce.len() + sealed.len());
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+fn decrypt_backup(data: &[u8]) -> Result<Vec<u8>, BackupError> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    let body = &data[MAGIC.len()..];
+    if body.len() < 12 + 16 {
+        return Err(fail(400, "请上传有效的 .db 备份文件"));
+    }
+    let keys: Vec<Vec<u8>> = ["BACKUP_ENCRYPTION_KEY", "FEISHU_CREDENTIAL_KEY"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .filter_map(|raw| crate::feishu_personal::decode_key(raw.trim()).ok())
+        .collect();
+    if keys.is_empty() {
+        return Err(fail(
+            400,
+            "备份已加密，请配置 BACKUP_ENCRYPTION_KEY 后再恢复",
+        ));
+    }
+    for key in keys {
+        let Ok(cipher) = aes_gcm::Aes256Gcm::new_from_slice(&key) else {
+            continue;
+        };
+        if let Ok(plain) = cipher.decrypt(aes_gcm::Nonce::from_slice(&body[..12]), &body[12..]) {
+            return Ok(plain);
+        }
+    }
+    Err(fail(
+        400,
+        "备份解密失败，请确认 BACKUP_ENCRYPTION_KEY 与备份时一致",
+    ))
 }
 
 fn upload_pruned(cfg: &Cfg, folder: &str, name: &str, bytes: &[u8]) -> Result<(), BackupError> {
@@ -712,6 +825,8 @@ fn utc_human() -> String {
 mod tests {
     use super::*;
 
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn names_come_from_webdav_listing() {
         let xml = r#"<D:href>/vpush-backups/</D:href><D:href>/vpush-backups/dav-20260814-030000.db</D:href><D:href>/x/dav-20260813-030000.db</D:href>"#;
@@ -726,6 +841,7 @@ mod tests {
 
     #[tokio::test]
     async fn saves_config_downloads_and_restores_without_showing_the_password() {
+        let _serial = SERIAL.lock().await;
         let dir =
             std::env::temp_dir().join(format!("vpush-bak-{}-{}", std::process::id(), now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -753,6 +869,120 @@ mod tests {
             db.setting("backup_marker").await.unwrap().as_deref(),
             Some("before")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restoring_an_old_backup_migrates_it_before_swapping() {
+        let _serial = SERIAL.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-bak-old-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.db");
+        let status = Command::new("sqlite3")
+            .arg(&old)
+            .arg(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                     password_hash TEXT NOT NULL DEFAULT '', is_admin INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO users (username, password_hash, is_admin) VALUES ('restored', 'h', 1);",
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(&old).unwrap();
+        let db = Db::open(&dir.join("app.db")).await.unwrap();
+        restore_bytes(&db, &bytes).await.unwrap();
+        let user = db.user_by_username("restored").await.unwrap().unwrap();
+        assert!(user.is_admin);
+        assert_eq!(user.telegram_chat_id, "");
+        assert!(db.setting("anything").await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encrypted_backups_round_trip_and_need_the_key() {
+        let _serial = SERIAL.lock().await;
+        let _env = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
+        let previous = std::env::var_os("BACKUP_ENCRYPTION_KEY");
+        let previous_feishu = std::env::var_os("FEISHU_CREDENTIAL_KEY");
+        std::env::remove_var("FEISHU_CREDENTIAL_KEY");
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-bak-enc-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("app.db")).await.unwrap();
+        db.set_setting("backup_marker", "sealed").await.unwrap();
+        let plain = std::fs::read(snapshot(&db).await.unwrap()).unwrap();
+        db.set_setting("backup_marker", "live").await.unwrap();
+
+        std::env::set_var(
+            "BACKUP_ENCRYPTION_KEY",
+            base64::engine::general_purpose::URL_SAFE.encode([7u8; 32]),
+        );
+        let key = backup_key().unwrap();
+        let sealed = encrypt_backup(&key, &plain).unwrap();
+        assert!(sealed.starts_with(MAGIC));
+        assert!(!sealed
+            .windows(b"SQLite format 3".len())
+            .any(|w| w == b"SQLite format 3"));
+
+        std::env::remove_var("BACKUP_ENCRYPTION_KEY");
+        let err = restore_bytes(&db, &sealed).await.unwrap_err();
+        assert_eq!(err.status, 400);
+        std::env::set_var(
+            "BACKUP_ENCRYPTION_KEY",
+            base64::engine::general_purpose::URL_SAFE.encode([8u8; 32]),
+        );
+        assert!(restore_bytes(&db, &sealed).await.is_err());
+        assert_eq!(
+            db.setting("backup_marker").await.unwrap().as_deref(),
+            Some("live")
+        );
+        std::env::set_var(
+            "BACKUP_ENCRYPTION_KEY",
+            base64::engine::general_purpose::URL_SAFE.encode([7u8; 32]),
+        );
+        restore_bytes(&db, &sealed).await.unwrap();
+        assert_eq!(
+            db.setting("backup_marker").await.unwrap().as_deref(),
+            Some("sealed")
+        );
+        match previous {
+            Some(value) => std::env::set_var("BACKUP_ENCRYPTION_KEY", value),
+            None => std::env::remove_var("BACKUP_ENCRYPTION_KEY"),
+        }
+        if let Some(value) = previous_feishu {
+            std::env::set_var("FEISHU_CREDENTIAL_KEY", value);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_need_the_pooled_connection() {
+        let _serial = SERIAL.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-bak-busy-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("app.db")).await.unwrap();
+        let held = db.pool().acquire().await.unwrap();
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(10), snapshot(&db))
+            .await
+            .expect("snapshot must not wait for the busy pool")
+            .unwrap();
+        drop(held);
+        assert!(snap.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

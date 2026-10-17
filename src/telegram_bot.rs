@@ -342,9 +342,33 @@ fn undo_store() -> &'static std::sync::Mutex<std::collections::HashMap<String, U
     STORE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
+const UNDO_CAPACITY: usize = 1024;
+
 fn remember_undo(callback: &TelegramCallback, action: UndoAction) {
     let mut store = undo_store().lock().unwrap_or_else(|err| err.into_inner());
+    prune_undo(&mut store);
     store.insert(undo_key(&callback.chat_id, callback.message_id), action);
+}
+
+/// Undo is only honoured for `UNDO_TTL_SECS`, so older entries are dead weight;
+/// the cap bounds memory even under a burst of fresh callbacks.
+fn prune_undo(store: &mut std::collections::HashMap<String, UndoAction>) {
+    store.retain(|_, action| {
+        action
+            .at
+            .elapsed()
+            .is_ok_and(|age| age.as_secs() <= UNDO_TTL_SECS)
+    });
+    while store.len() >= UNDO_CAPACITY {
+        let Some(oldest) = store
+            .iter()
+            .min_by_key(|(_, action)| action.at)
+            .map(|(key, _)| key.clone())
+        else {
+            break;
+        };
+        store.remove(&oldest);
+    }
 }
 
 fn take_undo(callback: &TelegramCallback, kol_id: i64, kind: &str) -> Result<UndoAction, String> {
@@ -464,7 +488,7 @@ async fn callback_secondary(
     let text = if was_secondary {
         format!("已恢复实时推送：「{name}」")
     } else {
-        format!("已设为次要：「{name}」新帖合并推送")
+        format!("已设为次要：「{name}」新帖不再推送，只在网页动态页显示")
     };
     Ok((
         response_with_keyboard(
@@ -2194,8 +2218,9 @@ mod tests {
             .add_kol_request_without_category("xueqiu", "777", applicant.id, "")
             .await
             .unwrap();
-        sqlx::query(
-            "INSERT INTO users (username, password_hash, is_admin, telegram_chat_id)
+        sqlx::raw_sql(
+            "DROP INDEX idx_users_telegram_chat_id;
+             INSERT INTO users (username, password_hash, is_admin, telegram_chat_id)
              VALUES ('duplicate-admin', 'x', 1, 'duplicate-chat'),
                     ('duplicate-reader', 'x', 0, 'duplicate-chat')",
         )
@@ -2231,5 +2256,27 @@ mod tests {
             .unwrap()
             .iter()
             .any(|item| item["id"] == request));
+    }
+
+    #[test]
+    fn undo_store_drops_expired_entries_and_is_capped() {
+        let action = |age: u64| UndoAction {
+            at: std::time::SystemTime::now() - std::time::Duration::from_secs(age),
+            kind: "unsubscribe",
+            kol_id: 1,
+            subscribe_type: String::new(),
+            favorite: false,
+            secondary: false,
+            text: String::new(),
+            keyboard: Vec::new(),
+        };
+        let mut store = std::collections::HashMap::new();
+        store.insert("stale".to_string(), action(UNDO_TTL_SECS + 5));
+        for index in 0..UNDO_CAPACITY + 3 {
+            store.insert(format!("fresh-{index}"), action(0));
+        }
+        prune_undo(&mut store);
+        assert!(!store.contains_key("stale"));
+        assert!(store.len() < UNDO_CAPACITY);
     }
 }

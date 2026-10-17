@@ -117,11 +117,18 @@ export function createFeishuPersonalView(dependencies) {
   function startFeishuPersonalPoll(sessionId, owner = fsPersonalState.owner) {
     if (!fsPersonalOwnerActive(owner)) return;
     stopFeishuPersonalPoll(owner);
-    const timer = setInterval(async () => {
-      if (!fsPersonalOwnerActive(owner) || fsPersonalState.pollTimer !== timer) return;
+    // setTimeout 链：上一轮请求结束后才排下一轮，慢网下不会堆积；
+    // 句柄对象作为「本轮询仍有效」的标记，stop 后旧链自然断开
+    const timer = { id: 0 };
+    const live = () => fsPersonalOwnerActive(owner) && fsPersonalState.pollTimer === timer;
+    const schedule = () => {
+      if (live()) timer.id = setTimeout(tick, 1000);  // 1s 一次，状态接口很轻量
+    };
+    const tick = async () => {
+      if (!live()) return;
       try {
         const data = await api(`/api/me/feishu-personal/register/${sessionId}`);
-        if (!fsPersonalOwnerActive(owner) || fsPersonalState.pollTimer !== timer) return;
+        if (!live()) return;
         fsPersonalState.verificationUri = data.verification_uri;
         fsPersonalState.qrUri = data.qr_uri || fsPersonalState.qrUri;
         // 同步个人机器人展示状态（轮询期间 /api/me 不会刷新）
@@ -156,22 +163,24 @@ export function createFeishuPersonalView(dependencies) {
           fsPersonalRender(owner);
         }
       } catch (err) {
-        // 轮询失败静默，下轮再试；会话不存在则结束
-        if (fsPersonalOwnerActive(owner) && fsPersonalState.pollTimer === timer
-          && String(err.message).includes("404")) {
+        // 轮询失败静默，下轮再试；会话不存在（404/410）或已登出（401）则结束
+        if (live() && [401, 404, 410].includes(err.status)) {
           stopFeishuPersonalPoll(owner);
           fsPersonalState.sessionId = "";
           fsPersonalRender(owner);
+          return;
         }
       }
-    }, 1000);  // 绑定轮询：1s 一次，扫码/绑定完成及时反映（状态接口很轻量）
+      schedule();
+    };
     fsPersonalState.pollTimer = timer;
+    schedule();
   }
 
   function stopFeishuPersonalPoll(owner = null) {
     if (owner && fsPersonalState.owner !== owner) return;
     if (fsPersonalState.pollTimer) {
-      clearInterval(fsPersonalState.pollTimer);
+      clearTimeout(fsPersonalState.pollTimer.id);
       fsPersonalState.pollTimer = null;
     }
     if (fsPersonalState.countdownTimer) {

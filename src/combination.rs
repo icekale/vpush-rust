@@ -45,12 +45,15 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("组合抓取: {err}");
+    crate::supervise::spawn("combination", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("组合抓取: {err}");
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }
@@ -66,37 +69,56 @@ async fn poll(db: &Db) -> Result<(), String> {
     let exit = crate::proxy_admin::acquire(db, "combination").await?;
     let proxy = exit.as_ref().map(|item| item.url.clone());
     let proxy_id = exit.map(|item| item.id);
-    let mut cookie = crate::xueqiu::app_cookie(db).await?;
-    for (id, name, external_id) in kols {
-        let symbol = cube_symbol(&external_id);
-        if !symbol.starts_with("ZH") {
-            tracing::warn!(kol = id, "无效的组合编码: {external_id}");
-            continue;
-        }
-        match sync_one(db, &cookie, id, &name, &symbol, proxy.clone()).await {
-            Ok(()) => {
-                crate::proxy_admin::note(db, proxy_id, true, "").await;
-                let _ = db.note_kol_fetch(id, None).await;
+    let cookie = crate::xueqiu::app_cookie(db).await?;
+    let kols = kols
+        .into_iter()
+        .filter(|(id, _, external_id)| {
+            let valid = cube_symbol(external_id).starts_with("ZH");
+            if !valid {
+                tracing::warn!(kol = id, "无效的组合编码: {external_id}");
             }
-            Err(FetchErr::Dead) => {
-                tracing::warn!(kol = id, "雪球身份失效，重新注册");
-                cookie = crate::xueqiu::rotate_app_cookie(db).await?;
-                if let Err(err) = sync_one(db, &cookie, id, &name, &symbol, proxy.clone()).await {
-                    let detail = err.to_string();
-                    let _ = db.note_kol_fetch(id, Some(&detail)).await;
-                    tracing::warn!(kol = id, "{err}");
-                } else {
-                    let _ = db.note_kol_fetch(id, None).await;
-                }
-            }
-            Err(FetchErr::Other(msg)) => {
-                crate::proxy_admin::note(db, proxy_id, false, &msg).await;
-                let _ = db.note_kol_fetch(id, Some(&msg)).await;
-                tracing::warn!(kol = id, "{msg}");
-            }
+            valid
+        })
+        .collect();
+    let mut source = Cubes { db, cookie, proxy };
+    crate::xueqiu::run_round(db, proxy_id, kols, &mut source).await
+}
+
+struct Cubes<'a> {
+    db: &'a Db,
+    cookie: String,
+    proxy: Option<String>,
+}
+
+impl crate::xueqiu::KolSource for Cubes<'_> {
+    type Batch = ();
+
+    async fn pull(&mut self, kol: &crate::xueqiu::Kol) -> crate::xueqiu::Pulled<()> {
+        let symbol = cube_symbol(&kol.2);
+        match sync_one(
+            self.db,
+            &self.cookie,
+            kol.0,
+            &kol.1,
+            &symbol,
+            self.proxy.clone(),
+        )
+        .await
+        {
+            Ok(()) => crate::xueqiu::Pulled::Got(()),
+            Err(FetchErr::Dead) => crate::xueqiu::Pulled::Dead,
+            Err(FetchErr::Other(msg)) => crate::xueqiu::Pulled::Failed(msg),
         }
     }
-    Ok(())
+
+    async fn rotate(&mut self) -> Result<(), String> {
+        self.cookie = crate::xueqiu::rotate_app_cookie(self.db).await?;
+        Ok(())
+    }
+
+    async fn save(&mut self, _kol: &crate::xueqiu::Kol, _batch: ()) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 async fn sync_one(

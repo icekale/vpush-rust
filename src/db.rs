@@ -380,6 +380,13 @@ CREATE TABLE IF NOT EXISTS posts (
     UNIQUE (platform, external_id)
 );
 CREATE INDEX IF NOT EXISTS idx_posts_feed ON posts (kol_id, published_at, id);
+CREATE TABLE IF NOT EXISTS ima_redownload (
+    group_id TEXT NOT NULL,
+    media_id TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (group_id, media_id)
+);
 CREATE TABLE IF NOT EXISTS seen_posts (
     platform TEXT NOT NULL,
     external_id TEXT NOT NULL,
@@ -911,16 +918,34 @@ impl Db {
         Ok(n > 0)
     }
 
-    /// 以前下载过、但因路径碰撞被清掉 `pdf_path` 的条目，不受"最近 3 天"窗口限制，需要重下。
+    /// 只有碰撞修复清空过 `pdf_path` 的条目（登记在 `ima_redownload`）才绕过"最近 3 天"窗口重下；
+    /// 历史上建档但从没下过 PDF 的行不在这里，不会触发整库补档。
     pub async fn ima_redownload_ids(&self, group_id: &str) -> Result<HashSet<String>, sqlx::Error> {
         let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT media_id FROM ima_document_index
-             WHERE group_id = ? AND pdf_path = '' AND downloaded_at != ''",
+            "SELECT r.media_id FROM ima_redownload r
+             JOIN ima_document_index d ON d.group_id = r.group_id AND d.media_id = r.media_id
+             WHERE r.group_id = ? AND r.attempts < ? AND d.pdf_path = ''",
         )
         .bind(group_id)
+        .bind(IMA_REDOWNLOAD_MAX_ATTEMPTS)
         .fetch_all(self.pool())
         .await?;
         Ok(rows.into_iter().map(|row| row.0).collect())
+    }
+
+    pub async fn note_ima_redownload_failure(
+        &self,
+        group_id: &str,
+        media_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE ima_redownload SET attempts = attempts + 1 WHERE group_id = ? AND media_id = ?",
+        )
+        .bind(group_id)
+        .bind(media_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// 已经下载过 PDF 的 media_id，用来跳过重复下载。
@@ -969,6 +994,11 @@ impl Db {
     ) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE ima_document_index SET pdf_path = ?, downloaded_at = datetime('now') WHERE group_id = ? AND media_id = ?")
             .bind(pdf_path)
+            .bind(group_id)
+            .bind(media_id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM ima_redownload WHERE group_id = ? AND media_id = ?")
             .bind(group_id)
             .bind(media_id)
             .execute(&self.pool)
@@ -9123,11 +9153,14 @@ async fn ensure_etf_premium_columns(pool: &SqlitePool) -> Result<(), sqlx::Error
 /// 旧版 IMA PDF 落盘为 `MMDD/标题`，不同库或不同年份的同名研报会互相覆盖。
 /// 对仍指向同一旧路径的多行，只保留最后写入的那一行（文件内容属于它），其余清空
 /// `pdf_path` 让下一轮同步按新路径重下。可重复执行。
+/// Collision repairs that keep failing stop being retried after this many rounds.
+pub(crate) const IMA_REDOWNLOAD_MAX_ATTEMPTS: i64 = 5;
+
 async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    let cleared = sqlx::query(
-        "UPDATE ima_document_index AS d
-         SET pdf_path = '',
-             downloaded_at = CASE WHEN d.downloaded_at = '' THEN datetime('now') ELSE d.downloaded_at END
+    let mut tx = pool.begin().await?;
+    sqlx::query(
+        "INSERT OR IGNORE INTO ima_redownload (group_id, media_id)
+         SELECT d.group_id, d.media_id FROM ima_document_index AS d
          WHERE d.pdf_path != '' AND d.pdf_path NOT LIKE 'ima/%'
            AND d.group_id NOT LIKE 'local-%' AND d.group_id NOT LIKE 'feishu-%'
            AND EXISTS (
@@ -9141,9 +9174,17 @@ async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error>
                              OR (o.group_id = d.group_id AND o.media_id > d.media_id))))
            )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
+    .await?;
+    let cleared = sqlx::query(
+        "UPDATE ima_document_index SET pdf_path = ''
+         WHERE pdf_path != '' AND pdf_path NOT LIKE 'ima/%'
+           AND (group_id, media_id) IN (SELECT group_id, media_id FROM ima_redownload)",
+    )
+    .execute(&mut *tx)
     .await?
     .rows_affected();
+    tx.commit().await?;
     if cleared > 0 {
         tracing::warn!(cleared, "IMA PDF 旧路径存在碰撞，已清空待重新下载");
     }
@@ -12349,6 +12390,8 @@ mod regression_tests {
             ("local-x", "m3", "1114/晨会纪要.pdf", "2026-03-01 00:00:00"),
             ("g3", "m4", "0101/独有.pdf", "2026-01-01 00:00:00"),
             ("g4", "m5", "ima/g4/2026/0101/m5.pdf", "2026-01-01 00:00:00"),
+            ("g1", "m9", "", "2025-01-01 00:00:00"),
+            ("g5", "m10", "", "2025-01-01 00:00:00"),
         ] {
             sqlx::query(
                 "INSERT INTO ima_document_index (group_id, media_id, pdf_path, downloaded_at) VALUES (?, ?, ?, ?)",
@@ -12380,8 +12423,10 @@ mod regression_tests {
         assert_eq!(pdf("local-x").await, "1114/晨会纪要.pdf");
         assert_eq!(pdf("g3").await, "0101/独有.pdf");
         assert_eq!(pdf("g4").await, "ima/g4/2026/0101/m5.pdf");
-        assert!(db.ima_redownload_ids("g1").await.unwrap().contains("m1"));
+        let g1 = db.ima_redownload_ids("g1").await.unwrap();
+        assert_eq!(g1, HashSet::from(["m1".to_string()]));
         assert!(db.ima_redownload_ids("g2").await.unwrap().is_empty());
+        assert!(db.ima_redownload_ids("g5").await.unwrap().is_empty());
         db.pool().close().await;
         let db = Db::open(&path).await.unwrap();
         let kept: String =
@@ -12390,6 +12435,23 @@ mod regression_tests {
                 .await
                 .unwrap();
         assert_eq!(kept, "1114/晨会纪要.pdf");
+        assert_eq!(
+            db.ima_redownload_ids("g1").await.unwrap(),
+            HashSet::from(["m1".to_string()])
+        );
+        assert!(db.ima_redownload_ids("g5").await.unwrap().is_empty());
+        for _ in 0..IMA_REDOWNLOAD_MAX_ATTEMPTS {
+            db.note_ima_redownload_failure("g1", "m1").await.unwrap();
+        }
+        assert!(db.ima_redownload_ids("g1").await.unwrap().is_empty());
+        db.mark_ima_pdf("g1", "m1", "ima/g1/2026/0101/m1.pdf")
+            .await
+            .unwrap();
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM ima_redownload")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
         let _ = std::fs::remove_file(&path);
     }
 

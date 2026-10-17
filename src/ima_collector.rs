@@ -1,5 +1,7 @@
 //! IMA 采集配置。保存 UID、令牌和知识库挂载；真正的腾讯侧下载还没接上。
 
+use std::collections::HashSet;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -538,6 +540,7 @@ async fn sync_groups(
     let mut failed_groups = Vec::new();
     let mut skipped_folders = 0_usize;
     let mut pending = 0_i64;
+    let mut retried = 0_usize;
     let mut downloaded = 0_i64;
     let mut download_errors = 0_i64;
     let mut first_download_error = String::new();
@@ -570,12 +573,12 @@ async fn sync_groups(
                 .map_err(|_| CollectorError::Unavailable("IMA 索引写入失败"))?;
             // 以前对列到的每个文件都直接 fetch_pdf。库里 legacy 一万七千行只下过 311 个，
             // 全量补档一轮要十几小时（上游每个请求 4 秒），所以只看最近几天的新研报。
-            if have.contains(&file.media_id)
-                || (!retry.contains(&file.media_id)
-                    && !ima_client::fresh_sort_date(&file.sort_date, 3))
-            {
+            let fresh = ima_client::fresh_sort_date(&file.sort_date, 3);
+            let Some(is_retry) =
+                download_wanted(&file.media_id, fresh, &have, &retry, &mut retried)
+            else {
                 continue;
-            }
+            };
             pending += 1;
             let Some(root) = root else {
                 continue;
@@ -591,6 +594,11 @@ async fn sync_groups(
             {
                 Err(err) => {
                     download_errors += 1;
+                    if is_retry {
+                        let _ = db
+                            .note_ima_redownload_failure(&group.id, &file.media_id)
+                            .await;
+                    }
                     if first_download_error.is_empty() {
                         first_download_error = safe_ima(&err);
                     }
@@ -598,6 +606,11 @@ async fn sync_groups(
                 Ok(bytes) => match save_pdf_off(root, &group.id, file, bytes).await {
                     Err(err) => {
                         download_errors += 1;
+                        if is_retry {
+                            let _ = db
+                                .note_ima_redownload_failure(&group.id, &file.media_id)
+                                .await;
+                        }
                         if first_download_error.is_empty() {
                             first_download_error = err;
                         }
@@ -646,6 +659,33 @@ async fn sync_groups(
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 同步状态写入失败"))?;
     Ok(json!({"ok": true, "result": result}))
+}
+
+/// Collision repairs re-fetched per sync round; keeps one round short even if
+/// many legacy rows were cleared.
+const REDOWNLOAD_PER_ROUND: usize = 20;
+
+/// `Some(is_retry)` when the file should be fetched this round. Old files are
+/// only fetched when the collision repair queued them, and at most
+/// `REDOWNLOAD_PER_ROUND` of those per round.
+fn download_wanted(
+    media_id: &str,
+    fresh: bool,
+    have: &HashSet<String>,
+    retry: &HashSet<String>,
+    retried: &mut usize,
+) -> Option<bool> {
+    if have.contains(media_id) {
+        return None;
+    }
+    if fresh {
+        return Some(false);
+    }
+    if !retry.contains(media_id) || *retried >= REDOWNLOAD_PER_ROUND {
+        return None;
+    }
+    *retried += 1;
+    Some(true)
 }
 
 async fn save_pdf_off(
@@ -1445,5 +1485,34 @@ mod tests {
         ));
         drop(guard);
         assert_eq!(status(&db).await.unwrap()["running"], false);
+    }
+
+    #[test]
+    fn only_queued_old_files_are_redownloaded_and_capped_per_round() {
+        let have = HashSet::from(["done".to_string()]);
+        let retry: HashSet<String> = (0..30).map(|i| format!("r{i}")).collect();
+        let mut retried = 0;
+        assert_eq!(
+            download_wanted("done", true, &have, &retry, &mut retried),
+            None
+        );
+        assert_eq!(
+            download_wanted("new", true, &have, &retry, &mut retried),
+            Some(false)
+        );
+        assert_eq!(
+            download_wanted("legacy", false, &have, &retry, &mut retried),
+            None
+        );
+        let picked = (0..30)
+            .filter(|i| {
+                download_wanted(&format!("r{i}"), false, &have, &retry, &mut retried).is_some()
+            })
+            .count();
+        assert_eq!(picked, REDOWNLOAD_PER_ROUND);
+        assert_eq!(
+            download_wanted("new2", true, &have, &retry, &mut retried),
+            Some(false)
+        );
     }
 }

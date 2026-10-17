@@ -62,27 +62,50 @@ impl ProxiedBody {
     }
 }
 
-/// 在阻塞线程里按 64KB 分块读上游，经 channel 交给响应体；客户端断开时停止读取。
-/// `guard` 随读取线程一起释放（用来持有并发许可）。
+/// 客户端这么久不读走一个分块，就放弃这次转发并释放并发许可。
+const CLIENT_IDLE: Duration = Duration::from_secs(15);
+/// 单次转发（最多一个 4MB 分片）的总时长上限，防止极慢的客户端长期占槽。
+const STREAM_LIFETIME: Duration = Duration::from_secs(300);
+
+/// 在阻塞线程里按 64KB 分块读上游，经 channel 交给响应体；客户端断开、
+/// 长时间不读或超过总时长时停止读取。`guard` 随读取线程一起释放（用来持有并发许可）。
 pub fn stream_body<G: Send + 'static>(
-    mut reader: Box<dyn Read + Send>,
+    reader: Box<dyn Read + Send>,
     guard: G,
 ) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
+    stream_body_within(reader, guard, CLIENT_IDLE, STREAM_LIFETIME)
+}
+
+fn stream_body_within<G: Send + 'static>(
+    mut reader: Box<dyn Read + Send>,
+    guard: G,
+    idle: Duration,
+    lifetime: Duration,
+) -> impl futures_util::Stream<Item = Result<Vec<u8>, std::io::Error>> {
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(4);
+    let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let _guard = guard;
+        let deadline = std::time::Instant::now() + lifetime;
+        let send = |item| {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            !left.is_zero()
+                && handle
+                    .block_on(tx.send_timeout(item, idle.min(left)))
+                    .is_ok()
+        };
         loop {
             let mut buf = vec![0u8; STREAM_CHUNK];
             match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => {
                     buf.truncate(n);
-                    if tx.blocking_send(Ok(buf)).is_err() {
+                    if !send(Ok(buf)) {
                         break;
                     }
                 }
                 Err(err) => {
-                    let _ = tx.blocking_send(Err(err));
+                    send(Err(err));
                     break;
                 }
             }
@@ -203,11 +226,19 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
     if target.host == "static-assets-1.truthsocial.com" && !target.video {
         return fetch_truth(target);
     }
-    let agent = ureq::AgentBuilder::new()
+    let builder = ureq::AgentBuilder::new()
         .resolver(crate::url_guard::public_resolver)
-        .timeout(Duration::from_secs(if target.video { 30 } else { 15 }))
-        .redirects(0)
-        .build();
+        .redirects(0);
+    // 视频的 body 按客户端的速度读，整体超时会截断慢网用户；只限制连接和单次读的空闲时间。
+    let agent = if target.video {
+        builder
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_write(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(20))
+    } else {
+        builder.timeout(Duration::from_secs(15))
+    }
+    .build();
     let mut req = agent.get(&target.url).set(
         "User-Agent",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36",
@@ -260,16 +291,10 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
                 retry_after: None,
             });
         }
-        if status == 200 && content_length.is_some_and(|n| n > VIDEO_MAX) {
-            return Err(ImgError {
-                status: 400,
-                detail: "视频过大",
-                retry_after: None,
-            });
-        }
     }
     if target.video {
-        let reader: Box<dyn Read + Send> = Box::new(response.into_reader().take(VIDEO_MAX as u64));
+        let limit = video_body_limit(status, content_length)?;
+        let reader: Box<dyn Read + Send> = Box::new(response.into_reader().take(limit));
         return finish(
             true,
             status,
@@ -300,6 +325,28 @@ pub fn fetch(target: &Target, range: Option<&str>) -> Result<Proxied, ImgError> 
         content_range,
         ProxiedBody::Full(body),
     )
+}
+
+/// 上游忽略 Range 回一个超大的 206 时直接拒绝，免得把截断的数据连同原始
+/// Content-Length 一起转给浏览器。
+fn video_body_limit(status: u16, content_length: Option<usize>) -> Result<u64, ImgError> {
+    let limit = if status == 206 {
+        VIDEO_CHUNK
+    } else {
+        VIDEO_MAX as u64
+    };
+    if content_length.is_some_and(|n| n as u64 > limit) {
+        return Err(ImgError {
+            status: if status == 206 { 502 } else { 400 },
+            detail: if status == 206 {
+                "视频源请求失败"
+            } else {
+                "视频过大"
+            },
+            retry_after: None,
+        });
+    }
+    Ok(limit)
 }
 
 fn finish(
@@ -558,5 +605,52 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(UPSTREAM.available_permits(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stalled_client_releases_the_permit() {
+        struct Endless;
+        impl Read for Endless {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(7);
+                Ok(buf.len())
+            }
+        }
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = gate.clone().acquire_owned().await.unwrap();
+        let stream = stream_body_within(
+            Box::new(Endless),
+            permit,
+            Duration::from_millis(50),
+            Duration::from_secs(60),
+        );
+        let mut released = false;
+        for _ in 0..100 {
+            if gate.available_permits() == 1 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(released, "a client that never reads must not hold the slot");
+        drop(stream);
+    }
+
+    #[test]
+    fn oversized_partial_responses_are_rejected() {
+        assert_eq!(video_body_limit(206, Some(1024)).unwrap(), VIDEO_CHUNK);
+        assert_eq!(video_body_limit(206, None).unwrap(), VIDEO_CHUNK);
+        let err = video_body_limit(206, Some(VIDEO_CHUNK as usize + 1)).unwrap_err();
+        assert_eq!(err.status, 502);
+        assert_eq!(
+            video_body_limit(200, Some(VIDEO_MAX)).unwrap(),
+            VIDEO_MAX as u64
+        );
+        assert_eq!(
+            video_body_limit(200, Some(VIDEO_MAX + 1))
+                .unwrap_err()
+                .status,
+            400
+        );
     }
 }

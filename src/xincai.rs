@@ -520,4 +520,44 @@ mod tests {
         assert!(db.magazine(user.id, source_id + 9).await.is_err());
         let _ = std::fs::remove_file(&path);
     }
+
+    #[tokio::test]
+    async fn stored_article_html_is_sanitized_before_reaching_the_reader() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-xincai-xss-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let body = json!({"articles": [{
+            "sourceId": "x", "sourceName": "源", "externalId": "x1", "title": "坏",
+            "html": "<p>正文</p><img src=x onerror=alert(1)><script>alert(2)</script><a href=\"javascript:alert(3)\">链</a>",
+            "url": "https://example.com/x"
+        }]});
+        ingest(&db, &body).await.unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let listed = db
+            .list_news(user.id, 0, "", "", false, 20, 0)
+            .await
+            .unwrap();
+        let id = listed["items"][0]["id"].as_i64().unwrap();
+        let article = db.news_article(user.id, id).await.unwrap().unwrap();
+        let html = article["content_html"].as_str().unwrap();
+        assert!(html.contains("<p>正文</p>"));
+        assert!(!html.contains("onerror"));
+        assert!(!html.contains("<script"));
+        assert!(!html.contains("javascript:"));
+        sqlx::query("UPDATE news_articles SET url = 'javascript:alert(1)' WHERE id = ?")
+            .bind(id)
+            .execute(db.pool())
+            .await
+            .unwrap();
+        let article = db.news_article(user.id, id).await.unwrap().unwrap();
+        assert_eq!(article["url"], "");
+        let _ = std::fs::remove_file(&path);
+    }
 }

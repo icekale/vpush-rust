@@ -7802,7 +7802,7 @@ fn news_item(row: &sqlx::sqlite::SqliteRow, full: bool) -> Value {
         "feed_name": row.get::<Option<String>, _>("feed_name").unwrap_or_default(),
         "title": row.get::<String, _>("title"),
         "summary": row.get::<String, _>("summary"),
-        "url": row.get::<String, _>("url"),
+        "url": crate::news::web_url(&row.get::<String, _>("url")),
         "author": row.get::<String, _>("author"),
         "published_at": row.get::<String, _>("published_at"),
         "is_read": is_read,
@@ -7836,12 +7836,13 @@ fn topics_of(raw: &str) -> Value {
 }
 
 fn reader_html(content: &str, summary: &str) -> String {
-    if !crate::news::plain(content).trim().is_empty() {
-        return content.to_string();
+    let content = crate::news::sanitize_html(content);
+    if !crate::news::plain(&content).trim().is_empty() {
+        return content;
     }
     let summary = summary.trim();
     if summary.is_empty() {
-        return content.to_string();
+        return content;
     }
     let para = format!("<p>{}</p>", escape_html(summary));
     if content.contains("<img") {

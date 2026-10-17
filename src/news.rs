@@ -146,7 +146,7 @@ fn rss_entry(block: &str) -> Option<NewsEntry> {
     if title.is_empty() {
         return None;
     }
-    let url = text_of(block, "link");
+    let url = web_url(&text_of(block, "link"));
     let guid = text_of(block, "guid");
     let body = text_of(block, "description");
     Some(NewsEntry {
@@ -165,7 +165,7 @@ fn atom_entry(block: &str) -> Option<NewsEntry> {
     if title.is_empty() {
         return None;
     }
-    let url = attr_of(block, "link", "href").unwrap_or_else(|| text_of(block, "link"));
+    let url = web_url(&attr_of(block, "link", "href").unwrap_or_else(|| text_of(block, "link")));
     let body = {
         let summary = text_of(block, "summary");
         if summary.is_empty() {
@@ -282,17 +282,74 @@ pub(crate) fn plain(input: &str) -> String {
         .join(" ")
 }
 
+/// 单遍解码：`&amp;lt;` 只解一层成 `&lt;`，不会被链式替换还原成 `<`。
 fn decode(input: &str) -> String {
-    input
-        .replace("<![CDATA[", "")
-        .replace("]]>", "")
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .trim()
+    let input = input.replace("<![CDATA[", "").replace("]]>", "");
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input.as_str();
+    while let Some(at) = rest.find('&') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at..];
+        let entity = rest
+            .get(1..)
+            .and_then(|tail| tail.find(';').filter(|end| *end <= 10))
+            .map(|end| &rest[1..1 + end]);
+        let decoded = entity.and_then(|name| match name {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            _ => {
+                let code = if let Some(hex) =
+                    name.strip_prefix("#x").or_else(|| name.strip_prefix("#X"))
+                {
+                    u32::from_str_radix(hex, 16).ok()
+                } else {
+                    name.strip_prefix('#').and_then(|dec| dec.parse().ok())
+                };
+                code.and_then(char::from_u32)
+            }
+        });
+        match (entity, decoded) {
+            (Some(name), Some(ch)) => {
+                out.push(ch);
+                rest = &rest[name.len() + 2..];
+            }
+            _ => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out.trim().to_string()
+}
+
+/// 资讯正文进 `innerHTML` 前的白名单净化：去掉脚本、事件属性、内联样式，
+/// 链接和图片只保留 http(s) 绝对地址。
+pub(crate) fn sanitize_html(input: &str) -> String {
+    ammonia::Builder::default()
+        .url_schemes(std::collections::HashSet::from(["http", "https"]))
+        .url_relative(ammonia::UrlRelative::Deny)
+        .link_rel(Some("noopener noreferrer nofollow"))
+        .clean(input)
         .to_string()
+}
+
+/// "打开原文"等外链只接受 http(s)。
+pub(crate) fn web_url(raw: &str) -> String {
+    let raw = raw.trim();
+    let lower = raw.get(..8).unwrap_or(raw).to_ascii_lowercase();
+    if (lower.starts_with("https://") || lower.starts_with("http://"))
+        && raw.len() <= 2048
+        && !raw.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        raw.to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn first_nonempty(values: &[&str]) -> String {
@@ -462,5 +519,53 @@ mod tests {
             image_target("https://img.example/a.jpg").unwrap().host,
             "img.example"
         );
+    }
+
+    #[test]
+    fn decode_is_single_pass() {
+        assert_eq!(decode("&amp;lt;b&amp;gt;"), "&lt;b&gt;");
+        assert_eq!(decode("a &amp; b &#39;c&#x27; &#20013;"), "a & b 'c' 中");
+        assert_eq!(decode("AT&T &unknown; &"), "AT&T &unknown; &");
+        assert_eq!(decode("%中&#xZZ;"), "%中&#xZZ;");
+    }
+
+    #[test]
+    fn double_encoded_description_cannot_smuggle_markup() {
+        let xml = r#"<rss><item><title>t</title><link>javascript:alert(1)</link><description>正文 &amp;amp;lt;img src=x onerror=alert(1)&amp;amp;gt; 结尾</description></item></rss>"#;
+        let parsed = parse_feed(xml).unwrap();
+        let entry = &parsed.entries[0];
+        assert!(!entry.content.contains("<img"));
+        assert_eq!(entry.url, "");
+        let html = sanitize_html(&entry.content);
+        assert!(!html.contains("<img"));
+        assert!(!html.contains("onerror=\""));
+    }
+
+    #[test]
+    fn sanitizer_keeps_reader_markup_and_strips_active_content() {
+        let dirty = r#"<p onclick="x()">段落<script>alert(1)</script></p><img src="https://img.example/a.jpg" onerror="x()"><img src="data:image/png;base64,AA"><a href="javascript:alert(1)">坏</a><a href="https://example.com/">好</a><iframe src="https://evil"></iframe><figure><blockquote>引用</blockquote></figure><div style="background:url(x)">样式</div>"#;
+        let clean = sanitize_html(dirty);
+        assert!(clean.contains("<p>段落</p>"));
+        assert!(clean.contains(r#"<img src="https://img.example/a.jpg">"#));
+        assert!(!clean.contains("data:"));
+        assert!(!clean.contains("javascript:"));
+        assert!(!clean.contains("<script"));
+        assert!(!clean.contains("onclick"));
+        assert!(!clean.contains("onerror"));
+        assert!(!clean.contains("<iframe"));
+        assert!(!clean.contains("style="));
+        assert!(clean.contains(r#"href="https://example.com/""#));
+        assert!(clean.contains("noopener"));
+        assert!(clean.contains("<blockquote>引用</blockquote>"));
+    }
+
+    #[test]
+    fn web_url_only_allows_http_schemes() {
+        assert_eq!(web_url(" https://a.example/x "), "https://a.example/x");
+        assert_eq!(web_url("HTTP://a.example/"), "HTTP://a.example/");
+        assert_eq!(web_url("javascript:alert(1)"), "");
+        assert_eq!(web_url("data:text/html,x"), "");
+        assert_eq!(web_url("https://a.example/\nx"), "");
+        assert_eq!(web_url("//evil.example/"), "");
     }
 }

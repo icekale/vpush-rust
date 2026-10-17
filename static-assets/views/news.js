@@ -763,7 +763,7 @@ export function createNewsView(dependencies) {
             <h1>${escapeHtml(article.title)}</h1>
             ${article.author ? `<p class="section-meta">作者：${escapeHtml(article.author)}</p>` : ""}
             <div class="news-article-tools">
-              <a class="btn-ghost news-original-link" href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer nofollow">打开原文 ${externalLinkIcon}</a>
+              ${/^https?:\/\//i.test(article.url || "") ? `<a class="btn-ghost news-original-link" href="${escapeHtml(article.url)}" target="_blank" rel="noopener noreferrer nofollow">打开原文 ${externalLinkIcon}</a>` : ""}
               <div class="news-font-switch" role="group" aria-label="正文字号">
                 ${[["small", "小"], ["", "标准"], ["large", "大"]].map(([value, label]) => `
                   <button type="button" class="${((state.user && state.user.news_font_size) || "") === value ? "is-on" : ""}" onclick="setNewsFontSize('${value}')" aria-pressed="${((state.user && state.user.news_font_size) || "") === value}">${label}</button>`).join("")}

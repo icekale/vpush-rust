@@ -23,7 +23,7 @@ WEB_ADMIN_PASSWORD='至少10位' cargo run
 | `CICC_LAB_STALE_HOURS` | `36`。只作用于 ARM 日志信号 |
 | `BACKUP_ENCRYPTION_KEY` | 空：WebDAV 备份照旧明文上传。设为 32 字节 URL-safe base64（格式同 `FEISHU_CREDENTIAL_KEY`）后，上传前用 AES-256-GCM 加密；恢复时自动解密（也会尝试 `FEISHU_CREDENTIAL_KEY`）。值无效时备份失败、不会退回明文上传。丢了这把密钥，加密备份就无法恢复 |
 | `XINCAI_INGEST_MAX_MB` | `128`（1–128）。xincai 推送接口单次请求体上限；先校验 token 再读取请求体 |
-| `RESEARCH_TRANSLATE` | 开启（与以前一致）：英文研报摘要会发给第三方 MyMemory 翻译（最多 500 字）。设为 `0` 关闭，摘要不再离开服务器，阅读页直接显示原文。翻译请求每用户 5 分钟最多 60 次 |
+| `RESEARCH_TRANSLATE` | 开启（与以前一致）：英文研报摘要会**明文**发给第三方 MyMemory 翻译（最多 500 字）。设为 `0` 关闭，摘要不再离开服务器，阅读页直接显示原文。翻译请求每用户 5 分钟最多 60 次。**研报内容有保密要求的部署，务必显式设为 `0`** |
 | `CSP_STRICT_REPORT_ONLY` | 默认关闭。设为 `1` 时额外发送不含 `'unsafe-inline'` 的 `Content-Security-Policy-Report-Only` 头，只在浏览器控制台报告违规、不拦截，用于逐步迁移内联事件处理器；生效的 CSP 不变 |
 | `TRUSTED_PROXIES` | 二进制默认只信任回环（`127.0.0.0/8`、`::1/128`）。Compose 默认是 `127.0.0.0/8,::1/128,172.16.0.0/12`：端口映射后容器看到的来源是 Docker 网桥网关（例如 `172.17.0.1`），不是 `127.0.0.1`。端口只绑在宿主机 `127.0.0.1`，信任该网关是安全的。私网不会被二进制默认信任 |
 | `TRUST_X_REAL_IP` | 关闭（Compose 同样默认 `0`）。设为 `1` 后，受信代理没给出可用的 `X-Forwarded-For` 时才回落 `X-Real-IP` |

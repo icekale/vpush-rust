@@ -25,8 +25,8 @@ pub fn enabled() -> bool {
 }
 
 pub fn mask_app_id(app_id: &str) -> String {
-    if app_id.len() > 8 {
-        format!("{}…", &app_id[..8])
+    if app_id.chars().count() > 8 {
+        format!("{}…", app_id.chars().take(8).collect::<String>())
     } else {
         "…".into()
     }
@@ -894,5 +894,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::env::remove_var("FEISHU_CREDENTIAL_KEY");
         std::env::remove_var("FEISHU_PERSONAL_LISTENER");
+    }
+
+    #[test]
+    fn mask_app_id_handles_multibyte_ids() {
+        assert_eq!(mask_app_id("cli_a1b2c3d4e5"), "cli_a1b2…");
+        assert_eq!(mask_app_id("应用编号一二三四五六"), "应用编号一二三四…");
+        assert_eq!(mask_app_id("short"), "…");
     }
 }

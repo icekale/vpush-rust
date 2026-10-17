@@ -59,16 +59,19 @@ pub fn spawn(db: Db) {
         tracing::info!("雪球抓取已关闭");
         return;
     }
-    tokio::spawn(async move {
-        let mut streak = HashMap::new();
-        loop {
-            if let Err(err) = poll(&db, &mut streak).await {
-                tracing::warn!("雪球抓取: {err}");
-                let _ = db.note_platform("xueqiu", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("xueqiu", None).await;
+    crate::supervise::spawn("xueqiu", move || {
+        let db = db.clone();
+        async move {
+            let mut streak = HashMap::new();
+            loop {
+                if let Err(err) = poll(&db, &mut streak).await {
+                    tracing::warn!("雪球抓取: {err}");
+                    let _ = db.note_platform("xueqiu", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("xueqiu", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(poll_wait(&db).await)).await;
         }
     });
 }

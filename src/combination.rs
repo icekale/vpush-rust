@@ -45,12 +45,15 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("组合抓取: {err}");
+    crate::supervise::spawn("combination", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("组合抓取: {err}");
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }

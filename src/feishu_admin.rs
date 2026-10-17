@@ -1419,24 +1419,27 @@ async fn access_token(db: &Db) -> Result<String, Fail> {
 }
 
 pub fn spawn_sync(db: Db) {
-    tokio::spawn(async move {
-        loop {
-            let wait = match config(&db).await {
-                Ok(cfg) => cfg.interval.max(15) as u64,
-                Err(_) => 60,
-            };
-            let ids = sqlx::query_scalar::<_, i64>(
+    crate::supervise::spawn("feishu_docs_sync", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                let wait = match config(&db).await {
+                    Ok(cfg) => cfg.interval.max(15) as u64,
+                    Err(_) => 60,
+                };
+                let ids = sqlx::query_scalar::<_, i64>(
                 "SELECT id FROM feishu_document_sources WHERE enabled = 1 AND deleted_at IS NULL ORDER BY id",
             )
             .fetch_all(db.pool())
             .await
             .unwrap_or_default();
-            for id in ids {
-                if let Err(err) = sync_source(&db, id).await {
-                    tracing::warn!(source = id, "飞书文档同步失败: {}", err.detail);
+                for id in ids {
+                    if let Err(err) = sync_source(&db, id).await {
+                        tracing::warn!(source = id, "飞书文档同步失败: {}", err.detail);
+                    }
                 }
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
         }
     });
 }

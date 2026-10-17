@@ -24,7 +24,9 @@ pub fn ensure_listener(db: Db, session_id: String) {
     }
     drop(guard);
     tokio::spawn(async move {
-        if let Err(err) = run(&db, &session_id).await {
+        if let Some(Err(err)) =
+            crate::supervise::catch("feishu_personal", run(&db, &session_id)).await
+        {
             tracing::warn!("飞书个人机器人长连接结束 {session_id}: {err}");
         }
         if let Some(running) = RUNNING.lock().expect("feishu listeners").as_mut() {
@@ -42,12 +44,17 @@ pub fn spawn_shared(db: Db) {
     if app_id.trim().is_empty() || secret.trim().is_empty() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = run_shared(&db, &app_id, &secret).await {
-                tracing::warn!("飞书共享机器人将重试: {err}");
+    crate::supervise::spawn("feishu_shared", move || {
+        let db = db.clone();
+        let app_id = app_id.clone();
+        let secret = secret.clone();
+        async move {
+            loop {
+                if let Err(err) = run_shared(&db, &app_id, &secret).await {
+                    tracing::warn!("飞书共享机器人将重试: {err}");
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
         }
     });
 }
@@ -797,12 +804,14 @@ fn read_varint(data: &[u8], index: &mut usize) -> Option<u64> {
 }
 
 fn read_bytes(data: &[u8], index: &mut usize) -> Result<Vec<u8>, String> {
-    let len = read_varint(data, index).ok_or("飞书帧无效")? as usize;
-    if *index + len > data.len() {
-        return Err("飞书帧无效".into());
-    }
-    let bytes = data[*index..*index + len].to_vec();
-    *index += len;
+    let len = usize::try_from(read_varint(data, index).ok_or("飞书帧无效")?)
+        .map_err(|_| "飞书帧无效".to_string())?;
+    let end = index
+        .checked_add(len)
+        .filter(|end| *end <= data.len())
+        .ok_or("飞书帧无效")?;
+    let bytes = data[*index..end].to_vec();
+    *index = end;
     Ok(bytes)
 }
 
@@ -894,5 +903,16 @@ mod tests {
             }))
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn oversized_length_prefix_is_rejected_without_overflow() {
+        let mut frame = vec![0xff; 9];
+        frame.push(0x01);
+        let mut index = 0;
+        assert!(read_bytes(&frame, &mut index).is_err());
+        let mut index = 0;
+        assert_eq!(read_bytes(&[2, b'o', b'k'], &mut index).unwrap(), b"ok");
+        assert_eq!(index, 3);
     }
 }

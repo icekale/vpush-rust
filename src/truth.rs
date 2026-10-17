@@ -25,15 +25,18 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("Truth 抓取: {err}");
-                let _ = db.note_platform("truth", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("truth", None).await;
+    crate::supervise::spawn("truth", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("Truth 抓取: {err}");
+                    let _ = db.note_platform("truth", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("truth", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }
@@ -258,12 +261,12 @@ fn published(raw: &str) -> (String, Option<i64>) {
         if raw.len() < 19 {
             return None;
         }
-        let year: i32 = raw[0..4].parse().ok()?;
-        let month: u32 = raw[5..7].parse().ok()?;
-        let day: u32 = raw[8..10].parse().ok()?;
-        let hour: i64 = raw[11..13].parse().ok()?;
-        let minute: i64 = raw[14..16].parse().ok()?;
-        let second: i64 = raw[17..19].parse().ok()?;
+        let year: i32 = raw.get(0..4)?.parse().ok()?;
+        let month: u32 = raw.get(5..7)?.parse().ok()?;
+        let day: u32 = raw.get(8..10)?.parse().ok()?;
+        let hour: i64 = raw.get(11..13)?.parse().ok()?;
+        let minute: i64 = raw.get(14..16)?.parse().ok()?;
+        let second: i64 = raw.get(17..19)?.parse().ok()?;
         let local = days_from_civil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second;
         let unix = local - offset_secs(raw);
         let beijing = unix + 8 * 3600;
@@ -631,5 +634,11 @@ mod tests {
         .unwrap();
         assert_eq!(pending, 2);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn published_with_multibyte_input_does_not_panic() {
+        let _ = published("2026年10月17日 12:30:00 中文");
+        let _ = published("中文中文中文中文中文中文");
     }
 }

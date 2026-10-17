@@ -30,15 +30,18 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("知识星球抓取: {err}");
-                let _ = db.note_platform("zsxq", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("zsxq", None).await;
+    crate::supervise::spawn("zsxq", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("知识星球抓取: {err}");
+                    let _ = db.note_platform("zsxq", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("zsxq", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }
@@ -398,11 +401,11 @@ fn published_unix(published: &str) -> Option<i64> {
     if published.len() < 16 {
         return None;
     }
-    let year: i32 = published[0..4].parse().ok()?;
-    let month: u32 = published[5..7].parse().ok()?;
-    let day: u32 = published[8..10].parse().ok()?;
-    let hour: i64 = published[11..13].parse().ok()?;
-    let minute: i64 = published[14..16].parse().ok()?;
+    let year: i32 = published.get(0..4)?.parse().ok()?;
+    let month: u32 = published.get(5..7)?.parse().ok()?;
+    let day: u32 = published.get(8..10)?.parse().ok()?;
+    let hour: i64 = published.get(11..13)?.parse().ok()?;
+    let minute: i64 = published.get(14..16)?.parse().ok()?;
     let days = days_from_civil(year, month, day);
     Some(days * 86400 + hour * 3600 + minute * 60 - 8 * 3600)
 }
@@ -527,5 +530,11 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn published_unix_with_multibyte_input_does_not_panic() {
+        assert_eq!(published_unix("2026年10月17日 12:30"), None);
+        assert!(published_unix("2026-10-17 12:30").is_some());
     }
 }

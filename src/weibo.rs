@@ -61,15 +61,18 @@ pub fn spawn(db: Db) {
     if !crate::xueqiu::fetch_enabled() {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = poll(&db).await {
-                tracing::warn!("微博抓取: {err}");
-                let _ = db.note_platform("weibo", Some(&err)).await;
-            } else {
-                let _ = db.note_platform("weibo", None).await;
+    crate::supervise::spawn("weibo", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = poll(&db).await {
+                    tracing::warn!("微博抓取: {err}");
+                    let _ = db.note_platform("weibo", Some(&err)).await;
+                } else {
+                    let _ = db.note_platform("weibo", None).await;
+                }
+                tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
             }
-            tokio::time::sleep(Duration::from_secs(crate::xueqiu::poll_wait(&db).await)).await;
         }
     });
 }
@@ -591,8 +594,8 @@ fn zone_minutes(raw: &str) -> Option<i64> {
     if raw.len() != 5 {
         return None;
     }
-    let hour: i64 = raw[1..3].parse().ok()?;
-    let minute: i64 = raw[3..5].parse().ok()?;
+    let hour: i64 = raw.get(1..3)?.parse().ok()?;
+    let minute: i64 = raw.get(3..5)?.parse().ok()?;
     Some(sign * (hour * 60 + minute))
 }
 
@@ -942,5 +945,11 @@ mod tests {
         assert_eq!(page[0]["platform"], "weibo");
         assert_eq!(page[0]["content"], "一条微博");
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zone_offset_with_multibyte_input_does_not_panic() {
+        assert_eq!(zone_minutes("+中a"), None);
+        assert_eq!(zone_minutes("+0800"), Some(480));
     }
 }

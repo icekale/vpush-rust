@@ -5,24 +5,27 @@ use std::time::Duration;
 use crate::db::{Db, NewsEntry};
 
 pub fn spawn(db: Db) {
-    tokio::spawn(async move {
-        loop {
-            if db.news_flag("news_enabled", false).await.unwrap_or(false) {
-                if let Err(err) = refresh_all(&db).await {
-                    tracing::warn!("资讯抓取: {err}");
-                    let _ = db.note_platform("news", Some(&err)).await;
-                } else {
-                    let _ = db.note_platform("news", None).await;
+    crate::supervise::spawn("news", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if db.news_flag("news_enabled", false).await.unwrap_or(false) {
+                    if let Err(err) = refresh_all(&db).await {
+                        tracing::warn!("资讯抓取: {err}");
+                        let _ = db.note_platform("news", Some(&err)).await;
+                    } else {
+                        let _ = db.note_platform("news", None).await;
+                    }
                 }
+                let minutes = db
+                    .setting("news_refresh_minutes")
+                    .await
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(30);
+                tokio::time::sleep(Duration::from_secs(minutes.clamp(5, 1440) * 60)).await;
             }
-            let minutes = db
-                .setting("news_refresh_minutes")
-                .await
-                .ok()
-                .flatten()
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(30);
-            tokio::time::sleep(Duration::from_secs(minutes.clamp(5, 1440) * 60)).await;
         }
     });
 }

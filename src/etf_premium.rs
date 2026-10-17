@@ -517,22 +517,25 @@ async fn evaluate(db: &Db, quote: &Quote, now: i64) -> Result<(), sqlx::Error> {
 }
 
 pub fn spawn(db: Db) {
-    tokio::spawn(async move {
-        let mut timer = tokio::time::interval(Duration::from_secs(30));
-        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            timer.tick().await;
-            let now = crate::market::now_unix();
-            if !crate::market::mainland_open(now) {
-                continue;
-            }
-            let (quotes, ok) = quotes(&db).await;
-            if !ok {
-                continue;
-            }
-            for quote in quotes {
-                if let Err(err) = evaluate(&db, &quote, crate::market::now_unix()).await {
-                    tracing::warn!(symbol = quote.symbol, "ETF阈值检查失败: {err}");
+    crate::supervise::spawn("etf_premium", move || {
+        let db = db.clone();
+        async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(30));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                timer.tick().await;
+                let now = crate::market::now_unix();
+                if !crate::market::mainland_open(now) {
+                    continue;
+                }
+                let (quotes, ok) = quotes(&db).await;
+                if !ok {
+                    continue;
+                }
+                for quote in quotes {
+                    if let Err(err) = evaluate(&db, &quote, crate::market::now_unix()).await {
+                        tracing::warn!(symbol = quote.symbol, "ETF阈值检查失败: {err}");
+                    }
                 }
             }
         }

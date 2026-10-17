@@ -24,10 +24,11 @@ pub fn spawn(db: Db) {
     every_round(db, |db| Box::pin(daily_reports(db)));
 }
 
+/// 每轮单独捕获 panic：某一轮被外部数据触发 panic 时只丢这一轮，循环继续。
 fn every_round(db: Db, round: Round) {
     tokio::spawn(async move {
         loop {
-            round(&db).await;
+            crate::supervise::catch("maintenance", round(&db)).await;
             tokio::time::sleep(ROUND_GAP).await;
         }
     });

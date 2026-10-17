@@ -1183,12 +1183,15 @@ pub fn spawn(db: Db) {
     ) {
         return;
     }
-    tokio::spawn(async move {
-        loop {
-            if let Err(err) = monitor_once(&db).await {
-                tracing::warn!("自选股行情监控: {}", err.detail);
+    crate::supervise::spawn("stock_watchlist", move || {
+        let db = db.clone();
+        async move {
+            loop {
+                if let Err(err) = monitor_once(&db).await {
+                    tracing::warn!("自选股行情监控: {}", err.detail);
+                }
+                tokio::time::sleep(Duration::from_secs(60)).await;
             }
-            tokio::time::sleep(Duration::from_secs(60)).await;
         }
     });
 }

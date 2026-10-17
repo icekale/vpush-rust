@@ -777,7 +777,7 @@ pub async fn translate_document<F>(
     translate: F,
 ) -> Result<Value, &'static str>
 where
-    F: FnOnce(&str) -> String,
+    F: FnOnce(&str) -> String + Send + 'static,
 {
     let meta = document_meta(db, user_id, is_admin, media_id, group, root).await?;
     let source = meta["abstract"].as_str().unwrap_or("");
@@ -788,7 +788,13 @@ where
             .unwrap_or(source);
         return Ok(json!({"abstract_zh": cached}));
     }
-    let translated = translate(source);
+    if !remote_translation_enabled() {
+        return Ok(json!({"abstract_zh": source}));
+    }
+    let owned = source.to_string();
+    let translated = tokio::task::spawn_blocking(move || translate(&owned))
+        .await
+        .unwrap_or_else(|_| source.to_string());
     let chosen = if collapsed(&translated, source) {
         source.to_string()
     } else {
@@ -801,6 +807,19 @@ where
             .map_err(|_| "读取文档失败")?;
     }
     Ok(json!({"abstract_zh": chosen}))
+}
+
+/// `RESEARCH_TRANSLATE=0` stops research abstracts from being sent to the
+/// third-party MyMemory API; unset keeps the existing behaviour (enabled).
+fn remote_translation_enabled() -> bool {
+    !matches!(
+        std::env::var("RESEARCH_TRANSLATE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
 }
 
 pub fn my_memory(text: &str) -> String {
@@ -1452,6 +1471,11 @@ mod tests {
 
     #[tokio::test]
     async fn translates_an_english_abstract_once() {
+        let _env = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
         let path = std::env::temp_dir().join(format!(
             "vpush-tr-{}-{}.db",
             std::process::id(),
@@ -1682,6 +1706,45 @@ mod tests {
             .unwrap();
         assert_eq!(timeline["type"], "feishu_timeline");
         assert!(timeline.get("extraction").is_none());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn remote_translation_can_be_switched_off() {
+        let _env = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
+        let path = std::env::temp_dir().join(format!(
+            "vpush-tr-off-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let db = Db::open(&path).await.unwrap();
+        db.insert_ima_document("reports", "en2", "Note", "2024-01-02", "", "")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE ima_document_index SET abstract = ? WHERE media_id = 'en2'")
+            .bind("Private research that must stay on this server.")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.set_ima_kb_acl("reports", &[7]).await.unwrap();
+        db.ima_kb_subscribe(7, "reports").await.unwrap();
+        std::env::set_var("RESEARCH_TRANSLATE", "0");
+        let kept = translate_document(&db, 7, false, "en2", "reports", &PathBuf::new(), |_| {
+            panic!("must not leave the server")
+        })
+        .await;
+        std::env::remove_var("RESEARCH_TRANSLATE");
+        assert_eq!(
+            kept.unwrap()["abstract_zh"],
+            "Private research that must stay on this server."
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

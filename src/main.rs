@@ -2829,6 +2829,7 @@ async fn ima_translate(
     if group.len() > 128 || media_id.len() > 128 {
         return Err(ApiError::new(StatusCode::BAD_REQUEST, "参数过长"));
     }
+    throttle_user(&state, "translate", user.id, 60)?;
     match feishu_docs::translate_document(
         &state.db,
         user.id,

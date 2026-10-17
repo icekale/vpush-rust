@@ -531,11 +531,12 @@ async fn issue_code(db: &Db, session: &FeishuSession, now: i64) -> Result<(), Pe
     let expires = now + BIND_TTL;
     db.save_feishu_bind_code(&session.session_id, &hash_code(&code), expires)
         .await?;
-    CODES
-        .lock()
-        .expect("feishu codes")
-        .get_or_insert_with(HashMap::new)
-        .insert(session.session_id.clone(), (code, expires));
+    {
+        let mut guard = CODES.lock().expect("feishu codes");
+        let codes = guard.get_or_insert_with(HashMap::new);
+        codes.retain(|_, (_, expires)| *expires >= now);
+        codes.insert(session.session_id.clone(), (code, expires));
+    }
     crate::feishu_ws::ensure_listener(db.clone(), session.session_id.clone());
     Ok(())
 }

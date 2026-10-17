@@ -162,6 +162,10 @@ struct CacheEntry {
     error: Option<String>,
 }
 
+/// Search results are cached so a just-added symbol renders immediately; the
+/// next refresh keeps only watched symbols, and this caps growth in between.
+const SEARCH_CACHE_CAP: usize = 4096;
+
 struct QuoteCache {
     at: Option<Instant>,
     refreshing: bool,
@@ -627,6 +631,9 @@ async fn refresh_quotes(db: &Db, instruments: Vec<Instrument>) -> Result<(), Wat
             }
         }
         let mut cache = cache().lock().unwrap_or_else(|err| err.into_inner());
+        let watched: std::collections::HashSet<String> =
+            instruments.iter().map(Instrument::key).collect();
+        cache.entries.retain(|key, _| watched.contains(key));
         for instrument in instruments {
             let key = instrument.key();
             if let Some(quote) = quotes.remove(&key) {
@@ -1059,6 +1066,9 @@ pub async fn search(db: &Db, input: SearchInput) -> Result<Value, WatchlistError
     for instrument in candidates {
         if let Some(quote) = verified.remove(&instrument.key()) {
             items.push(json!({"market": quote.instrument.market.as_str(), "symbol": quote.instrument.symbol, "name": quote.name, "currency": quote.instrument.currency()}));
+            if shared.entries.len() >= SEARCH_CACHE_CAP {
+                continue;
+            }
             shared.entries.insert(
                 instrument.key(),
                 CacheEntry {

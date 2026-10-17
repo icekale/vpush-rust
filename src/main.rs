@@ -6540,9 +6540,25 @@ fn prune_login_limit(limit: &mut LoginLimit, now: u64) {
     limit.pruned_at = now;
 }
 
+/// Upper bound on tracked limiter keys. Past it, the keys whose latest hit is
+/// oldest are evicted first, so active offenders stay tracked.
+const LOGIN_LIMIT_CAP: usize = 50_000;
+
 fn maybe_prune_login_limit(limit: &mut LoginLimit, now: u64) {
-    if now.saturating_sub(limit.pruned_at) >= 60 {
+    if now.saturating_sub(limit.pruned_at) >= 60 || limit.hits.len() > LOGIN_LIMIT_CAP {
         prune_login_limit(limit, now);
+    }
+    if limit.hits.len() > LOGIN_LIMIT_CAP {
+        let mut latest: Vec<(u64, String)> = limit
+            .hits
+            .iter()
+            .map(|(key, hits)| (hits.iter().copied().max().unwrap_or(0), key.clone()))
+            .collect();
+        latest.sort_unstable();
+        let excess = limit.hits.len() - LOGIN_LIMIT_CAP * 9 / 10;
+        for (_, key) in latest.into_iter().take(excess) {
+            limit.hits.remove(&key);
+        }
     }
 }
 
@@ -8777,5 +8793,21 @@ mod tests {
         let strict = content_security_policy(false);
         assert!(!strict.contains("unsafe-inline"));
         assert!(strict.contains("frame-ancestors 'none'"));
+    }
+
+    #[test]
+    fn login_limiter_map_is_bounded() {
+        let mut limit = LoginLimit::default();
+        let now = 10_000;
+        limit.pruned_at = now;
+        for index in 0..(LOGIN_LIMIT_CAP + 10) {
+            limit
+                .hits
+                .insert(format!("ip:{index}"), vec![now - 100 + (index % 50) as u64]);
+        }
+        limit.hits.insert("ip:hot".into(), vec![now]);
+        maybe_prune_login_limit(&mut limit, now);
+        assert!(limit.hits.len() <= LOGIN_LIMIT_CAP);
+        assert!(limit.hits.contains_key("ip:hot"));
     }
 }

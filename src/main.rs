@@ -5500,6 +5500,15 @@ fn validate_profile_fields(body: &MeUpdate) -> Result<(), ApiError> {
 
 async fn apply_profile(state: &AppState, user: &User, body: &MeUpdate) -> Result<(), ApiError> {
     validate_profile_fields(body)?;
+    // Everything that can reject the request is checked before the first
+    // write, so a bad field never leaves the profile half-updated.
+    if let Some(ids) = &body.news_source_ids {
+        state
+            .db
+            .validate_news_sources(ids)
+            .await
+            .map_err(catalog_err)?;
+    }
     let replacing_token = body
         .telegram_bot_token
         .as_ref()
@@ -8636,5 +8645,35 @@ mod tests {
         }
         assert!(throttle_user(&state, "llm-test", admin.id, 10).is_err());
         assert!(throttle_user(&state, "llm-test", admin.id + 1, 10).is_ok());
+    }
+
+    #[tokio::test]
+    async fn rejected_profile_update_writes_nothing() {
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let user = db.user_by_username("admin").await.unwrap().unwrap();
+        let state = AppState {
+            db,
+            secret: "profile-tx".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        };
+        let err = apply_profile(
+            &state,
+            &user,
+            &MeUpdate {
+                bark_key: Some("AAAAAAAAAAAAAAAAAAAA".into()),
+                dnd_start: Some("22:00".into()),
+                news_source_ids: Some(vec![424242]),
+                ..MeUpdate::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        let saved = state.db.user_by_id(user.id).await.unwrap().unwrap();
+        assert_eq!(saved.bark_key, "");
+        assert_eq!(saved.dnd_start, "");
     }
 }

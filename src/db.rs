@@ -25,6 +25,10 @@ pub struct NewsEntry {
     pub published_at: String,
 }
 
+/// Audit history survives account deletion: admin logs keep the actor id,
+/// push logs are anonymised (user_id set to NULL) so counts stay intact.
+const AUDIT_TABLES: &[&str] = &["admin_logs", "push_logs"];
+
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
@@ -1879,27 +1883,45 @@ impl Db {
         if name.is_empty() || name.chars().count() > 60 {
             return Err(CatalogError::Bad("媒体名称需 1-60 字"));
         }
+        let mut tx = self.pool.begin().await?;
         let id = sqlx::query(
-            "INSERT INTO news_sources (slug, name, group_name) VALUES ('pending', ?, ?)",
+            "INSERT INTO news_sources (slug, name, group_name)
+             VALUES ('pending-' || lower(hex(randomblob(8))), ?, ?)",
         )
         .bind(name)
         .bind(group_name.trim())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?
         .last_insert_rowid();
         sqlx::query("UPDATE news_sources SET slug = ? WHERE id = ?")
             .bind(format!("s{id}"))
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
         sqlx::query(
             "INSERT INTO user_news_sources (user_id, source_id)
              SELECT DISTINCT user_id, ? FROM user_news_sources",
         )
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(id)
+    }
+
+    pub async fn validate_news_sources(&self, ids: &[i64]) -> Result<(), CatalogError> {
+        for id in ids {
+            let ok: Option<i64> = sqlx::query_scalar(
+                "SELECT id FROM news_sources WHERE id = ? AND archived_at IS NULL",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+            if ok.is_none() {
+                return Err(CatalogError::Bad("来源不存在或已归档"));
+            }
+        }
+        Ok(())
     }
 
     pub async fn set_user_news_sources(
@@ -1913,22 +1935,7 @@ impl Db {
                 unique.push(*id);
             }
         }
-        if !unique.is_empty() {
-            let mut found = Vec::new();
-            for id in &unique {
-                let ok: Option<i64> = sqlx::query_scalar(
-                    "SELECT id FROM news_sources WHERE id = ? AND archived_at IS NULL",
-                )
-                .bind(id)
-                .fetch_optional(&self.pool)
-                .await?;
-                if ok.is_none() {
-                    return Err(CatalogError::Bad("来源不存在或已归档"));
-                }
-                found.push(*id);
-            }
-            let _ = found;
-        }
+        self.validate_news_sources(&unique).await?;
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM user_news_sources WHERE user_id = ?")
             .bind(user_id)
@@ -1967,22 +1974,29 @@ impl Db {
         if url.is_empty() || url.len() > 2048 {
             return Err(CatalogError::Bad("Feed URL 无效"));
         }
+        let mut tx = self.pool.begin().await?;
         let duplicate: Option<i64> = sqlx::query_scalar("SELECT id FROM news_feeds WHERE url = ?")
             .bind(url)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         if duplicate.is_some() {
             return Err(CatalogError::Bad("Feed URL 已存在"));
         }
-        Ok(
-            sqlx::query("INSERT INTO news_feeds (source_id, name, url) VALUES (?, ?, ?)")
-                .bind(source_id)
-                .bind(name)
-                .bind(url)
-                .execute(&self.pool)
-                .await?
-                .last_insert_rowid(),
-        )
+        let id = sqlx::query("INSERT INTO news_feeds (source_id, name, url) VALUES (?, ?, ?)")
+            .bind(source_id)
+            .bind(name)
+            .bind(url)
+            .execute(&mut *tx)
+            .await
+            .map_err(|err| match &err {
+                sqlx::Error::Database(db) if db.is_unique_violation() => {
+                    CatalogError::Bad("Feed URL 已存在")
+                }
+                _ => CatalogError::Db(err),
+            })?
+            .last_insert_rowid();
+        tx.commit().await?;
+        Ok(id)
     }
 
     pub async fn news_feeds(&self) -> Result<Vec<(i64, i64, String, String)>, sqlx::Error> {
@@ -4061,22 +4075,16 @@ impl Db {
         password_hash: Option<&str>,
         is_admin: Option<bool>,
     ) -> Result<(), CatalogError> {
-        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-        if exists.is_none() {
-            return Err(CatalogError::Missing("用户不存在"));
-        }
         if is_admin == Some(false) && actor == id {
             return Err(CatalogError::Bad("不能取消自己的管理员权限"));
         }
-        if let Some(on) = is_admin {
-            sqlx::query("UPDATE users SET is_admin = ? WHERE id = ?")
-                .bind(i64::from(on))
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
+        let mut tx = self.pool.begin().await?;
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        if exists.is_none() {
+            return Err(CatalogError::Missing("用户不存在"));
         }
         if let Some(name) = username {
             let taken: Option<i64> = sqlx::query_scalar(
@@ -4084,7 +4092,7 @@ impl Db {
             )
             .bind(name)
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
             if taken.is_some() {
                 return Err(CatalogError::Bad("用户名已存在"));
@@ -4092,32 +4100,56 @@ impl Db {
             sqlx::query("UPDATE users SET username = ? WHERE id = ?")
                 .bind(name)
                 .bind(id)
-                .execute(&self.pool)
+                .execute(&mut *tx)
+                .await?;
+        }
+        if let Some(on) = is_admin {
+            sqlx::query("UPDATE users SET is_admin = ? WHERE id = ?")
+                .bind(i64::from(on))
+                .bind(id)
+                .execute(&mut *tx)
                 .await?;
         }
         if let Some(hash) = password_hash {
-            self.set_password(id, hash).await?;
+            sqlx::query(
+                "UPDATE users SET password_hash = ?, token_version = token_version + 1 WHERE id = ?",
+            )
+            .bind(hash)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
         }
+        tx.commit().await?;
         Ok(())
     }
 
     pub async fn delete_user(&self, actor: i64, id: i64) -> Result<(), CatalogError> {
+        if actor == id {
+            return Err(CatalogError::Bad("不能删除自己的账号"));
+        }
+        let mut tx = self.pool.begin().await?;
         let row = sqlx::query("SELECT is_admin FROM users WHERE id = ?")
             .bind(id)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *tx)
             .await?;
         let Some(row) = row else {
             return Err(CatalogError::Missing("用户不存在"));
         };
-        if actor == id {
-            return Err(CatalogError::Bad("不能删除自己的账号"));
-        }
         if row.get::<i64, _>("is_admin") != 0 {
             return Err(CatalogError::Bad("不能删除管理员"));
         }
-        let mut tx = self.pool.begin().await?;
         let tables = tables_with_column(&mut tx, "user_id").await?;
         for table in tables {
+            if table == "push_logs" {
+                sqlx::query("UPDATE push_logs SET user_id = NULL WHERE user_id = ?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                continue;
+            }
+            if AUDIT_TABLES.contains(&table.as_str()) {
+                continue;
+            }
             sqlx::query(&format!("DELETE FROM \"{table}\" WHERE user_id = ?"))
                 .bind(id)
                 .execute(&mut *tx)
@@ -8445,6 +8477,9 @@ async fn rebuild_users_autoincrement(
         }
     }
     for table in &tables {
+        if AUDIT_TABLES.contains(&table.as_str()) {
+            continue;
+        }
         sqlx::query(&format!(
             "DELETE FROM \"{table}\" WHERE user_id IS NOT NULL AND user_id NOT IN (SELECT id FROM users)"
         ))
@@ -9115,16 +9150,22 @@ async fn repair_ima_pdf_collisions(pool: &SqlitePool) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-/// Unique partial indexes for push binding IDs. Legacy databases might already
-/// hold duplicates; those are left untouched (the index is skipped with a
-/// warning) so no user silently loses a binding during an upgrade.
+/// Unique partial indexes for push binding IDs and feed URLs. Legacy databases
+/// might already hold duplicates; those are left untouched (the index is
+/// skipped with a warning) so no user silently loses a binding on upgrade.
 async fn ensure_binding_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    for (column, index) in [
-        ("telegram_chat_id", "idx_users_telegram_chat_id"),
-        ("feishu_open_id", "idx_users_feishu_open_id"),
+    // A failed add_news_source used to leave a row stuck on slug 'pending',
+    // which then made every later insert collide on the UNIQUE slug.
+    sqlx::query("UPDATE OR IGNORE news_sources SET slug = 's' || id WHERE slug = 'pending'")
+        .execute(pool)
+        .await?;
+    for (table, column, index) in [
+        ("users", "telegram_chat_id", "idx_users_telegram_chat_id"),
+        ("users", "feishu_open_id", "idx_users_feishu_open_id"),
+        ("news_feeds", "url", "idx_news_feeds_url"),
     ] {
         let duplicates: i64 = sqlx::query_scalar(&format!(
-            "SELECT COUNT(*) FROM (SELECT {column} FROM users WHERE {column} != ''
+            "SELECT COUNT(*) FROM (SELECT {column} FROM {table} WHERE {column} != ''
              GROUP BY {column} HAVING COUNT(*) > 1)"
         ))
         .fetch_one(pool)
@@ -9138,7 +9179,7 @@ async fn ensure_binding_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
             continue;
         }
         sqlx::raw_sql(&format!(
-            "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON users({column}) WHERE {column} != ''"
+            "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table}({column}) WHERE {column} != ''"
         ))
         .execute(pool)
         .await?;
@@ -12519,6 +12560,87 @@ mod regression_tests {
             .await
             .unwrap();
         assert!(!ids.contains(&1), "RFC 822 articles must age out");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn admin_user_update_is_all_or_nothing() {
+        let (db, path) = fresh_db("admin-update-tx").await;
+        let a = add_user(&db, "alice").await;
+        add_user(&db, "bob").await;
+        let err = db
+            .update_admin_user(999, a, Some("BOB"), Some("new-hash"), Some(true))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CatalogError::Bad("用户名已存在")));
+        let alice = db.user_by_id(a).await.unwrap().unwrap();
+        assert!(!alice.is_admin);
+        assert_eq!(alice.password_hash, "x");
+        assert_eq!(alice.token_version, 0);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn stuck_pending_news_source_is_repaired_and_feed_urls_are_unique() {
+        let (db, path) = fresh_db("news-source-tx").await;
+        sqlx::query("INSERT INTO news_sources (slug, name) VALUES ('pending', 'half-created')")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let first = db.add_news_source("甲", "").await.unwrap();
+        let second = db.add_news_source("乙", "").await.unwrap();
+        let slugs: Vec<String> = sqlx::query_scalar("SELECT slug FROM news_sources ORDER BY id")
+            .fetch_all(db.pool())
+            .await
+            .unwrap();
+        assert!(!slugs.iter().any(|slug| slug.starts_with("pending")));
+        assert_eq!(slugs[1], format!("s{first}"));
+        assert_eq!(slugs[2], format!("s{second}"));
+        db.add_news_feed(first, "feed", "https://example.com/rss")
+            .await
+            .unwrap();
+        assert!(matches!(
+            db.add_news_feed(second, "dup", "https://example.com/rss")
+                .await,
+            Err(CatalogError::Bad("Feed URL 已存在"))
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_user_keeps_audit_history() {
+        let (db, path) = fresh_db("delete-audit").await;
+        let admin = add_user(&db, "root").await;
+        let gone = add_user(&db, "gone").await;
+        sqlx::query(
+            "INSERT INTO admin_logs (user_id, action) VALUES (?, 'grant'), (0, 'system');
+             ",
+        )
+        .bind(gone)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO push_logs (post_id, channel, status, user_id) VALUES (1, 'bark', 'ok', ?)",
+        )
+        .bind(gone)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        db.delete_user(admin, gone).await.unwrap();
+        let admin_logs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM admin_logs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(admin_logs, 2);
+        let push_owner: Option<i64> = sqlx::query_scalar("SELECT user_id FROM push_logs")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(push_owner, None);
+        assert!(db.user_by_id(gone).await.unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
 }

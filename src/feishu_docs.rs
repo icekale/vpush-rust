@@ -1,8 +1,9 @@
 //! 已落盘的飞书文档时间线。不采集、不写文件。
 //! `feishu-` 开头的库登录即可读。其它库要同时有授权和订阅。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 use sqlx::{QueryBuilder, Row, Sqlite};
@@ -66,6 +67,23 @@ pub async fn timeline_all(
     if !group.is_empty() && !readable.iter().any(|source| source["group_id"] == group) {
         return Err("文档不存在");
     }
+    let wanted: Vec<String> = readable
+        .iter()
+        .filter(|source| group.is_empty() || source["group_id"] == group)
+        .map(|source| source["timeline_path"].as_str().unwrap_or("").to_string())
+        .collect();
+    let mut timelines = {
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            wanted
+                .iter()
+                .map(|relative| read_timeline(&root, relative))
+                .collect::<Vec<_>>()
+        })
+        .await
+        .map_err(|_| "读取文档失败")?
+        .into_iter()
+    };
     let mut public_sources = Vec::new();
     let mut entries = Vec::new();
     let mut notices = Vec::new();
@@ -84,7 +102,7 @@ pub async fn timeline_all(
         if !group.is_empty() && gid != group {
             continue;
         }
-        let Some(data) = read_timeline(root, source["timeline_path"].as_str().unwrap_or("")) else {
+        let Some(data) = timelines.next().flatten() else {
             continue;
         };
         for item in data["notices"].as_array().into_iter().flatten() {
@@ -1024,11 +1042,41 @@ pub fn asset_type(path: &Path) -> &'static str {
     }
 }
 
-fn read_timeline(root: &Path, relative: &str) -> Option<Value> {
+type TimelineCache = HashMap<PathBuf, (std::time::SystemTime, u64, Arc<Value>)>;
+
+/// Parsed timelines keyed by path and validated against mtime/size, so a page
+/// load only stats the files instead of re-reading and re-parsing every one.
+fn read_timeline(root: &Path, relative: &str) -> Option<Arc<Value>> {
+    const CAPACITY: usize = 64;
+    static CACHE: Mutex<Option<TimelineCache>> = Mutex::new(None);
     let root = root.canonicalize().ok()?;
     let path = safe_path(&root, relative)?;
-    let data: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
-    data.is_object().then_some(data)
+    let meta = std::fs::metadata(&path).ok()?;
+    let stamp = (meta.modified().ok()?, meta.len());
+    if let Some((modified, len, data)) = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(&path)
+    {
+        if (*modified, *len) == stamp {
+            return Some(data.clone());
+        }
+    }
+    let data: Value = serde_json::from_str(&std::fs::read_to_string(&path).ok()?).ok()?;
+    if !data.is_object() {
+        return None;
+    }
+    let data = Arc::new(data);
+    let mut cache = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let cache = cache.get_or_insert_with(HashMap::new);
+    if cache.len() >= CAPACITY && !cache.contains_key(&path) {
+        cache.clear();
+    }
+    cache.insert(path, (stamp.0, stamp.1, data.clone()));
+    Some(data)
 }
 
 fn safe_path(root: &Path, relative: &str) -> Option<PathBuf> {

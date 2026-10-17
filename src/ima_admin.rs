@@ -100,18 +100,35 @@ pub async fn libraries(db: &Db) -> Result<Value, AdminError> {
 pub async fn scan(db: &Db, archive: &Path) -> Result<Value, AdminError> {
     let local = archive.join("local");
     let previous = stored(db).await?;
-    let found = match fs::read_dir(&local) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+    let scanned = tokio::task::spawn_blocking(move || scan_libraries(&local))
+        .await
+        .unwrap_or(Err(()));
+    let libraries = match scanned {
+        Ok(Some(libraries)) => libraries,
+        Ok(None) => {
             let payload = json!({"scanned_at": iso_now(), "status": "finished", "libraries": []});
             save_libraries(db, &payload).await?;
             return Ok(payload);
         }
-        Err(_) => {
+        Err(()) => {
             let mut payload = previous;
             payload["status"] = json!("scan_failed");
             return Ok(payload);
         }
+    };
+    let payload = json!({"scanned_at": iso_now(), "status": "finished", "libraries": libraries});
+    save_libraries(db, &payload).await?;
+    let mut payload = payload;
+    attach_acl(db, &mut payload).await?;
+    Ok(payload)
+}
+
+/// `Ok(None)` when the `local` directory does not exist.
+fn scan_libraries(local: &Path) -> Result<Option<Vec<Value>>, ()> {
+    let found = match fs::read_dir(local) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(()),
     };
     let mut libraries = Vec::new();
     for entry in found.flatten() {
@@ -136,38 +153,46 @@ pub async fn scan(db: &Db, archive: &Path) -> Result<Value, AdminError> {
             .unwrap_or("")
             .cmp(right["slug"].as_str().unwrap_or(""))
     });
-    let payload = json!({"scanned_at": iso_now(), "status": "finished", "libraries": libraries});
-    save_libraries(db, &payload).await?;
-    let mut payload = payload;
-    attach_acl(db, &mut payload).await?;
-    Ok(payload)
+    Ok(Some(libraries))
 }
 
 /// 把 `<archive>/local/<slug>/**/*.pdf` 收进 ima_document_index，返回写入行数。
 /// 不动 ima_local_libraries；名称优先取登记值，其次 marker，最后退化成 slug。
 /// 目录里没有 marker 也照收：标记文件丢过一次，不能让整库就此停摆。
 pub async fn sync_documents(db: &Db, archive: &Path) -> Result<u64, AdminError> {
-    let Ok(entries) = fs::read_dir(archive.join("local")) else {
+    let local = archive.join("local");
+    let dirs = tokio::task::spawn_blocking(move || {
+        let Ok(entries) = fs::read_dir(local) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                let kind = entry.file_type().ok()?;
+                let slug = entry.file_name().to_string_lossy().to_string();
+                if !kind.is_dir() || kind.is_symlink() || slug.starts_with('.') || !slug_ok(&slug) {
+                    return None;
+                }
+                let marker = read_marker(&entry.path()).ok();
+                Some((slug, entry.path(), marker))
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    if dirs.is_empty() {
         return Ok(0);
-    };
+    }
     let libraries = stored(db).await?["libraries"]
         .as_array()
         .cloned()
         .unwrap_or_default();
     let mut written = 0_u64;
-    for entry in entries.flatten() {
-        let Ok(kind) = entry.file_type() else {
-            continue;
-        };
-        let slug = entry.file_name().to_string_lossy().to_string();
-        if !kind.is_dir() || kind.is_symlink() || slug.starts_with('.') || !slug_ok(&slug) {
-            continue;
-        }
+    for (slug, path, marker) in dirs {
         let group_id = format!("local-{slug}");
         let record = libraries
             .iter()
             .find(|item| item["group_id"].as_str() == Some(group_id.as_str()));
-        let marker = read_marker(&entry.path()).ok();
         let disabled = match record {
             Some(item) => item["enabled"] != true,
             None => marker
@@ -183,7 +208,7 @@ pub async fn sync_documents(db: &Db, archive: &Path) -> Result<u64, AdminError> 
             .or_else(|| marker.as_ref().and_then(|value| value["name"].as_str()))
             .unwrap_or(&slug)
             .to_string();
-        written += sync_library(db, archive, &entry.path(), &group_id, &name).await?;
+        written += sync_library(db, archive, &path, &group_id, &name).await?;
     }
     Ok(written)
 }
@@ -195,7 +220,48 @@ async fn sync_library(
     group_id: &str,
     group_name: &str,
 ) -> Result<u64, AdminError> {
+    let docs = {
+        let archive = archive.to_path_buf();
+        let root = root.to_path_buf();
+        tokio::task::spawn_blocking(move || collect_library_docs(&archive, &root))
+            .await
+            .unwrap_or_default()
+    };
     let mut written = 0_u64;
+    for doc in docs {
+        match db
+            .upsert_local_ima_document(
+                group_id,
+                &doc.media_id,
+                &doc.day,
+                &doc.sort_date,
+                &doc.name,
+                group_name,
+                &doc.abstract_text,
+                doc.size as i64,
+                &doc.pdf_path,
+            )
+            .await
+        {
+            Ok(rows) => written += rows,
+            Err(err) => tracing::warn!(pdf_path = %doc.pdf_path, "本地库文档入库失败: {err}"),
+        }
+    }
+    Ok(written)
+}
+
+struct LocalDoc {
+    media_id: String,
+    day: String,
+    sort_date: String,
+    name: String,
+    abstract_text: String,
+    size: u64,
+    pdf_path: String,
+}
+
+fn collect_library_docs(archive: &Path, root: &Path) -> Vec<LocalDoc> {
+    let mut docs = Vec::new();
     let mut pending = vec![root.to_path_buf()];
     while let Some(dir) = pending.pop() {
         let Ok(entries) = fs::read_dir(&dir) else {
@@ -250,28 +316,18 @@ async fn sync_library(
                 .map(str::to_string)
                 // 没有 publish 就退回文件时间，新文件才不会掉到列表最底下
                 .unwrap_or_else(|| date_of(&path));
-            let abstract_text = sidecar["summary"].as_str().unwrap_or("");
-            let name = &file_name[..file_name.len() - 4];
-            match db
-                .upsert_local_ima_document(
-                    group_id,
-                    &media_id,
-                    &day,
-                    &sort_date,
-                    name,
-                    group_name,
-                    abstract_text,
-                    size as i64,
-                    &pdf_path,
-                )
-                .await
-            {
-                Ok(rows) => written += rows,
-                Err(err) => tracing::warn!(%pdf_path, "本地库文档入库失败: {err}"),
-            }
+            docs.push(LocalDoc {
+                media_id,
+                day,
+                sort_date,
+                name: file_name[..file_name.len() - 4].to_string(),
+                abstract_text: sidecar["summary"].as_str().unwrap_or("").to_string(),
+                size,
+                pdf_path,
+            });
         }
     }
-    Ok(written)
+    docs
 }
 
 fn sidecar(path: &Path) -> Value {

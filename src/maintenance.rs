@@ -517,9 +517,13 @@ async fn cleanup_and_backup(db: &Db) {
             match crate::imgbed::process_due(
                 db,
                 cfg.retention_days,
-                crate::imgbed::live_download,
-                |url, bytes, kind| crate::imgbed::live_upload(&cfg, url, bytes, kind),
-                |url| crate::imgbed::live_delete(&cfg, url),
+                |url| tokio::task::block_in_place(|| crate::imgbed::live_download(url)),
+                |url, bytes, kind| {
+                    tokio::task::block_in_place(|| {
+                        crate::imgbed::live_upload(&cfg, url, bytes, kind)
+                    })
+                },
+                |url| tokio::task::block_in_place(|| crate::imgbed::live_delete(&cfg, url)),
             )
             .await
             {
@@ -531,8 +535,10 @@ async fn cleanup_and_backup(db: &Db) {
     })
     .await;
     timed(GROUP, "代理池刷新", async {
-        if let Err(err) =
-            crate::proxy_admin::refresh_due(db, unix_now(), crate::proxy_admin::live_get).await
+        if let Err(err) = crate::proxy_admin::refresh_due(db, unix_now(), |url| {
+            tokio::task::block_in_place(|| crate::proxy_admin::live_get(url))
+        })
+        .await
         {
             tracing::warn!("代理池刷新失败: {err}");
         }

@@ -279,7 +279,7 @@ pub fn exchange_refresh(app_id: &str, secret: &str, refresh: &str) -> Result<Str
     post_token(&body)
 }
 
-pub fn exchange_code(
+pub async fn exchange_code(
     app_id: &str,
     secret: &str,
     redirect: &str,
@@ -294,7 +294,9 @@ pub fn exchange_code(
         "client_id": app_id,
         "client_secret": secret,
     });
-    post_token(&body)
+    tokio::task::spawn_blocking(move || post_token(&body))
+        .await
+        .map_err(|_| fail(400, "飞书授权失败"))?
 }
 
 fn post_token(body: &Value) -> Result<String, Fail> {

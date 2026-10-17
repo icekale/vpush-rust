@@ -6152,6 +6152,7 @@ async fn feishu_docs_oauth_callback_post(
         feishu_secret(&state.db).await?
     };
     let token = feishu_admin::exchange_code(app_id, &secret, redirect, &body.code, &verifier)
+        .await
         .map_err(feishu_admin_err)?;
     feishu_admin::save_token(&state.db, &token)
         .await
@@ -6189,10 +6190,11 @@ async fn feishu_docs_oauth_callback(
     } else {
         secret
     };
-    let body = match feishu_admin::exchange_code(app_id, &secret, redirect, &q.code, &verifier) {
-        Ok(body) => body,
-        Err(_) => return failed.into_response(),
-    };
+    let body =
+        match feishu_admin::exchange_code(app_id, &secret, redirect, &q.code, &verifier).await {
+            Ok(body) => body,
+            Err(_) => return failed.into_response(),
+        };
     if feishu_admin::save_token(&state.db, &body).await.is_err() {
         return failed.into_response();
     }
@@ -6807,7 +6809,10 @@ async fn static_or_spa(State(state): State<AppState>, req: Request<Body>) -> Res
     let first = rel.split('/').next().unwrap_or("");
     if rel.is_empty() || SPA.contains(&first) {
         let index = state.static_dir.join("index.html");
-        if index.is_file() {
+        if tokio::fs::metadata(&index)
+            .await
+            .is_ok_and(|meta| meta.is_file())
+        {
             return file_from_path(&index, false, head).await;
         }
     }
@@ -6818,10 +6823,18 @@ async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf
     if rel.is_empty() {
         return None;
     }
+    let root = root.to_path_buf();
+    let rel = rel.to_string();
+    tokio::task::spawn_blocking(move || resolve_static(&root, &rel, read_body))
+        .await
+        .ok()?
+}
+
+fn resolve_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf, bool, Vec<u8>)> {
     let direct = root.join(rel);
     if direct.is_file() && inside(root, &direct) {
         let bytes = if read_body {
-            tokio::fs::read(&direct).await.ok()?
+            std::fs::read(&direct).ok()?
         } else {
             Vec::new()
         };
@@ -6832,13 +6845,45 @@ async fn load_static(root: &Path, rel: &str, read_body: bool) -> Option<(PathBuf
     if !path.is_file() || !inside(root, &path) {
         return None;
     }
-    let bytes = tokio::fs::read(&path).await.ok()?;
-    let digest = hex::encode(Sha256::digest(&bytes));
     let hashed = rel.rsplit_once('.')?.0.rsplit_once('.')?.1;
+    let (digest, bytes) = static_digest(&path, read_body)?;
     if !digest.starts_with(hashed) {
         return None;
     }
     Some((path, true, bytes))
+}
+
+type DigestCache = HashMap<PathBuf, (std::time::SystemTime, u64, String)>;
+
+/// Content digest of a static file, recomputed only when its mtime or size
+/// changes. Keys are limited to files that exist under the static root.
+fn static_digest(path: &Path, read_body: bool) -> Option<(String, Vec<u8>)> {
+    static CACHE: std::sync::Mutex<Option<DigestCache>> = std::sync::Mutex::new(None);
+    let meta = std::fs::metadata(path).ok()?;
+    let stamp = (meta.modified().ok()?, meta.len());
+    let cached = CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .get(path)
+        .filter(|(modified, len, _)| (*modified, *len) == stamp)
+        .map(|(_, _, digest)| digest.clone());
+    if let Some(digest) = cached {
+        let bytes = if read_body {
+            std::fs::read(path).ok()?
+        } else {
+            Vec::new()
+        };
+        return Some((digest, bytes));
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let digest = hex::encode(Sha256::digest(&bytes));
+    CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(path.to_path_buf(), (stamp.0, stamp.1, digest.clone()));
+    Some((digest, if read_body { bytes } else { Vec::new() }))
 }
 
 fn unhash(rel: &str) -> Option<String> {
@@ -8675,5 +8720,23 @@ mod tests {
         let saved = state.db.user_by_id(user.id).await.unwrap().unwrap();
         assert_eq!(saved.bark_key, "");
         assert_eq!(saved.dnd_start, "");
+    }
+
+    #[test]
+    fn static_digest_cache_follows_file_changes() {
+        let dir = std::env::temp_dir().join(format!("vpush-digest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("app.js");
+        std::fs::write(&file, b"one").unwrap();
+        let (first, body) = static_digest(&file, true).unwrap();
+        assert_eq!(first, hex::encode(Sha256::digest(b"one")));
+        assert_eq!(body, b"one");
+        let (cached, empty) = static_digest(&file, false).unwrap();
+        assert_eq!(cached, first);
+        assert!(empty.is_empty());
+        std::fs::write(&file, b"second").unwrap();
+        let (changed, _) = static_digest(&file, false).unwrap();
+        assert_eq!(changed, hex::encode(Sha256::digest(b"second")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

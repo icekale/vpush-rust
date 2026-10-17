@@ -96,10 +96,9 @@ pub struct Parsed {
 pub async fn fetch_feed(url: &str) -> Result<Parsed, String> {
     public_https(url)?;
     let url = url.to_string();
-    let body = tokio::task::spawn_blocking(move || http_text(&url))
+    tokio::task::spawn_blocking(move || parse_feed(&http_text(&url)?))
         .await
-        .map_err(|e| e.to_string())??;
-    parse_feed(&body)
+        .map_err(|e| e.to_string())?
 }
 
 pub fn public_https(url: &str) -> Result<(), String> {
@@ -204,26 +203,27 @@ fn atom_entry(block: &str) -> Option<NewsEntry> {
 }
 
 fn blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    // ASCII lowercasing keeps byte offsets, so positions found in `lower` index `xml`.
+    let lower = xml.to_ascii_lowercase();
+    let open = format!("<{tag}").to_ascii_lowercase();
+    let close = format!("</{tag}>").to_ascii_lowercase();
     let mut out = Vec::new();
-    let mut rest = xml;
-    let open = format!("<{tag}");
-    let close = format!("</{tag}>");
-    while let Some(start) = find_tag(rest, &open) {
-        let after = &rest[start + open.len()..];
-        let Some(end) = find_tag(after, &close) else {
+    let mut pos = 0;
+    while let Some(start) = lower[pos..].find(&open) {
+        let after = pos + start + open.len();
+        let Some(end) = lower[after..].find(&close).map(|n| after + n) else {
             break;
         };
-        let content_start = after.find('>').map(|n| n + 1).unwrap_or(0);
+        let content_start = xml[after..]
+            .find('>')
+            .map(|n| after + n + 1)
+            .unwrap_or(after);
         if content_start <= end {
-            out.push(&after[content_start..end]);
+            out.push(&xml[content_start..end]);
         }
-        rest = &after[end + close.len()..];
+        pos = end + close.len();
     }
     out
-}
-
-fn find_tag(text: &str, tag: &str) -> Option<usize> {
-    text.to_ascii_lowercase().find(&tag.to_ascii_lowercase())
 }
 
 fn text_of(xml: &str, tag: &str) -> String {
@@ -759,5 +759,16 @@ mod tests {
         let parsed = parse_feed(xml).unwrap();
         assert_eq!(parsed.entries[0].author, "作者甲");
         assert_eq!(parsed.entries[0].published_at, "2026-10-17T08:00:00+00:00");
+    }
+
+    #[test]
+    fn large_feeds_split_into_blocks_in_linear_time() {
+        let item = "<ITEM><title>t</title><link>https://a.example/x</link></ITEM>";
+        let xml = format!("<rss><channel>{}</channel></rss>", item.repeat(20_000));
+        let started = std::time::Instant::now();
+        let parsed = parse_feed(&xml).unwrap();
+        assert_eq!(parsed.entries.len(), 20_000);
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(blocks("<a>1</a><A x=\"y\">2</A><a>", "a"), ["1", "2"]);
     }
 }

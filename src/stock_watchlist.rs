@@ -573,6 +573,29 @@ async fn refresh_cache(db: &Db) -> Result<(), WatchlistError> {
         }
         cache.refreshing = true;
     }
+    // Detached so a cancelled request cannot strand `refreshing = true`; the
+    // guard resets the flag on every exit path, including panics.
+    let db = db.clone();
+    tokio::spawn(async move {
+        let _guard = RefreshReset;
+        refresh_quotes(&db, instruments).await
+    })
+    .await
+    .unwrap_or_else(|err| Err(WatchlistError::gateway(err.to_string())))
+}
+
+struct RefreshReset;
+
+impl Drop for RefreshReset {
+    fn drop(&mut self) {
+        cache()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .refreshing = false;
+    }
+}
+
+async fn refresh_quotes(db: &Db, instruments: Vec<Instrument>) -> Result<(), WatchlistError> {
     let result = async {
         let cookie = crate::xueqiu::app_cookie(db)
             .await
@@ -1788,5 +1811,24 @@ mod tests {
         assert!(valid_target("us", 10.01));
         assert!(valid_target("us", 0.001));
         assert!(!valid_target("us", 0.00001));
+    }
+
+    #[tokio::test]
+    async fn refresh_guard_clears_the_flag_even_when_the_task_panics() {
+        cache()
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .refreshing = true;
+        let task = tokio::spawn(async {
+            let _guard = RefreshReset;
+            panic!("simulated refresh failure");
+        });
+        assert!(task.await.is_err());
+        assert!(
+            !cache()
+                .lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .refreshing
+        );
     }
 }

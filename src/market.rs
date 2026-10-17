@@ -83,44 +83,48 @@ pub async fn snapshot(db: &crate::db::Db, group: &str) -> Value {
         group
     };
     let (start, previous) = begin(group);
-    let cookie = if matches!(start, Start::Idle) {
-        None
-    } else {
-        crate::xueqiu::app_cookie(db).await.ok()
-    };
-    match start {
-        Start::Cold => {
+    let cold = matches!(start, Start::Cold);
+    if !matches!(start, Start::Idle) {
+        // The refresh runs detached so a cancelled request (client disconnect,
+        // timeout) can never leave `refreshing` stuck; the guard resets it even
+        // if the task itself panics.
+        let db = db.clone();
+        let group = group.to_string();
+        let task = tokio::spawn(async move {
+            let guard = SlotReset(group.clone());
+            let cookie = crate::xueqiu::app_cookie(&db).await.ok();
             let fetched = tokio::task::spawn_blocking({
+                let group = group.clone();
                 let previous = previous.clone();
-                let group = group.to_string();
-                let cookie = cookie.clone();
                 move || fetch_group(&group, &previous, cookie.as_deref())
             })
             .await
-            .unwrap_or(previous);
-            finish(group, fetched);
+            .unwrap_or_default();
+            if !fetched.is_empty() {
+                finish(&group, fetched);
+            } else if cold {
+                finish(&group, previous);
+            } else {
+                mark_stale(&group);
+            }
+            drop(guard);
+        });
+        if cold {
+            let _ = task.await;
         }
-        Start::Warm => {
-            let previous = previous.clone();
-            let group = group.to_string();
-            tokio::spawn(async move {
-                let fetched = tokio::task::spawn_blocking({
-                    let group = group.clone();
-                    let cookie = cookie.clone();
-                    move || fetch_group(&group, &previous, cookie.as_deref())
-                })
-                .await
-                .unwrap_or_default();
-                if fetched.is_empty() {
-                    mark_stale(&group);
-                } else {
-                    finish(&group, fetched);
-                }
-            });
-        }
-        Start::Idle => {}
     }
     render(group, &current(group), now)
+}
+
+struct SlotReset(String);
+
+impl Drop for SlotReset {
+    fn drop(&mut self) {
+        let mut slots = slots().lock().unwrap_or_else(|err| err.into_inner());
+        if let Some(slot) = slots.get_mut(&self.0) {
+            slot.refreshing = false;
+        }
+    }
 }
 
 fn begin(group: &str) -> (Start, Vec<Item>) {
@@ -1442,5 +1446,19 @@ mod tests {
             "hkHSI"
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_guard_clears_the_flag_even_when_the_task_panics() {
+        let group = "h9-guard-test";
+        assert!(matches!(begin(group).0, Start::Cold));
+        assert!(matches!(begin(group).0, Start::Idle));
+        let task = tokio::spawn(async move {
+            let _guard = SlotReset(group.to_string());
+            panic!("simulated refresh failure");
+        });
+        assert!(task.await.is_err());
+        assert!(matches!(begin(group).0, Start::Cold));
+        drop(SlotReset(group.to_string()));
     }
 }

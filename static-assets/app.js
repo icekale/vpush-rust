@@ -1579,7 +1579,7 @@ function kolCard(kol) {
           ${kol.subscribed ? "✓ 已订阅" : "订阅"}
         </button>
         ${kol.subscribed ? `<button class="fav-btn ${kol.favorite ? "fav-on" : ""}" onclick="toggleFavorite(${kol.id}, this)" title="特别关注：优先推送" aria-label="${kol.favorite ? "取消特别关注" : "设为特别关注"}">${STAR_SVG}</button>` : ""}
-        ${kol.subscribed ? `<button class="fav-btn ${kol.secondary ? "sec-on" : "sec-off"}" onclick="toggleSecondary(${kol.id}, this)" title="次要：新帖合并进摘要推送（降频）" aria-label="${kol.secondary ? "取消次要" : "设为次要"}">${kol.secondary ? BELL_OFF_ICON : BELL_ICON}</button>` : ""}
+        ${kol.subscribed ? `<button class="fav-btn ${kol.secondary ? "sec-on" : "sec-off"}" onclick="toggleSecondary(${kol.id}, this)" title="次要：新帖不推送（特别关注除外），只在动态页打开「次要大V」后显示" aria-label="${kol.secondary ? "取消次要" : "设为次要"}">${kol.secondary ? BELL_OFF_ICON : BELL_ICON}</button>` : ""}
         ${state.user?.is_admin ? `<button class="btn-sm danger kol-del" onclick="adminDeleteKolFromHome(${kol.id})" title="删除该大V" aria-label="删除该大V">${TRASH_ICON}</button>` : ""}
       </div>
     </div>`;
@@ -1642,7 +1642,7 @@ async function toggleSecondary(kolId, btn) {
     });
     if (kol) kol.secondary = next;
     if (btn) btn.classList.toggle("sec-on", next);
-    flash(next ? "已设为次要（降频推送）" : "已取消次要");
+    flash(next ? "已设为次要：新帖不再推送，仅在动态页显示" : "已取消次要，恢复实时推送");
     if (isRoute("home")) renderHomeList();
   } catch (err) {
     alert("操作失败: " + err.message);

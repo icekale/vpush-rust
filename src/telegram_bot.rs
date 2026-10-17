@@ -488,7 +488,7 @@ async fn callback_secondary(
     let text = if was_secondary {
         format!("已恢复实时推送：「{name}」")
     } else {
-        format!("已设为次要：「{name}」新帖合并推送")
+        format!("已设为次要：「{name}」新帖不再推送，只在网页动态页显示")
     };
     Ok((
         response_with_keyboard(

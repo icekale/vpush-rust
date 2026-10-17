@@ -226,229 +226,29 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     let rich_messages = telegram_rich_messages(db).await;
     let now = beijing_minutes();
     let telegram_post = load_telegram_identity(db, kol_id, note.platform, note.external_id).await;
+    let mut key = PostKey {
+        kol_id,
+        platform: note.platform,
+        external_id: note.external_id,
+        id: None,
+    };
+    key.id = match &telegram_post {
+        Ok(Some(post)) => Some(post.id),
+        _ => key.resolve(db).await.ok().flatten(),
+    };
+    let key = &key;
+    let telegram_post = &telegram_post;
     let users = async {
-        for target in &targets {
-            if !target.notify_enabled || dnd_blocks(target, now) {
-                continue;
-            }
-            let channels = channels(&target.push_channels);
-            let unix = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|item| item.as_secs() as i64)
-                .unwrap_or(0);
-            tokio::join!(
-                async {
-                    if channels.wecom && wecom_bound(&target.wecom_webhook) {
-                        let detail = match &telegram_post {
-                            Ok(Some(post)) if post.detail.is_object() => Some(&post.detail),
-                            _ => None,
-                        };
-                        if let Err(err) = wecom(&target.wecom_webhook, note, detail).await {
-                            tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
-                            note_push_failure(db, &format!("企业微信：{err}")).await;
-                            remember_failure_logged(
-                                db,
-                                kol_id,
-                                (note.platform, note.external_id),
-                                "wecom",
-                                target.user_id,
-                                &err,
-                                unix,
-                            )
-                            .await;
-                        } else {
-                            remember_success(
-                                db,
-                                kol_id,
-                                (note.platform, note.external_id),
-                                "wecom",
-                                target.user_id,
-                            )
-                            .await;
-                        }
-                    }
-                },
-                async {
-                    if channels.bark && valid_bark_key(&target.bark_key) {
-                        if let Err(err) = bark(&target.bark_key, note).await {
-                            tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
-                            note_push_failure(db, &format!("Bark：{err}")).await;
-                            remember_failure_logged(
-                                db,
-                                kol_id,
-                                (note.platform, note.external_id),
-                                "bark",
-                                target.user_id,
-                                &err,
-                                unix,
-                            )
-                            .await;
-                        } else {
-                            remember_success(
-                                db,
-                                kol_id,
-                                (note.platform, note.external_id),
-                                "bark",
-                                target.user_id,
-                            )
-                            .await;
-                        }
-                    }
-                },
-                async {
-                    if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
-                        let key = crate::feishu_personal::credential_key().unwrap_or_default();
-                        match telegram_secret(&target.telegram_bot_token, &key) {
-                            Ok(token) => {
-                                let result = match &telegram_post {
-                                    Ok(Some(post)) => {
-                                        send_telegram_post(
-                                            &token,
-                                            &target.telegram_chat_id,
-                                            Some(post),
-                                            target.user_id,
-                                            db,
-                                            rich_messages,
-                                        )
-                                        .await
-                                    }
-                                    Ok(None) => Err("帖子不存在".into()),
-                                    Err(err) => Err(format!("读取帖子失败: {err}")),
-                                };
-                                if let Err(err) = result {
-                                    tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
-                                    note_push_failure(db, &format!("Telegram：{err}")).await;
-                                    remember_failure_logged(
-                                        db,
-                                        kol_id,
-                                        (note.platform, note.external_id),
-                                        "telegram",
-                                        target.user_id,
-                                        &err,
-                                        unix,
-                                    )
-                                    .await;
-                                } else {
-                                    remember_success(
-                                        db,
-                                        kol_id,
-                                        (note.platform, note.external_id),
-                                        "telegram",
-                                        target.user_id,
-                                    )
-                                    .await;
-                                }
-                            }
-                            Err(err) => {
-                                tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
-                                note_push_failure(db, &format!("Telegram：{err}")).await;
-                                remember_failure_logged(
-                                    db,
-                                    kol_id,
-                                    (note.platform, note.external_id),
-                                    "telegram",
-                                    target.user_id,
-                                    &err,
-                                    unix,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                },
-                async {
-                    if channels.feishu {
-                        let empty = serde_json::Value::Null;
-                        let (category, tags, detail, favorite, keyword) = match &telegram_post {
-                            Ok(Some(post)) => {
-                                let (favorite, keyword) =
-                                    telegram_reasons(db, post, target.user_id)
-                                        .await
-                                        .unwrap_or((target.favorite, false));
-                                (
-                                    post.category.as_str(),
-                                    &post.tags,
-                                    &post.detail,
-                                    favorite,
-                                    keyword,
-                                )
-                            }
-                            _ => ("", &empty, &empty, target.favorite, false),
-                        };
-                        let ctx = crate::feishu::CardContext {
-                            category,
-                            tags,
-                            detail,
-                            favorite,
-                            keyword,
-                        };
-                        match crate::feishu::deliver_user(db, target.user_id, note, &ctx).await {
-                            Ok(()) => {
-                                remember_success(
-                                    db,
-                                    kol_id,
-                                    (note.platform, note.external_id),
-                                    "feishu",
-                                    target.user_id,
-                                )
-                                .await;
-                            }
-                            Err(err) if err == "飞书未绑定" => {}
-                            Err(err) => {
-                                tracing::warn!(
-                                    kol = kol_id,
-                                    user = target.user_id,
-                                    "飞书推送失败: {err}"
-                                );
-                                note_push_failure(db, &format!("飞书：{err}")).await;
-                                remember_failure_logged(
-                                    db,
-                                    kol_id,
-                                    (note.platform, note.external_id),
-                                    "feishu",
-                                    target.user_id,
-                                    &err,
-                                    unix,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                },
-                async {
-                    if channels.webpush {
-                        if let Err(err) =
-                            crate::webpush::notify_note(db, target.user_id, note, target.favorite)
-                                .await
-                        {
-                            if !unbound_skip(&err) {
-                                tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
-                                note_push_failure(db, &format!("浏览器：{err}")).await;
-                                remember_failure_logged(
-                                    db,
-                                    kol_id,
-                                    (note.platform, note.external_id),
-                                    "webpush",
-                                    target.user_id,
-                                    &err,
-                                    unix,
-                                )
-                                .await;
-                            }
-                        } else {
-                            remember_success(
-                                db,
-                                kol_id,
-                                (note.platform, note.external_id),
-                                "webpush",
-                                target.user_id,
-                            )
-                            .await;
-                        }
-                    }
-                },
-            );
-        }
+        let jobs: Vec<_> = targets
+            .iter()
+            .map(|target| deliver_target(db, note, key, telegram_post, rich_messages, now, target))
+            .collect();
+        let _: Vec<()> =
+            futures_util::StreamExt::collect(futures_util::StreamExt::buffer_unordered(
+                futures_util::stream::iter(jobs),
+                PUSH_FANOUT,
+            ))
+            .await;
     };
     let group = async {
         if let Err(err) = crate::feishu::notify(
@@ -472,6 +272,151 @@ pub async fn deliver(db: &Db, kol_id: i64, note: &Note<'_>) {
     tokio::join!(users, group);
 }
 
+async fn deliver_target(
+    db: &Db,
+    note: &Note<'_>,
+    key: &PostKey<'_>,
+    telegram_post: &Result<Option<TelegramPost>, sqlx::Error>,
+    rich_messages: bool,
+    now: u32,
+    target: &crate::db::PushTarget,
+) {
+    let kol_id = key.kol_id;
+    if !target.notify_enabled || dnd_blocks(target, now) {
+        return;
+    }
+    let channels = channels(&target.push_channels);
+    let reasons = match telegram_post {
+        Ok(Some(post)) if channels.telegram || channels.feishu => {
+            telegram_reasons(db, post, target.user_id)
+                .await
+                .unwrap_or((target.favorite, false))
+        }
+        _ => (target.favorite, false),
+    };
+    let unix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|item| item.as_secs() as i64)
+        .unwrap_or(0);
+    tokio::join!(
+        async {
+            if channels.wecom && wecom_bound(&target.wecom_webhook) {
+                let detail = match telegram_post {
+                    Ok(Some(post)) if post.detail.is_object() => Some(&post.detail),
+                    _ => None,
+                };
+                if let Err(err) = wecom(&target.wecom_webhook, note, detail).await {
+                    tracing::warn!(kol = kol_id, "企业微信推送失败: {err}");
+                    note_push_failure(db, &format!("企业微信：{err}")).await;
+                    remember_failure_logged(db, key, "wecom", target.user_id, &err, unix).await;
+                } else {
+                    remember_success(db, key, "wecom", target.user_id).await;
+                }
+            }
+        },
+        async {
+            if channels.bark && valid_bark_key(&target.bark_key) {
+                if let Err(err) = bark(&target.bark_key, note).await {
+                    tracing::warn!(kol = kol_id, "Bark 推送失败: {err}");
+                    note_push_failure(db, &format!("Bark：{err}")).await;
+                    remember_failure_logged(db, key, "bark", target.user_id, &err, unix).await;
+                } else {
+                    remember_success(db, key, "bark", target.user_id).await;
+                }
+            }
+        },
+        async {
+            if channels.telegram && !target.telegram_chat_id.trim().is_empty() {
+                let secret_key = crate::feishu_personal::credential_key().unwrap_or_default();
+                match telegram_secret(&target.telegram_bot_token, &secret_key) {
+                    Ok(token) => {
+                        let result = match telegram_post {
+                            Ok(Some(post)) => {
+                                send_telegram_post(
+                                    &token,
+                                    &target.telegram_chat_id,
+                                    Some(post),
+                                    reasons,
+                                    rich_messages,
+                                )
+                                .await
+                            }
+                            Ok(None) => Err("帖子不存在".into()),
+                            Err(err) => Err(format!("读取帖子失败: {err}")),
+                        };
+                        if let Err(err) = result {
+                            tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
+                            note_push_failure(db, &format!("Telegram：{err}")).await;
+                            remember_failure_logged(
+                                db,
+                                key,
+                                "telegram",
+                                target.user_id,
+                                &err,
+                                unix,
+                            )
+                            .await;
+                        } else {
+                            remember_success(db, key, "telegram", target.user_id).await;
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(kol = kol_id, "Telegram 推送失败: {err}");
+                        note_push_failure(db, &format!("Telegram：{err}")).await;
+                        remember_failure_logged(db, key, "telegram", target.user_id, &err, unix)
+                            .await;
+                    }
+                }
+            }
+        },
+        async {
+            if channels.feishu {
+                let empty = serde_json::Value::Null;
+                let (favorite, keyword) = reasons;
+                let (category, tags, detail) = match telegram_post {
+                    Ok(Some(post)) => (post.category.as_str(), &post.tags, &post.detail),
+                    _ => ("", &empty, &empty),
+                };
+                let ctx = crate::feishu::CardContext {
+                    category,
+                    tags,
+                    detail,
+                    favorite,
+                    keyword,
+                };
+                match crate::feishu::deliver_user(db, target.user_id, note, &ctx).await {
+                    Ok(()) => {
+                        remember_success(db, key, "feishu", target.user_id).await;
+                    }
+                    Err(err) if err == "飞书未绑定" => {}
+                    Err(err) => {
+                        tracing::warn!(kol = kol_id, user = target.user_id, "飞书推送失败: {err}");
+                        note_push_failure(db, &format!("飞书：{err}")).await;
+                        remember_failure_logged(db, key, "feishu", target.user_id, &err, unix)
+                            .await;
+                    }
+                }
+            }
+        },
+        async {
+            if channels.webpush {
+                if let Err(err) =
+                    crate::webpush::notify_note(db, target.user_id, note, target.favorite).await
+                {
+                    if !unbound_skip(&err) {
+                        tracing::warn!(kol = kol_id, "浏览器推送失败: {err}");
+                        note_push_failure(db, &format!("浏览器：{err}")).await;
+                        remember_failure_logged(db, key, "webpush", target.user_id, &err, unix)
+                            .await;
+                    }
+                } else {
+                    remember_success(db, key, "webpush", target.user_id).await;
+                }
+            }
+        },
+    );
+}
+
 async fn note_push_failure(db: &Db, detail: &str) {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -490,50 +435,64 @@ const RETRY_DELAYS: [i64; 3] = [60, 300, 900];
 
 async fn remember_failure_logged(
     db: &Db,
-    kol_id: i64,
-    identity: (&str, &str),
+    key: &PostKey<'_>,
     channel: &str,
     user_id: i64,
     error: &str,
     now: i64,
 ) {
-    if let Err(err) = remember_failure(db, kol_id, identity, channel, user_id, error, now).await {
-        tracing::warn!(kol = kol_id, channel, "记录推送失败以便重试失败: {err}");
+    if let Err(err) = remember_failure_for(db, key, channel, user_id, error, now).await {
+        tracing::warn!(kol = key.kol_id, channel, "记录推送失败以便重试失败: {err}");
     }
 }
 
-async fn remember_success(
-    db: &Db,
+/// Users handled at once during fan-out; HTTP is still capped by `push_slots`.
+const PUSH_FANOUT: usize = 8;
+
+/// A post identity whose `posts.id` is looked up at most once per fan-out.
+#[derive(Clone, Copy)]
+struct PostKey<'a> {
     kol_id: i64,
-    identity: (&str, &str),
-    channel: &str,
-    user_id: i64,
-) {
-    let row =
-        sqlx::query("SELECT id FROM posts WHERE platform = ? AND external_id = ? AND kol_id = ?")
-            .bind(identity.0)
-            .bind(identity.1)
-            .bind(kol_id)
-            .fetch_optional(db.pool())
-            .await;
-    let row = match row {
-        Ok(row) => row,
+    platform: &'a str,
+    external_id: &'a str,
+    id: Option<i64>,
+}
+
+impl PostKey<'_> {
+    async fn resolve(&self, db: &Db) -> Result<Option<i64>, sqlx::Error> {
+        if self.id.is_some() {
+            return Ok(self.id);
+        }
+        sqlx::query_scalar(
+            "SELECT id FROM posts WHERE platform = ? AND external_id = ? AND kol_id = ?",
+        )
+        .bind(self.platform)
+        .bind(self.external_id)
+        .bind(self.kol_id)
+        .fetch_optional(db.pool())
+        .await
+    }
+}
+
+async fn remember_success(db: &Db, key: &PostKey<'_>, channel: &str, user_id: i64) {
+    let kol_id = key.kol_id;
+    let post_id = match key.resolve(db).await {
+        Ok(Some(id)) => id,
+        Ok(None) => return,
         Err(err) => {
             tracing::warn!(kol = kol_id, channel, "记录推送成功失败: {err}");
             return;
         }
     };
-    let Some(row) = row else {
-        return;
-    };
     if let Err(err) = db
-        .add_push_log(row.get("id"), channel, "success", "", Some(user_id))
+        .add_push_log(post_id, channel, "success", "", Some(user_id))
         .await
     {
         tracing::warn!(kol = kol_id, channel, "记录推送成功失败: {err}");
     }
 }
 
+#[cfg(test)]
 pub async fn remember_failure(
     db: &Db,
     kol_id: i64,
@@ -543,26 +502,35 @@ pub async fn remember_failure(
     error: &str,
     now: i64,
 ) -> Result<(), sqlx::Error> {
-    let row =
-        sqlx::query("SELECT id FROM posts WHERE platform = ? AND external_id = ? AND kol_id = ?")
-            .bind(identity.0)
-            .bind(identity.1)
-            .bind(kol_id)
-            .fetch_optional(db.pool())
-            .await?;
-    let Some(row) = row else {
+    let key = PostKey {
+        kol_id,
+        platform: identity.0,
+        external_id: identity.1,
+        id: None,
+    };
+    remember_failure_for(db, &key, channel, user_id, error, now).await
+}
+
+async fn remember_failure_for(
+    db: &Db,
+    key: &PostKey<'_>,
+    channel: &str,
+    user_id: i64,
+    error: &str,
+    now: i64,
+) -> Result<(), sqlx::Error> {
+    let Some(post_id) = key.resolve(db).await? else {
         tracing::warn!(
-            kol = kol_id,
-            platform = identity.0,
-            external_id = identity.1,
+            kol = key.kol_id,
+            platform = key.platform,
+            external_id = key.external_id,
             channel,
             "未找到推送失败对应的帖子，跳过重试入队"
         );
         return Ok(());
     };
-    let post_id: i64 = row.get("id");
-    let platform = identity.0;
-    let external_id = identity.1;
+    let platform = key.platform;
+    let external_id = key.external_id;
     sqlx::query(
         "INSERT INTO push_retries (channel, user_id, platform, external_id, post_id, attempts, next_at)
          VALUES (?, ?, ?, ?, ?, 0, ?)
@@ -781,12 +749,14 @@ pub async fn retry_due_live(db: &Db, now: i64) -> Result<usize, sqlx::Error> {
                 let token = telegram_secret(&row.get::<String, _>("telegram_bot_token"), &key)?;
                 let post = load_telegram_post(db, post_id).await.map_err(|err| err.to_string())?
                     .ok_or_else(|| "帖子不存在".to_string())?;
+                let reasons = telegram_reasons(db, &post, user_id)
+                    .await
+                    .map_err(|err| err.to_string())?;
                 send_telegram_post(
                     &token,
                     &row.get::<String, _>("telegram_chat_id"),
                     Some(&post),
-                    user_id,
-                    db,
+                    reasons,
                     rich_messages,
                 )
                 .await
@@ -1141,7 +1111,6 @@ fn validate_telegram_send(token: &str, chat_id: &str) -> Result<(), String> {
 
 #[derive(Debug)]
 struct TelegramPost {
-    #[allow(dead_code)]
     id: i64,
     platform: String,
     kol_id: i64,
@@ -1364,6 +1333,7 @@ fn telegram_rich_media_body(
 
 fn escape_html(raw: &str, max_chars: usize, max_html: usize) -> String {
     let mut out = String::new();
+    let mut units = 0;
     for ch in raw.chars().take(max_chars) {
         let escaped = match ch {
             '&' => "&amp;",
@@ -1372,16 +1342,18 @@ fn escape_html(raw: &str, max_chars: usize, max_html: usize) -> String {
             '"' => "&quot;",
             '\'' => "&#39;",
             _ => {
-                if out.encode_utf16().count() + ch.len_utf16() > max_html {
+                if units + ch.len_utf16() > max_html {
                     break;
                 }
+                units += ch.len_utf16();
                 out.push(ch);
                 continue;
             }
         };
-        if out.encode_utf16().count() + escaped.len() > max_html {
+        if units + escaped.len() > max_html {
             break;
         }
+        units += escaped.len();
         out.push_str(escaped);
     }
     out
@@ -1801,16 +1773,12 @@ async fn send_telegram_post(
     token: &str,
     chat_id: &str,
     post: Option<&TelegramPost>,
-    user_id: i64,
-    db: &Db,
+    (favorite, keyword): (bool, bool),
     rich_messages: bool,
 ) -> Result<(), String> {
     let Some(post) = post else {
         return Err("帖子不存在".into());
     };
-    let (favorite, keyword) = telegram_reasons(db, post, user_id)
-        .await
-        .map_err(|err| err.to_string())?;
     let (html, markup) = render_telegram_post(post, favorite, keyword);
     let media = telegram_post_media(post);
     validate_telegram_send(token, chat_id)?;
@@ -2959,11 +2927,15 @@ mod tests {
             published_at: "",
         };
         deliver(&db, kol, &note).await;
-        assert!(
-            send_telegram_post("123456:ABCDEFGHIJKLMNOPQRST", "-1", None, user, &db, true)
-                .await
-                .is_err()
-        );
+        assert!(send_telegram_post(
+            "123456:ABCDEFGHIJKLMNOPQRST",
+            "-1",
+            None,
+            (false, false),
+            true
+        )
+        .await
+        .is_err());
         remember_failure(&db, kol, ("xueqiu", "A"), "telegram", 1, "missing", 1_000)
             .await
             .unwrap();
@@ -4159,5 +4131,18 @@ mod tests {
         let err = post_json(&format!("http://127.0.0.1:1/{secret}/title/body"), "").unwrap_err();
         assert!(!err.contains(secret), "{err}");
         assert!(!err.contains("http"), "{err}");
+    }
+
+    #[test]
+    fn escape_html_counts_utf16_incrementally_and_stays_within_limits() {
+        let raw = "😀<a>&".repeat(50_000);
+        let started = std::time::Instant::now();
+        let out = escape_html(&raw, usize::MAX, 4096);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(out.encode_utf16().count() <= 4096);
+        assert!(out.encode_utf16().count() > 4096 - 6);
+        assert!(out.starts_with("😀&lt;a&gt;&amp;"));
+        assert_eq!(escape_html("a'b\"", 10, 100), "a&#39;b&quot;");
+        assert_eq!(escape_html("😀😀", 10, 3), "😀");
     }
 }

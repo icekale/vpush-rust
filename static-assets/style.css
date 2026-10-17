@@ -5448,3 +5448,20 @@ a.ima-ex-badge.ima-ex-ticker:hover { border-color: var(--color-accent); color: v
   .watch-temperature-actions { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .watch-a500-metrics > div, .watch-a500-line-grid > div, .watch-temperature-metrics > div { min-height: 48px; }
 }
+
+.boot-error {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 24px;
+  text-align: center;
+  background: var(--color-bg);
+  z-index: 1000;
+}
+.boot-error[hidden] { display: none; }
+.boot-error-title { font-size: 17px; font-weight: 600; color: var(--color-text-strong); }
+.boot-error-detail { max-width: 420px; color: var(--color-text-muted); }

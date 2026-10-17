@@ -332,19 +332,38 @@ function clearSessionCaches() {
 
 async function logout() {
   const token = state.token;
-  try {
-    if (token) await api("/api/auth/logout", { method: "POST" });
-  } catch {
-    /* 本地清会话优先，服务端失效失败不挡住登出 */
-  }
+  // 先同步清掉本地会话：并发中的请求和 router 立刻看到「未登录」
   state.token = "";
   state.user = null;
   localStorage.removeItem("dav_token");
   clearSessionCaches();
-  replaceRoute("timeline");
-  $("#app-view").classList.add("hidden");
-  $("#auth-view").classList.remove("hidden");
-  resetAuthButtons();
+  resetAuthForms();
+  try {
+    if (token) {
+      await fetch("/api/auth/logout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      });
+    }
+  } catch {
+    /* 本地清会话优先，服务端失效失败不挡住登出 */
+  }
+  // 整页重载，确保上一个用户的 DOM（表单、列表、弹窗）不会残留在共享设备上
+  location.replace("/");
+}
+
+function resetAuthForms() {
+  for (const id of ["login-form", "register-form"]) {
+    const form = document.getElementById(id);
+    if (form) form.reset();
+  }
+  document.querySelectorAll(".pw-toggle.visible").forEach((btn) => {
+    const input = btn.parentElement?.querySelector("input");
+    if (input) input.type = "password";
+    btn.classList.remove("visible");
+    btn.setAttribute("aria-label", "显示密码");
+    btn.setAttribute("aria-pressed", "false");
+  });
 }
 
 function resetAuthButtons() {
@@ -5693,6 +5712,32 @@ async function ensureAdminViews() {
 
 
 
+function showBootError(err) {
+  let box = document.getElementById("boot-error");
+  if (!box) {
+    box = document.createElement("div");
+    box.id = "boot-error";
+    box.className = "boot-error";
+    box.setAttribute("role", "alert");
+    box.innerHTML = `<p class="boot-error-title">网络异常，暂时无法加载</p>
+      <p class="boot-error-detail"></p>
+      <button type="button" class="btn-primary">重试</button>`;
+    box.querySelector("button").addEventListener("click", () => router());
+    document.body.appendChild(box);
+  }
+  box.querySelector(".boot-error-detail").textContent = navigator.onLine === false
+    ? "设备当前离线，联网后点「重试」。"
+    : String((err && err.message) || "服务暂时不可用，请稍后重试。");
+  box.hidden = false;
+  $("#auth-view").classList.add("hidden");
+  $("#app-view").classList.add("hidden");
+}
+
+function hideBootError() {
+  const box = document.getElementById("boot-error");
+  if (box) box.hidden = true;
+}
+
 function replaceRoute(path) {
   const url = normalizeRoute(path);
   if (location.pathname + location.search !== url) history.replaceState(null, "", url);
@@ -5744,11 +5789,14 @@ async function router() {
   let user;
   try {
     user = await api("/api/me");
-  } catch {
+  } catch (err) {
     if (!sessionOwnerStillActive(renderSeq, token, sessionGeneration)) return;
+    // 401 已在 api() 里登出并切到登录页；其余（离线 / 5xx）显示外壳和重试，避免白屏
+    if (state.token) showBootError(err);
     return;
   }
   if (!sessionOwnerStillActive(renderSeq, token, sessionGeneration)) return;
+  hideBootError();
   $("#app-view").classList.remove("hidden");
   $("#auth-view").classList.add("hidden");
   state.user = user;
@@ -5923,6 +5971,7 @@ async function doLogin(e) {
     });
     state.token = data.token;
     localStorage.setItem("dav_token", data.token);
+    resetAuthForms();
     go("timeline");
   } catch (err) {
     $("#auth-error").textContent = err.message;
@@ -5956,6 +6005,7 @@ async function doRegister(e) {
     });
     state.token = data.token;
     localStorage.setItem("dav_token", data.token);
+    resetAuthForms();
     go("timeline");
   } catch (err) {
     $("#reg-error").textContent = err.message;

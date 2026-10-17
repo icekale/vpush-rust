@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -28,11 +28,17 @@ pub struct NewsEntry {
 #[derive(Clone)]
 pub struct Db {
     pool: SqlitePool,
+    path: std::sync::Arc<PathBuf>,
 }
 
 impl Db {
     pub(crate) fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// The database file this handle was opened on (`:memory:` for tests).
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -693,7 +699,10 @@ impl Db {
         ensure_hot_indexes(&pool).await?;
         ensure_binding_indexes(&pool).await?;
         repair_ima_pdf_collisions(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            path: std::sync::Arc::new(path.to_path_buf()),
+        })
     }
 
     pub async fn telegram_poll_acquire(
@@ -4307,53 +4316,51 @@ impl Db {
         let posts = if posts_days == 0 {
             0
         } else {
-            sqlx::query(&format!("DELETE FROM news_reads WHERE article_id IN (SELECT id FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days'))")).execute(&self.pool).await?;
-            let news = sqlx::query(&format!("DELETE FROM news_articles WHERE published_at != '' AND published_at < datetime('now', '-{posts_days} days')")).execute(&self.pool).await?.rows_affected();
+            let cutoff = format!("datetime('now', '-{posts_days} days')");
+            let old_news = format!("published_at != '' AND published_at < {cutoff}");
+            delete_in_batches(
+                &self.pool,
+                "news_reads",
+                &format!("article_id IN (SELECT id FROM news_articles WHERE {old_news})"),
+            )
+            .await?;
+            let news = delete_in_batches(&self.pool, "news_articles", &old_news).await?;
             let posts = self.purge_old_posts(posts_days).await?;
             self.set_setting("maintenance_last_cleanup", &now.to_string())
                 .await?;
-            let logs = if log_days == 0 {
-                0
-            } else {
-                sqlx::query(&format!(
-                    "DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')"
-                ))
-                .execute(&self.pool)
-                .await?
-                .rows_affected()
-            };
-            let admin = sqlx::query(
-                "DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')",
-            )
-            .execute(&self.pool)
-            .await?
-            .rows_affected();
-            sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')")
-                .execute(&self.pool)
-                .await?;
-            return Ok((posts as i64, news as i64, logs as i64, admin as i64));
+            let (logs, admin) = self.prune_logs(log_days).await?;
+            return Ok((posts as i64, news as i64, logs, admin));
         };
-        let logs = if log_days == 0 {
-            0
-        } else {
-            sqlx::query(&format!(
-                "DELETE FROM push_logs WHERE created_at < datetime('now', '-{log_days} days')"
-            ))
-            .execute(&self.pool)
-            .await?
-            .rows_affected() as i64
-        };
-        let admin =
-            sqlx::query("DELETE FROM admin_logs WHERE created_at < datetime('now', '-180 days')")
-                .execute(&self.pool)
-                .await?
-                .rows_affected() as i64;
-        sqlx::query("DELETE FROM source_events WHERE created_at < datetime('now', '-7 days')")
-            .execute(&self.pool)
-            .await?;
+        let (logs, admin) = self.prune_logs(log_days).await?;
         self.set_setting("maintenance_last_cleanup", &now.to_string())
             .await?;
         Ok((posts, 0, logs, admin))
+    }
+
+    async fn prune_logs(&self, log_days: i64) -> Result<(i64, i64), sqlx::Error> {
+        let logs = if log_days == 0 {
+            0
+        } else {
+            delete_in_batches(
+                &self.pool,
+                "push_logs",
+                &format!("created_at < datetime('now', '-{log_days} days')"),
+            )
+            .await? as i64
+        };
+        let admin = delete_in_batches(
+            &self.pool,
+            "admin_logs",
+            "created_at < datetime('now', '-180 days')",
+        )
+        .await? as i64;
+        delete_in_batches(
+            &self.pool,
+            "source_events",
+            "created_at < datetime('now', '-7 days')",
+        )
+        .await?;
+        Ok((logs, admin))
     }
 
     pub async fn register(
@@ -8568,6 +8575,28 @@ fn read_sql_name(sql: &str, index: usize) -> Result<(usize, String), String> {
     Ok((index + end, rest[..end].to_string()))
 }
 
+/// Deletes matching rows a few thousand at a time. The pool has a single
+/// connection, so one huge DELETE would stall every request behind it; between
+/// batches other callers get the connection back.
+async fn delete_in_batches(
+    pool: &SqlitePool,
+    table: &str,
+    filter: &str,
+) -> Result<u64, sqlx::Error> {
+    let sql = format!(
+        "DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE {filter} LIMIT 5000)"
+    );
+    let mut total = 0;
+    loop {
+        let deleted = sqlx::query(&sql).execute(pool).await?.rows_affected();
+        total += deleted;
+        if deleted < 5000 {
+            return Ok(total);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Splits `SCHEMA` into table/data statements and index statements so indexes
 /// are only built after legacy tables have been brought up to date.
 fn split_schema(schema: &str) -> (String, Vec<String>) {
@@ -12369,5 +12398,34 @@ mod regression_tests {
         assert!(schema_columns(SCHEMA)
             .iter()
             .any(|column| column.table == "users" && column.name == "wechat_openid"));
+    }
+
+    #[tokio::test]
+    async fn batched_deletes_remove_everything_that_matches() {
+        let (db, path) = fresh_db("batched-delete").await;
+        sqlx::raw_sql(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 12001)
+             INSERT INTO source_events (platform, status, created_at)
+             SELECT CASE WHEN i % 3 = 0 THEN 'keep' ELSE 'x' END, 'ok',
+                    CASE WHEN i % 3 = 0 THEN datetime('now') ELSE datetime('now', '-30 days') END
+             FROM n",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        let deleted = delete_in_batches(
+            db.pool(),
+            "source_events",
+            "created_at < datetime('now', '-7 days')",
+        )
+        .await
+        .unwrap();
+        assert_eq!(deleted, 8001);
+        let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM source_events")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(left, 4000);
+        let _ = std::fs::remove_file(&path);
     }
 }

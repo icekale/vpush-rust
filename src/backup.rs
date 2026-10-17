@@ -233,6 +233,15 @@ async fn restore_candidate(db: &Db, live: &Path, candidate: &Path) -> Result<(),
         let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
     }
+    // The live connection must reload the schema (reading sqlite_master
+    // notices the new schema cookie) before cached statements, which still
+    // carry the pre-restore column layout, are dropped.
+    if let Ok(mut conn) = db.pool().acquire().await {
+        let _ = sqlx::query("SELECT COUNT(*) FROM sqlite_master")
+            .execute(&mut *conn)
+            .await;
+        let _ = sqlx::Connection::clear_cached_statements(&mut *conn).await;
+    }
     if sqlx::query("SELECT 1").execute(db.pool()).await.is_err() {
         let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
@@ -271,10 +280,24 @@ async fn snapshot_unlocked(db: &Db) -> Result<PathBuf, BackupError> {
     std::fs::create_dir_all(&folder).map_err(|_| fail(500, "读取数据库失败"))?;
     let target = unique_snapshot(&folder);
     let escaped = target.to_string_lossy().replace('\'', "''");
-    sqlx::query(&format!("VACUUM INTO '{escaped}'"))
-        .execute(db.pool())
-        .await
-        .map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
+    // A dedicated read-only connection: WAL lets it copy a consistent snapshot
+    // while the app's single pooled connection keeps serving requests.
+    let mut conn = {
+        use sqlx::sqlite::SqliteConnectOptions;
+        use sqlx::ConnectOptions;
+        SqliteConnectOptions::new()
+            .filename(&live)
+            .read_only(true)
+            .busy_timeout(std::time::Duration::from_secs(30))
+            .connect()
+            .await
+            .map_err(|_| fail(500, "读取数据库失败"))?
+    };
+    let vacuumed = sqlx::query(&format!("VACUUM INTO '{escaped}'"))
+        .execute(&mut conn)
+        .await;
+    let _ = sqlx::Connection::close(conn).await;
+    vacuumed.map_err(|_| fail(500, "备份校验失败，请稍后重试"))?;
     if !sqlite_ok_off(&target).await {
         let _ = std::fs::remove_file(&target);
         return Err(fail(500, "备份校验失败，请稍后重试"));
@@ -580,16 +603,11 @@ async fn setting(db: &Db, key: &str) -> Result<String, BackupError> {
 }
 
 async fn db_file(db: &Db) -> Result<PathBuf, BackupError> {
-    let file: Option<String> =
-        sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name = 'main'")
-            .fetch_optional(db.pool())
-            .await
-            .map_err(|_| fail(500, "读取数据库失败"))?;
-    let file = file.unwrap_or_default();
-    if file.is_empty() {
+    let path = db.path();
+    if path.as_os_str().is_empty() || path.to_string_lossy().starts_with(":memory:") {
         return Err(fail(400, "当前数据库不能导出"));
     }
-    Ok(PathBuf::from(file))
+    Ok(path.to_path_buf())
 }
 
 fn valid_https(url: &str) -> bool {
@@ -945,6 +963,26 @@ mod tests {
         if let Some(value) = previous_feishu {
             std::env::set_var("FEISHU_CREDENTIAL_KEY", value);
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn snapshot_does_not_need_the_pooled_connection() {
+        let _serial = SERIAL.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-bak-busy-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("app.db")).await.unwrap();
+        let held = db.pool().acquire().await.unwrap();
+        let snap = tokio::time::timeout(std::time::Duration::from_secs(10), snapshot(&db))
+            .await
+            .expect("snapshot must not wait for the busy pool")
+            .unwrap();
+        drop(held);
+        assert!(snap.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

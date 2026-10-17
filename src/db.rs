@@ -9193,7 +9193,14 @@ async fn ensure_hot_indexes(pool: &SqlitePool) -> Result<(), sqlx::Error> {
          CREATE INDEX IF NOT EXISTS idx_push_logs_created ON push_logs(created_at);
          CREATE INDEX IF NOT EXISTS idx_push_logs_user ON push_logs(user_id);
          CREATE INDEX IF NOT EXISTS idx_posts_fetched ON posts(fetched_at);
-         CREATE INDEX IF NOT EXISTS idx_news_articles_published ON news_articles(published_at);",
+         CREATE INDEX IF NOT EXISTS idx_news_articles_published ON news_articles(published_at);
+         CREATE INDEX IF NOT EXISTS idx_subscriptions_kol ON subscriptions(kol_id);
+         CREATE INDEX IF NOT EXISTS idx_source_events_platform_created ON source_events(platform, created_at);
+         CREATE INDEX IF NOT EXISTS idx_source_events_created ON source_events(created_at);
+         CREATE INDEX IF NOT EXISTS idx_news_reads_article ON news_reads(article_id);
+         CREATE INDEX IF NOT EXISTS idx_report_tickers_code ON report_extraction_tickers(code);
+         CREATE INDEX IF NOT EXISTS idx_report_tickers_name ON report_extraction_tickers(name);
+         CREATE INDEX IF NOT EXISTS idx_ima_doc_downloaded ON ima_document_index(downloaded_at);",
     )
     .execute(pool)
     .await?;
@@ -12648,5 +12655,62 @@ mod regression_tests {
         assert_eq!(push_owner, None);
         assert!(db.user_by_id(gone).await.unwrap().is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn hot_lookup_indexes_are_added_and_used() {
+        let (db, path) = fresh_db("hot-lookups").await;
+        let names = [
+            "idx_ima_doc_downloaded",
+            "idx_news_reads_article",
+            "idx_report_tickers_code",
+            "idx_report_tickers_name",
+            "idx_source_events_created",
+            "idx_source_events_platform_created",
+            "idx_subscriptions_kol",
+        ];
+        for name in names {
+            sqlx::query(&format!("DROP INDEX {name}"))
+                .execute(db.pool())
+                .await
+                .unwrap();
+        }
+        db.pool().close().await;
+        let db = Db::open(&path).await.unwrap();
+        let plan = |sql: &'static str| {
+            let db = db.clone();
+            async move {
+                sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("detail"))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            }
+        };
+        for (sql, index) in [
+            ("SELECT user_id FROM subscriptions WHERE kol_id = 1", "idx_subscriptions_kol"),
+            (
+                "SELECT status FROM source_events WHERE platform = 'xueqiu' AND created_at >= datetime('now', '-24 hours')",
+                "idx_source_events_platform_created",
+            ),
+            (
+                "SELECT id FROM source_events WHERE created_at < datetime('now', '-7 days')",
+                "idx_source_events_created",
+            ),
+            ("SELECT user_id FROM news_reads WHERE article_id = 1", "idx_news_reads_article"),
+            ("SELECT media_id FROM report_extraction_tickers WHERE code = '600519'", "idx_report_tickers_code"),
+            ("SELECT media_id FROM report_extraction_tickers WHERE name = '茅台'", "idx_report_tickers_name"),
+            (
+                "SELECT media_id FROM ima_document_index WHERE downloaded_at >= '2026-01-01'",
+                "idx_ima_doc_downloaded",
+            ),
+        ] {
+            let detail = plan(sql).await;
+            assert!(detail.contains(index), "{sql}: {detail}");
+        }
+        let _ = std::fs::remove_file(path);
     }
 }

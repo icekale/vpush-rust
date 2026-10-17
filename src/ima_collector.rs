@@ -86,7 +86,7 @@ pub async fn status(db: &Db) -> Result<Value, String> {
         .map_err(|err| err.to_string())?;
     Ok(json!({
         "config": config,
-        "running": false,
+        "running": RUNNING.load(std::sync::atomic::Ordering::SeqCst),
         "next_run_at": 0,
         "last_started_at": text(db, STARTED_KEY).await?,
         "last_finished_at": text(db, FINISHED_KEY).await?,
@@ -309,7 +309,38 @@ pub async fn discover(db: &Db) -> Result<Value, CollectorError> {
     Err(CollectorError::Unavailable("IMA 知识库发现尚未接入"))
 }
 
-pub async fn sync(db: &Db, body: &SyncBody) -> Result<Value, CollectorError> {
+static RUNNING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Held for the whole sync; the maintenance loop and manual triggers share it,
+/// so two runs never download into the same files concurrently.
+struct RunGuard;
+
+impl RunGuard {
+    fn acquire() -> Option<Self> {
+        // Never build a RunGuard on failure: dropping it would clear the flag.
+        if RUNNING
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
+        {
+            Some(RunGuard)
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn plan(db: &Db, body: &SyncBody) -> Result<(Cfg, Vec<Group>, bool), CollectorError> {
     let cfg = load(db)
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 文档下载尚未接入"))?;
@@ -324,26 +355,68 @@ pub async fn sync(db: &Db, body: &SyncBody) -> Result<Value, CollectorError> {
         if mount_ids(group).is_empty() {
             return Err(CollectorError::Conflict("请先挂载该知识库"));
         }
-    } else if too_soon(&cfg, db)
-        .await
-        .map_err(|_| CollectorError::Unavailable("IMA 文档下载尚未接入"))?
-        .is_some()
+    }
+    let targets: Vec<Group> = cfg
+        .groups
+        .iter()
+        .filter(|group| {
+            if group_id.is_empty() {
+                group.enabled && !mount_ids(group).is_empty()
+            } else {
+                group.id == group_id
+            }
+        })
+        .cloned()
+        .collect();
+    Ok((cfg, targets, group_id.is_empty()))
+}
+
+/// Scheduled path (maintenance loop): runs inline and honours the interval.
+pub async fn sync(db: &Db, body: &SyncBody) -> Result<Value, CollectorError> {
+    let (cfg, targets, scheduled) = plan(db, body).await?;
+    let Some(guard) = RunGuard::acquire() else {
+        return Err(CollectorError::TooSoon);
+    };
+    if scheduled
+        && too_soon(&cfg, db)
+            .await
+            .map_err(|_| CollectorError::Unavailable("IMA 文档下载尚未接入"))?
+            .is_some()
     {
         return Err(CollectorError::TooSoon);
     }
-    let targets: Vec<Group> = if group_id.is_empty() {
-        cfg.groups
-            .iter()
-            .filter(|group| group.enabled && !mount_ids(group).is_empty())
-            .cloned()
-            .collect()
-    } else {
-        cfg.groups
-            .iter()
-            .filter(|group| group.id == group_id)
-            .cloned()
-            .collect()
+    let result = run(db, &cfg, &targets).await;
+    drop(guard);
+    result
+}
+
+/// Manual trigger from the admin page: validates, then runs in the background
+/// so a proxy timeout or closed tab cannot cancel the sync half-way.
+pub async fn start_sync(db: &Db, body: &SyncBody) -> Result<Value, CollectorError> {
+    let (cfg, targets, scheduled) = plan(db, body).await?;
+    let Some(guard) = RunGuard::acquire() else {
+        return Ok(json!({"ok": true, "status": "already_running"}));
     };
+    if scheduled
+        && too_soon(&cfg, db)
+            .await
+            .map_err(|_| CollectorError::Unavailable("IMA 文档下载尚未接入"))?
+            .is_some()
+    {
+        return Err(CollectorError::TooSoon);
+    }
+    let db = db.clone();
+    tokio::spawn(async move {
+        let _guard = guard;
+        if let Some(Err(err)) = crate::supervise::catch("ima_sync", run(&db, &cfg, &targets)).await
+        {
+            tracing::warn!("IMA 手动同步失败: {err:?}");
+        }
+    });
+    Ok(json!({"ok": true, "status": "started"}))
+}
+
+async fn run(db: &Db, cfg: &Cfg, targets: &[Group]) -> Result<Value, CollectorError> {
     let exit = crate::proxy_admin::acquire(db, "ima")
         .await
         .map_err(|err| match err.as_str() {
@@ -358,7 +431,7 @@ pub async fn sync(db: &Db, body: &SyncBody) -> Result<Value, CollectorError> {
         .ok()
         .map(std::path::PathBuf::from)
         .filter(|path| !path.as_os_str().is_empty());
-    let result = sync_groups(db, &cfg, &targets, &http, root.as_deref()).await;
+    let result = sync_groups(db, cfg, targets, &http, root.as_deref()).await;
     crate::proxy_admin::note(db, proxy_id, result.is_ok(), "IMA 同步失败").await;
     result
 }
@@ -449,17 +522,28 @@ async fn sync_groups(
     db.set_setting(STARTED_KEY, &now.to_string())
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 同步状态写入失败"))?;
-    let session = ima_client::refresh(http, &ima_client::base(), &cfg.uid, &cfg.refresh_token)
-        .await
-        .map_err(|_| CollectorError::Unavailable("IMA 登录失败"))?;
+    let session =
+        match ima_client::refresh(http, &ima_client::base(), &cfg.uid, &cfg.refresh_token).await {
+            Ok(session) => session,
+            Err(err) => {
+                record_result(
+                db,
+                &json!({"status": "error", "error": format!("IMA 登录失败: {}", safe_ima(&err))}),
+            )
+            .await;
+                return Err(CollectorError::Unavailable("IMA 登录失败"));
+            }
+        };
     let mut listed = 0_i64;
+    let mut failed_groups = Vec::new();
+    let mut skipped_folders = 0_usize;
     let mut pending = 0_i64;
     let mut downloaded = 0_i64;
     let mut download_errors = 0_i64;
     let mut first_download_error = String::new();
     let mut done = Vec::new();
     for group in targets {
-        let files = ima_client::list_pdfs_deep(
+        let files = match ima_client::list_pdfs_deep(
             http,
             &ima_client::base(),
             &session,
@@ -467,7 +551,17 @@ async fn sync_groups(
             &mount_ids(group),
         )
         .await
-        .map_err(|_| CollectorError::Unavailable("IMA 知识库列表读取失败"))?;
+        {
+            Ok((files, skipped)) => {
+                skipped_folders += skipped;
+                files
+            }
+            Err(err) => {
+                tracing::warn!(group = group.id, "IMA 知识库列表读取失败: {err}");
+                failed_groups.push(json!({"group": group.id, "error": safe_ima(&err)}));
+                continue;
+            }
+        };
         let have = db.ima_downloaded_ids(&group.id).await.unwrap_or_default();
         let retry = db.ima_redownload_ids(&group.id).await.unwrap_or_default();
         for file in &files {
@@ -501,7 +595,7 @@ async fn sync_groups(
                         first_download_error = safe_ima(&err);
                     }
                 }
-                Ok(bytes) => match save_pdf(root, &group.id, file, &bytes) {
+                Ok(bytes) => match save_pdf_off(root, &group.id, file, bytes).await {
                     Err(err) => {
                         download_errors += 1;
                         if first_download_error.is_empty() {
@@ -528,12 +622,19 @@ async fn sync_groups(
         listed += files.len() as i64;
         done.push(group.id.clone());
     }
+    if done.is_empty() && !failed_groups.is_empty() {
+        // Nothing was listed at all: let the next maintenance round retry
+        // instead of waiting out a full interval.
+        let _ = db.set_setting(STARTED_KEY, "0").await;
+    }
     let finished = now_secs();
     let result = json!({
-        "status": "ok",
+        "status": if failed_groups.is_empty() { "ok" } else { "partial" },
         "listed": listed,
         "pending": pending,
         "groups": done,
+        "failed_groups": failed_groups,
+        "skipped_folders": skipped_folders,
         "downloaded": downloaded,
         "download_errors": download_errors,
         "download_error": first_download_error
@@ -545,6 +646,23 @@ async fn sync_groups(
         .await
         .map_err(|_| CollectorError::Unavailable("IMA 同步状态写入失败"))?;
     Ok(json!({"ok": true, "result": result}))
+}
+
+async fn save_pdf_off(
+    root: &std::path::Path,
+    group_id: &str,
+    file: &ima_client::File,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let (root, group_id, file) = (root.to_path_buf(), group_id.to_string(), file.clone());
+    tokio::task::spawn_blocking(move || save_pdf(&root, &group_id, &file, &bytes))
+        .await
+        .unwrap_or_else(|_| Err("PDF 写入失败".into()))
+}
+
+async fn record_result(db: &Db, result: &Value) {
+    let _ = db.set_setting(FINISHED_KEY, &now_secs().to_string()).await;
+    let _ = db.set_setting(RESULT_KEY, &result.to_string()).await;
 }
 
 struct Cfg {
@@ -1254,5 +1372,78 @@ mod tests {
         let failed = db.user_by_username("readerfail").await.unwrap().unwrap();
         grant_default_libraries(&db, failed.id).await;
         assert!(db.user_by_id(failed.id).await.unwrap().is_some());
+    }
+
+    struct HalfBroken;
+
+    impl ima_client::Transport for HalfBroken {
+        async fn post(&self, url: &str, _: &[(&str, String)], body: &str) -> Result<Value, String> {
+            if url.contains("refresh") {
+                return Ok(json!({"token": "abc"}));
+            }
+            if body.contains("kb_bad") {
+                return Err("timeout".into());
+            }
+            Ok(
+                json!({"is_end": true, "knowledge_list": [{"media_id": "ok1", "title": "报告.pdf", "file_size": 12, "create_time": 1700000000000i64}]}),
+            )
+        }
+    }
+
+    fn group_in(id: &str) -> GroupIn {
+        GroupIn {
+            id: Some(id.into()),
+            name: id.into(),
+            knowledge_base_id: id.into(),
+            root_folder_id: "root".into(),
+            enabled: Some(true),
+            folder_ids: Some(vec![json!("folder")]),
+            interval_seconds: Some(100),
+        }
+    }
+
+    #[tokio::test]
+    async fn one_failing_group_does_not_stop_the_others_and_runs_are_exclusive() {
+        let db = db().await;
+        save(
+            &db,
+            &SaveBody {
+                uid: Some("uid1".into()),
+                refresh_token: Some("token".into()),
+                knowledge_base_id: None,
+                root_folder_id: None,
+                interval_seconds: Some(3600),
+                groups: Some(vec![group_in("kb_bad"), group_in("kb_good")]),
+            },
+        )
+        .await
+        .unwrap();
+        let cfg = load(&db).await.unwrap();
+        let out = sync_groups(&db, &cfg, &cfg.groups, &HalfBroken, None)
+            .await
+            .unwrap();
+        assert_eq!(out["result"]["status"], "partial");
+        assert_eq!(out["result"]["groups"], json!(["kb_good"]));
+        assert_eq!(out["result"]["failed_groups"][0]["group"], "kb_bad");
+        assert_eq!(out["result"]["listed"], 1);
+
+        let guard = RunGuard::acquire().expect("free");
+        assert!(RunGuard::acquire().is_none());
+        assert_eq!(status(&db).await.unwrap()["running"], true);
+        let queued = start_sync(
+            &db,
+            &SyncBody {
+                group_id: Some("kb_good".into()),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(queued["status"], "already_running");
+        assert!(matches!(
+            sync(&db, &SyncBody { group_id: None }).await,
+            Err(CollectorError::TooSoon)
+        ));
+        drop(guard);
+        assert_eq!(status(&db).await.unwrap()["running"], false);
     }
 }

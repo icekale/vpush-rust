@@ -3471,7 +3471,7 @@ async fn sync_ima_collector(
     Json(body): Json<ima_collector::SyncBody>,
 ) -> Result<Json<Value>, ApiError> {
     require_admin(&state, &headers).await?;
-    ima_collector::sync(&state.db, &body)
+    ima_collector::start_sync(&state.db, &body)
         .await
         .map(Json)
         .map_err(collector_err)

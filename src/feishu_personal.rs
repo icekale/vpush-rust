@@ -607,7 +607,7 @@ fn open_secret(key_b64: &str, stored: &str) -> Result<String, String> {
     String::from_utf8(plain).map_err(|_| "密文无效".into())
 }
 
-fn decode_key(key_b64: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn decode_key(key_b64: &str) -> Result<Vec<u8>, String> {
     let bytes = URL_SAFE
         .decode(key_b64)
         .map_err(|_| "FEISHU_CREDENTIAL_KEY 无效".to_string())?;

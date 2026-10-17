@@ -151,12 +151,13 @@ pub async fn restore_bytes(db: &Db, data: &[u8]) -> Result<(), BackupError> {
     if data.is_empty() || data.len() > UPLOAD_MAX {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
     }
-    if data.starts_with(MAGIC) {
-        return Err(fail(
-            400,
-            "备份已加密，请配置 FEISHU_CREDENTIAL_KEY 后再恢复",
-        ));
-    }
+    let decrypted;
+    let data = if data.starts_with(MAGIC) {
+        decrypted = decrypt_backup(data)?;
+        decrypted.as_slice()
+    } else {
+        data
+    };
     if !data.starts_with(b"SQLite format 3\0") {
         return Err(fail(400, "请上传有效的 .db 备份文件"));
     }
@@ -685,6 +686,16 @@ pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
             return Ok(false);
         }
     };
+    let bytes = match backup_key() {
+        Some(key) => match encrypt_backup(&key, &bytes) {
+            Ok(sealed) => sealed,
+            Err(err) => {
+                let _ = db.set_setting(LAST_ERR, err.detail).await;
+                return Ok(false);
+            }
+        },
+        None => bytes,
+    };
     let folder = join(&cfg.url, &cfg.path);
     if let Err(err) = upload_pruned_off(&cfg, &folder, &name, bytes).await {
         let _ = db.set_setting(LAST_ERR, err.detail).await;
@@ -694,6 +705,73 @@ pub async fn run_scheduled(db: &Db) -> Result<bool, BackupError> {
     let _ = db.set_setting(LAST_ERR, "").await;
     let _ = db.set_setting(LAST_NAME, &name).await;
     Ok(true)
+}
+
+/// Opt-in: when `BACKUP_ENCRYPTION_KEY` (32 bytes, URL-safe base64 like
+/// `FEISHU_CREDENTIAL_KEY`) is set, uploads are AES-256-GCM sealed as
+/// `MAGIC || nonce || ciphertext`. Unset keeps the historical plaintext upload.
+fn backup_key() -> Option<Vec<u8>> {
+    let raw = std::env::var("BACKUP_ENCRYPTION_KEY").unwrap_or_default();
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    match crate::feishu_personal::decode_key(raw) {
+        Ok(key) => Some(key),
+        Err(_) => {
+            tracing::error!(
+                "BACKUP_ENCRYPTION_KEY 无效（需要 32 字节 URL-safe base64），备份将不上传"
+            );
+            Some(Vec::new())
+        }
+    }
+}
+
+fn encrypt_backup(key: &[u8], plain: &[u8]) -> Result<Vec<u8>, BackupError> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    let cipher = aes_gcm::Aes256Gcm::new_from_slice(key)
+        .map_err(|_| fail(500, "BACKUP_ENCRYPTION_KEY 无效"))?;
+    let mut nonce = [0u8; 12];
+    getrandom::getrandom(&mut nonce).map_err(|_| fail(500, "备份加密失败"))?;
+    let sealed = cipher
+        .encrypt(aes_gcm::Nonce::from_slice(&nonce), plain)
+        .map_err(|_| fail(500, "备份加密失败"))?;
+    let mut out = Vec::with_capacity(MAGIC.len() + nonce.len() + sealed.len());
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&nonce);
+    out.extend_from_slice(&sealed);
+    Ok(out)
+}
+
+fn decrypt_backup(data: &[u8]) -> Result<Vec<u8>, BackupError> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    let body = &data[MAGIC.len()..];
+    if body.len() < 12 + 16 {
+        return Err(fail(400, "请上传有效的 .db 备份文件"));
+    }
+    let keys: Vec<Vec<u8>> = ["BACKUP_ENCRYPTION_KEY", "FEISHU_CREDENTIAL_KEY"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .filter_map(|raw| crate::feishu_personal::decode_key(raw.trim()).ok())
+        .collect();
+    if keys.is_empty() {
+        return Err(fail(
+            400,
+            "备份已加密，请配置 BACKUP_ENCRYPTION_KEY 后再恢复",
+        ));
+    }
+    for key in keys {
+        let Ok(cipher) = aes_gcm::Aes256Gcm::new_from_slice(&key) else {
+            continue;
+        };
+        if let Ok(plain) = cipher.decrypt(aes_gcm::Nonce::from_slice(&body[..12]), &body[12..]) {
+            return Ok(plain);
+        }
+    }
+    Err(fail(
+        400,
+        "备份解密失败，请确认 BACKUP_ENCRYPTION_KEY 与备份时一致",
+    ))
 }
 
 fn upload_pruned(cfg: &Cfg, folder: &str, name: &str, bytes: &[u8]) -> Result<(), BackupError> {
@@ -803,6 +881,70 @@ mod tests {
         assert!(user.is_admin);
         assert_eq!(user.telegram_chat_id, "");
         assert!(db.setting("anything").await.unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn encrypted_backups_round_trip_and_need_the_key() {
+        let _serial = SERIAL.lock().await;
+        let _env = crate::feishu_personal::TEST_ENV_LOCK
+            .get_or_init(|| async { tokio::sync::Mutex::new(()) })
+            .await
+            .lock()
+            .await;
+        let previous = std::env::var_os("BACKUP_ENCRYPTION_KEY");
+        let previous_feishu = std::env::var_os("FEISHU_CREDENTIAL_KEY");
+        std::env::remove_var("FEISHU_CREDENTIAL_KEY");
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-bak-enc-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("app.db")).await.unwrap();
+        db.set_setting("backup_marker", "sealed").await.unwrap();
+        let plain = std::fs::read(snapshot(&db).await.unwrap()).unwrap();
+        db.set_setting("backup_marker", "live").await.unwrap();
+
+        std::env::set_var(
+            "BACKUP_ENCRYPTION_KEY",
+            base64::engine::general_purpose::URL_SAFE.encode([7u8; 32]),
+        );
+        let key = backup_key().unwrap();
+        let sealed = encrypt_backup(&key, &plain).unwrap();
+        assert!(sealed.starts_with(MAGIC));
+        assert!(!sealed
+            .windows(b"SQLite format 3".len())
+            .any(|w| w == b"SQLite format 3"));
+
+        std::env::remove_var("BACKUP_ENCRYPTION_KEY");
+        let err = restore_bytes(&db, &sealed).await.unwrap_err();
+        assert_eq!(err.status, 400);
+        std::env::set_var(
+            "BACKUP_ENCRYPTION_KEY",
+            base64::engine::general_purpose::URL_SAFE.encode([8u8; 32]),
+        );
+        assert!(restore_bytes(&db, &sealed).await.is_err());
+        assert_eq!(
+            db.setting("backup_marker").await.unwrap().as_deref(),
+            Some("live")
+        );
+        std::env::set_var(
+            "BACKUP_ENCRYPTION_KEY",
+            base64::engine::general_purpose::URL_SAFE.encode([7u8; 32]),
+        );
+        restore_bytes(&db, &sealed).await.unwrap();
+        assert_eq!(
+            db.setting("backup_marker").await.unwrap().as_deref(),
+            Some("sealed")
+        );
+        match previous {
+            Some(value) => std::env::set_var("BACKUP_ENCRYPTION_KEY", value),
+            None => std::env::remove_var("BACKUP_ENCRYPTION_KEY"),
+        }
+        if let Some(value) = previous_feishu {
+            std::env::set_var("FEISHU_CREDENTIAL_KEY", value);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

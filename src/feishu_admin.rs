@@ -1246,8 +1246,7 @@ fn download_media(token: &str, access: &str) -> Result<Option<MediaFile>, Fail> 
     .call();
     let response = match response {
         Ok(response) => response,
-        Err(ureq::Error::Status(401, _)) => return Err(fail(400, "飞书授权已失效")),
-        Err(_) => return Ok(None),
+        Err(err) => return media_error(&err),
     };
     let mime = response
         .header("content-type")
@@ -1262,7 +1261,7 @@ fn download_media(token: &str, access: &str) -> Result<Option<MediaFile>, Fail> 
         .into_reader()
         .take(50 * 1024 * 1024 + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| fail(400, "飞书媒体下载失败"))?;
+        .map_err(|_| fail(502, "飞书媒体下载失败，稍后重试"))?;
     if bytes.len() > 50 * 1024 * 1024 {
         return Err(fail(400, "飞书媒体文件超过 50 MB 限制"));
     }
@@ -1271,6 +1270,24 @@ fn download_media(token: &str, access: &str) -> Result<Option<MediaFile>, Fail> 
         mime,
         name: disposition_name(&disposition),
     }))
+}
+
+/// Only a definitive "gone / forbidden" answer marks an asset unavailable: the
+/// revision is stored afterwards and an unchanged document is never re-fetched,
+/// so transient failures must fail the whole sync to be retried.
+fn media_error(err: &ureq::Error) -> Result<Option<MediaFile>, Fail> {
+    match err {
+        ureq::Error::Status(401, _) => Err(fail(400, "飞书授权已失效")),
+        ureq::Error::Status(400 | 403 | 404 | 410, _) => Ok(None),
+        ureq::Error::Status(code, _) => {
+            tracing::warn!("飞书媒体下载失败 HTTP {code}，本次同步稍后重试");
+            Err(fail(502, "飞书媒体下载失败，稍后重试"))
+        }
+        ureq::Error::Transport(transport) => {
+            tracing::warn!("飞书媒体下载网络错误，本次同步稍后重试: {transport}");
+            Err(fail(502, "飞书媒体下载失败，稍后重试"))
+        }
+    }
 }
 
 fn disposition_name(header: &str) -> String {
@@ -1891,5 +1908,27 @@ mod tests {
         assert_eq!(std::fs::read(&file).unwrap(), b"png-bytes");
         assert_eq!(timeline["notices"][0]["assets"][0]["name"], "图表.png");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn only_definitive_media_errors_mark_assets_unavailable() {
+        let status =
+            |code: u16| ureq::Error::Status(code, ureq::Response::new(code, "x", "").unwrap());
+        for code in [400, 403, 404, 410] {
+            assert!(matches!(media_error(&status(code)), Ok(None)), "{code}");
+        }
+        for code in [401, 429, 500, 502, 503] {
+            assert!(media_error(&status(code)).is_err(), "{code}");
+        }
+
+        let mut timeline =
+            json!({"entries": [{"assets": [{"token": "boxcnAAAAAAAAAAAAAAAAAAAAAA"}]}]});
+        let mut flaky = |_: &str| -> Result<Option<MediaFile>, Fail> {
+            Err(fail(502, "飞书媒体下载失败，稍后重试"))
+        };
+        assert!(store_assets(&mut timeline, &mut flaky).is_err());
+        assert!(timeline["entries"][0]["assets"][0]
+            .get("unavailable")
+            .is_none());
     }
 }

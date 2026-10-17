@@ -198,14 +198,18 @@ async function api(path, options = {}) {
   // 登录/注册的 401 是「凭据错误」业务响应：透出后端 detail，不清会话
   if (resp.status === 401 && !path.startsWith("/api/auth/") && state.token === requestToken) {
     logout();
-    throw new Error("登录已过期，请重新登录");
+    const error = new Error("登录已过期，请重新登录");
+    error.status = 401;
+    throw error;
   }
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) {
     // FastAPI 422 等校验错误的 detail 是数组/对象，直接拼接会显示 [object Object]
     const detail = data.detail;
     const msg = typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : resp.statusText);
-    throw new Error(msg);
+    const error = new Error(msg);
+    error.status = resp.status;
+    throw error;
   }
   return data;
 }
@@ -223,7 +227,9 @@ async function apiBlob(path, options = {}) {
     const data = await resp.json().catch(() => ({}));
     const detail = data.detail;
     const msg = typeof detail === "string" ? detail : (detail ? JSON.stringify(detail) : resp.statusText);
-    throw new Error(msg);
+    const error = new Error(msg);
+    error.status = resp.status;
+    throw error;
   }
   return resp.blob();
 }
@@ -5754,6 +5760,8 @@ function migrateHashRoute() {
 async function router() {
   stopMarketQuotes();
   stopWatchlist();
+  // 飞书个人机器人注册轮询绑定在发起时的路由上，切路由即停
+  if (typeof stopFeishuPersonalPoll === "function") stopFeishuPersonalPoll();
   // admin 视图懒加载：这三个 stop 来自 admin 模块，未加载时没有在跑的轮询要停
   if (adminViewsLoaded) {
     stopCiccPoll();

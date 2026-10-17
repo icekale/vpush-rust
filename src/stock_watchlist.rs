@@ -688,13 +688,8 @@ pub async fn list(db: &Db, user_id: i64) -> Result<Value, WatchlistError> {
         let instrument = normalize_symbol(&market, &symbol).map_err(WatchlistError::bad)?;
         let entry = cached(&instrument.key());
         let quote = entry.as_ref().and_then(|entry| entry.quote.as_ref());
-        let error = entry
-            .as_ref()
-            .and_then(|entry| entry.error.clone())
-            .or_else(|| {
-                (!crate::market::exchange_calendar_known(market.as_str(), now / 1000))
-                    .then(|| "该年度交易日历尚未核验".to_string())
-            });
+        let error = entry.as_ref().and_then(|entry| entry.error.clone());
+        let calendar_verified = crate::market::exchange_calendar_known(market.as_str(), now / 1000);
         let status = if error.is_some()
             || quote.is_none()
             || quote.is_some_and(|quote| quote.observed_at_ms > now)
@@ -715,6 +710,7 @@ pub async fn list(db: &Db, user_id: i64) -> Result<Value, WatchlistError> {
             "percent": visible_quote.and_then(|quote| quote.percent),
             "tick_size": quote.and_then(|quote| quote.tick_size),
             "quoted_at": quote.map(|quote| quote.quoted_at.clone()), "status": status,
+            "calendar_verified": calendar_verified,
             "alerts": {"above": alert_json_from_columns(row, "above"), "below": alert_json_from_columns(row, "below")},
         });
         if let Some(error) = error {
@@ -1672,7 +1668,7 @@ mod tests {
         let mut at_lunch = quote.clone();
         at_lunch.observed_at_ms = lunch;
         assert!(!alertable_at(&at_lunch, lunch));
-        let unknown_calendar = crate::market::mainland_quote_time("20270104100000")
+        let unknown_calendar = crate::market::mainland_quote_time("20280104100000")
             .unwrap()
             .1;
         assert!(!crate::market::exchange_calendar_known(

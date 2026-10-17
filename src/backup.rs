@@ -887,7 +887,12 @@ mod tests {
             .arg(
                 "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
                      password_hash TEXT NOT NULL DEFAULT '', is_admin INTEGER NOT NULL DEFAULT 0);
-                 INSERT INTO users (username, password_hash, is_admin) VALUES ('restored', 'h', 1);",
+                 INSERT INTO users (username, password_hash, is_admin) VALUES ('restored', 'h', 1);
+                 CREATE TABLE ima_document_index (group_id TEXT NOT NULL, media_id TEXT NOT NULL,
+                     pdf_path TEXT NOT NULL DEFAULT '', downloaded_at TEXT NOT NULL DEFAULT '',
+                     PRIMARY KEY (group_id, media_id));
+                 INSERT INTO ima_document_index VALUES ('g1', 'm1', '1114/a.pdf', '2026-01-01');
+                 INSERT INTO ima_document_index VALUES ('g2', 'm2', '1114/a.pdf', '2026-02-01');",
             )
             .status()
             .unwrap();
@@ -898,6 +903,17 @@ mod tests {
         let user = db.user_by_username("restored").await.unwrap().unwrap();
         assert!(user.is_admin);
         assert_eq!(user.telegram_chat_id, "");
+        let index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_ima_doc_pdf_path'",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(index, 1);
+        assert_eq!(
+            db.ima_redownload_ids("g1").await.unwrap(),
+            std::collections::HashSet::from(["m1".to_string()])
+        );
         assert!(db.setting("anything").await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }

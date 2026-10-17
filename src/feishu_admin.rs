@@ -375,19 +375,31 @@ pub async fn sync_source(db: &Db, id: i64) -> Result<Value, Fail> {
     let key_hash: String = row.get("source_key_hash");
     let title_for_files = title.clone();
     let access_for_files = access.clone();
-    let published = tokio::task::spawn_blocking(move || {
+    let prior_fails = media_failure_counts(db).await;
+    let (published, outcomes) = tokio::task::spawn_blocking(move || {
         let mut timeline = timeline;
-        publish_files(
+        let mut outcomes = Vec::new();
+        let published = publish_files(
             &root,
             &key_hash,
             &title_for_files,
             &mut timeline,
-            &mut |token| download_media(token, &access_for_files),
+            &mut |token| {
+                let prior = prior_fails.get(token).copied().unwrap_or(0);
+                tolerate_media_failure(
+                    token,
+                    prior,
+                    download_media(token, &access_for_files),
+                    &mut outcomes,
+                )
+            },
         )
-        .map(|paths| (paths, timeline))
+        .map(|paths| (paths, timeline));
+        (published, outcomes)
     })
     .await
     .map_err(|_| fail(500, "飞书文档读取失败"))?;
+    record_media_outcomes(db, &outcomes).await;
     let ((timeline_path, txt_path, asset_root), timeline) = match published {
         Ok(paths) => paths,
         Err(err) => {
@@ -1276,7 +1288,8 @@ fn download_media(token: &str, access: &str) -> Result<Option<MediaFile>, Fail> 
 
 /// Only a definitive "gone / forbidden" answer marks an asset unavailable: the
 /// revision is stored afterwards and an unchanged document is never re-fetched,
-/// so transient failures must fail the whole sync to be retried.
+/// so transient failures must fail the whole sync to be retried (see
+/// `tolerate_media_failure` for the cap).
 fn media_error(err: &ureq::Error) -> Result<Option<MediaFile>, Fail> {
     match err {
         ureq::Error::Status(401, _) => Err(fail(400, "飞书授权已失效")),
@@ -1289,6 +1302,62 @@ fn media_error(err: &ureq::Error) -> Result<Option<MediaFile>, Fail> {
             tracing::warn!("飞书媒体下载网络错误，本次同步稍后重试: {transport}");
             Err(fail(502, "飞书媒体下载失败，稍后重试"))
         }
+    }
+}
+
+/// Consecutive transient failures after which one asset is published as
+/// unavailable instead of failing the whole document forever.
+const MEDIA_MAX_FAILS: i64 = 5;
+
+fn tolerate_media_failure(
+    token: &str,
+    prior: i64,
+    result: Result<Option<MediaFile>, Fail>,
+    outcomes: &mut Vec<(String, bool)>,
+) -> Result<Option<MediaFile>, Fail> {
+    match result {
+        Err(err) if err.status == 502 => {
+            outcomes.push((token.to_string(), false));
+            if prior + 1 >= MEDIA_MAX_FAILS {
+                tracing::warn!("飞书媒体连续 {} 次下载失败，本次按不可用发布", prior + 1);
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+        Ok(Some(file)) => {
+            outcomes.push((token.to_string(), true));
+            Ok(Some(file))
+        }
+        other => other,
+    }
+}
+
+async fn media_failure_counts(db: &Db) -> std::collections::HashMap<String, i64> {
+    let _ = sqlx::query(
+        "DELETE FROM feishu_media_failures WHERE updated_at < datetime('now', '-90 days')",
+    )
+    .execute(db.pool())
+    .await;
+    sqlx::query_as::<_, (String, i64)>("SELECT token, fails FROM feishu_media_failures")
+        .fetch_all(db.pool())
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect()
+}
+
+async fn record_media_outcomes(db: &Db, outcomes: &[(String, bool)]) {
+    for (token, ok) in outcomes {
+        let query = if *ok {
+            sqlx::query("DELETE FROM feishu_media_failures WHERE token = ?")
+        } else {
+            sqlx::query(
+                "INSERT INTO feishu_media_failures (token, fails) VALUES (?, 1)
+                 ON CONFLICT(token) DO UPDATE SET fails = fails + 1, updated_at = datetime('now')",
+            )
+        };
+        let _ = query.bind(token).execute(db.pool()).await;
     }
 }
 
@@ -1932,5 +2001,51 @@ mod tests {
         assert!(timeline["entries"][0]["assets"][0]
             .get("unavailable")
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn persistently_failing_asset_is_skipped_after_the_cap() {
+        let (db, path) = db().await;
+        let token = "boxcnBBBBBBBBBBBBBBBBBBBBBB";
+        let flaky = || -> Result<Option<MediaFile>, Fail> {
+            Err(fail(502, "飞书媒体下载失败，稍后重试"))
+        };
+        for attempt in 1..=MEDIA_MAX_FAILS {
+            let prior = media_failure_counts(&db)
+                .await
+                .get(token)
+                .copied()
+                .unwrap_or(0);
+            assert_eq!(prior, attempt - 1);
+            let mut outcomes = Vec::new();
+            let got = tolerate_media_failure(token, prior, flaky(), &mut outcomes);
+            record_media_outcomes(&db, &outcomes).await;
+            if attempt < MEDIA_MAX_FAILS {
+                assert!(got.is_err(), "attempt {attempt} should fail the sync");
+            } else {
+                assert!(
+                    matches!(got, Ok(None)),
+                    "attempt {attempt} should skip the asset"
+                );
+            }
+        }
+        let mut outcomes = Vec::new();
+        let auth =
+            tolerate_media_failure(token, 99, Err(fail(400, "飞书授权已失效")), &mut outcomes);
+        assert!(auth.is_err() && outcomes.is_empty());
+        let ok = tolerate_media_failure(
+            token,
+            3,
+            Ok(Some(MediaFile {
+                bytes: b"x".to_vec(),
+                mime: "image/png".into(),
+                name: String::new(),
+            })),
+            &mut outcomes,
+        );
+        assert!(matches!(ok, Ok(Some(_))));
+        record_media_outcomes(&db, &outcomes).await;
+        assert!(media_failure_counts(&db).await.is_empty());
+        let _ = std::fs::remove_file(&path);
     }
 }

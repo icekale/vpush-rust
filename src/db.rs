@@ -463,6 +463,11 @@ CREATE TABLE IF NOT EXISTS feishu_document_sources (
     last_success_at TEXT NOT NULL DEFAULT '',
     deleted_at TEXT
 );
+CREATE TABLE IF NOT EXISTS feishu_media_failures (
+    token TEXT PRIMARY KEY,
+    fails INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS feishu_oauth_sessions (
     state_hash TEXT PRIMARY KEY,
     user_id INTEGER NOT NULL,

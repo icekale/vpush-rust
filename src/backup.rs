@@ -172,6 +172,11 @@ pub async fn restore_bytes(db: &Db, data: &[u8]) -> Result<(), BackupError> {
         .map_err(|_| fail(500, "读取数据库失败"))?;
     let result = restore_candidate(db, &live, &candidate).await;
     let _ = std::fs::remove_file(&candidate);
+    for suffix in ["-wal", "-shm"] {
+        let mut side = candidate.clone().into_os_string();
+        side.push(suffix);
+        let _ = std::fs::remove_file(side);
+    }
     result
 }
 
@@ -221,6 +226,7 @@ async fn restore_candidate(db: &Db, live: &Path, candidate: &Path) -> Result<(),
     if !sqlite_ok_off(candidate).await {
         return Err(fail(400, "备份文件损坏，已取消恢复，当前数据未改"));
     }
+    migrate_candidate(candidate).await?;
     let snap = snapshot_unlocked(db).await?;
     if !restore_into_off(live, candidate).await {
         let _ = restore_into_off(live, &snap).await;
@@ -230,6 +236,31 @@ async fn restore_candidate(db: &Db, live: &Path, candidate: &Path) -> Result<(),
         let _ = restore_into_off(live, &snap).await;
         return Err(fail(400, "恢复失败，已保持恢复前的数据库"));
     }
+    Ok(())
+}
+
+/// Brings an (possibly old) backup up to the current schema on the side copy,
+/// so the live database is only replaced by something the app can run on.
+async fn migrate_candidate(candidate: &Path) -> Result<(), BackupError> {
+    let migrated = Db::open(candidate).await.map_err(|err| {
+        tracing::warn!(%err, "备份迁移失败");
+        fail(400, "备份无法升级到当前版本，已取消恢复，当前数据未改")
+    })?;
+    let violations: Vec<(String,)> =
+        sqlx::query_as("SELECT \"table\" FROM pragma_foreign_key_check")
+            .fetch_all(migrated.pool())
+            .await
+            .unwrap_or_default();
+    if !violations.is_empty() {
+        tracing::warn!(count = violations.len(), "恢复的备份存在外键孤儿记录");
+    }
+    let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
+        .execute(migrated.pool())
+        .await;
+    let _ = sqlx::query("PRAGMA journal_mode = DELETE")
+        .execute(migrated.pool())
+        .await;
+    migrated.pool().close().await;
     Ok(())
 }
 
@@ -698,6 +729,8 @@ fn utc_human() -> String {
 mod tests {
     use super::*;
 
+    static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn names_come_from_webdav_listing() {
         let xml = r#"<D:href>/vpush-backups/</D:href><D:href>/vpush-backups/dav-20260814-030000.db</D:href><D:href>/x/dav-20260813-030000.db</D:href>"#;
@@ -712,6 +745,7 @@ mod tests {
 
     #[tokio::test]
     async fn saves_config_downloads_and_restores_without_showing_the_password() {
+        let _serial = SERIAL.lock().await;
         let dir =
             std::env::temp_dir().join(format!("vpush-bak-{}-{}", std::process::id(), now_secs()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -739,6 +773,36 @@ mod tests {
             db.setting("backup_marker").await.unwrap().as_deref(),
             Some("before")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restoring_an_old_backup_migrates_it_before_swapping() {
+        let _serial = SERIAL.lock().await;
+        let dir = std::env::temp_dir().join(format!(
+            "vpush-bak-old-{}-{}",
+            std::process::id(),
+            now_secs()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = dir.join("old.db");
+        let status = Command::new("sqlite3")
+            .arg(&old)
+            .arg(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                     password_hash TEXT NOT NULL DEFAULT '', is_admin INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO users (username, password_hash, is_admin) VALUES ('restored', 'h', 1);",
+            )
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let bytes = std::fs::read(&old).unwrap();
+        let db = Db::open(&dir.join("app.db")).await.unwrap();
+        restore_bytes(&db, &bytes).await.unwrap();
+        let user = db.user_by_username("restored").await.unwrap().unwrap();
+        assert!(user.is_admin);
+        assert_eq!(user.telegram_chat_id, "");
+        assert!(db.setting("anything").await.unwrap().is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

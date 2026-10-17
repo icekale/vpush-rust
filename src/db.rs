@@ -678,7 +678,8 @@ impl Db {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        sqlx::raw_sql(SCHEMA).execute(&pool).await?;
+        let (tables, indexes) = split_schema(SCHEMA);
+        sqlx::raw_sql(&tables).execute(&pool).await?;
         ensure_user_columns(&pool).await?;
         ensure_users_autoincrement(&pool).await?;
         ensure_kol_columns(&pool).await?;
@@ -687,6 +688,8 @@ impl Db {
         ensure_feishu_columns(&pool).await?;
         ensure_news_admin_columns(&pool).await?;
         ensure_etf_premium_columns(&pool).await?;
+        ensure_legacy_columns(&pool).await?;
+        create_schema_indexes(&pool, &indexes).await?;
         ensure_hot_indexes(&pool).await?;
         ensure_binding_indexes(&pool).await?;
         repair_ima_pdf_collisions(&pool).await?;
@@ -8565,6 +8568,166 @@ fn read_sql_name(sql: &str, index: usize) -> Result<(usize, String), String> {
     Ok((index + end, rest[..end].to_string()))
 }
 
+/// Splits `SCHEMA` into table/data statements and index statements so indexes
+/// are only built after legacy tables have been brought up to date.
+fn split_schema(schema: &str) -> (String, Vec<String>) {
+    let mut tables = String::new();
+    let mut indexes = Vec::new();
+    for statement in schema.split(';') {
+        let statement = statement.trim();
+        if statement.is_empty() {
+            continue;
+        }
+        let head = statement.to_ascii_uppercase();
+        if head.starts_with("CREATE INDEX") || head.starts_with("CREATE UNIQUE INDEX") {
+            indexes.push(statement.to_string());
+        } else {
+            tables.push_str(statement);
+            tables.push_str(";\n");
+        }
+    }
+    (tables, indexes)
+}
+
+async fn create_schema_indexes(pool: &SqlitePool, indexes: &[String]) -> Result<(), sqlx::Error> {
+    for statement in indexes {
+        // A legacy table that still lacks a column must not abort startup; the
+        // index is an optimisation (or a guard that the app also enforces).
+        if let Err(err) = sqlx::raw_sql(statement).execute(pool).await {
+            tracing::warn!(%err, statement, "索引创建失败，已跳过");
+        }
+    }
+    Ok(())
+}
+
+struct SchemaColumn {
+    table: String,
+    name: String,
+    definition: String,
+}
+
+fn schema_columns(schema: &str) -> Vec<SchemaColumn> {
+    let mut out = Vec::new();
+    for statement in schema.split(';') {
+        let statement = statement.trim();
+        let Some(rest) = statement
+            .strip_prefix("CREATE TABLE IF NOT EXISTS ")
+            .map(str::trim_start)
+        else {
+            continue;
+        };
+        let (Some(open), Some(close)) = (rest.find('('), rest.rfind(')')) else {
+            continue;
+        };
+        let table = rest[..open].trim().to_string();
+        let mut depth = 0usize;
+        let mut start = open + 1;
+        let body_end = close;
+        let mut parts = Vec::new();
+        for (i, ch) in rest[..body_end]
+            .char_indices()
+            .skip_while(|(i, _)| *i <= open)
+        {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    parts.push(&rest[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&rest[start..body_end]);
+        for part in parts {
+            let part = part.trim();
+            let upper = part.to_ascii_uppercase();
+            if [
+                "PRIMARY KEY",
+                "FOREIGN KEY",
+                "UNIQUE",
+                "CHECK",
+                "CONSTRAINT",
+            ]
+            .iter()
+            .any(|kw| upper.starts_with(kw))
+            {
+                continue;
+            }
+            let Some((name, definition)) = part.split_once(char::is_whitespace) else {
+                continue;
+            };
+            out.push(SchemaColumn {
+                table: table.clone(),
+                name: name.to_string(),
+                definition: definition.trim().to_string(),
+            });
+        }
+    }
+    out
+}
+
+/// A definition SQLite's `ALTER TABLE ... ADD COLUMN` accepts, if any. Text
+/// columns whose default is an expression fall back to an empty string, which
+/// is what the app already treats as "unknown".
+fn addable_definition(definition: &str) -> Option<String> {
+    let upper = definition.to_ascii_uppercase();
+    if upper.contains("PRIMARY KEY") || upper.contains("UNIQUE") || upper.contains("REFERENCES") {
+        return None;
+    }
+    if let Some(at) = upper
+        .find("DEFAULT (")
+        .or_else(|| upper.find("DEFAULT CURRENT_"))
+    {
+        if !upper.starts_with("TEXT") {
+            return None;
+        }
+        return Some(format!("{}DEFAULT ''", &definition[..at]));
+    }
+    (!upper.contains("NOT NULL") || upper.contains("DEFAULT")).then(|| definition.to_string())
+}
+
+/// Adds any column the current `SCHEMA` declares but an old database (Python
+/// era, old backup) lacks, as long as SQLite can add it in place.
+async fn ensure_legacy_columns(pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    let mut known: HashMap<String, Vec<String>> = HashMap::new();
+    for column in schema_columns(SCHEMA) {
+        if !known.contains_key(&column.table) {
+            let existing: Vec<String> = sqlx::query_scalar("SELECT name FROM pragma_table_info(?)")
+                .bind(&column.table)
+                .fetch_all(pool)
+                .await?;
+            known.insert(column.table.clone(), existing);
+        }
+        let existing = &known[&column.table];
+        if existing.is_empty()
+            || existing
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&column.name))
+        {
+            continue;
+        }
+        let Some(definition) = addable_definition(&column.definition) else {
+            tracing::warn!(
+                table = column.table,
+                column = column.name,
+                "旧库缺少该列且无法在线补齐"
+            );
+            continue;
+        };
+        add_column(
+            pool,
+            &format!(
+                "ALTER TABLE {} ADD COLUMN {} {definition}",
+                column.table, column.name
+            ),
+        )
+        .await?;
+        tracing::info!(table = column.table, column = column.name, "已为旧库补齐列");
+    }
+    Ok(())
+}
+
 async fn add_column(pool: &SqlitePool, sql: &str) -> Result<(), sqlx::Error> {
     if let Err(err) = sqlx::raw_sql(sql).execute(pool).await {
         if !err.to_string().contains("duplicate column name") {
@@ -12126,5 +12289,85 @@ mod regression_tests {
         let db = Db::open(&path).await.unwrap();
         assert!(db.user_by_feishu_open_id("ou_dup").await.unwrap().is_none());
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn minimal_legacy_schema_upgrades_in_place_and_is_rerunnable() {
+        let path = std::env::temp_dir().join(format!(
+            "vpush-legacy-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        {
+            let opts = SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true);
+            let pool = SqlitePoolOptions::new()
+                .max_connections(1)
+                .connect_with(opts)
+                .await
+                .unwrap();
+            sqlx::raw_sql(
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT NOT NULL UNIQUE,
+                     password_hash TEXT NOT NULL DEFAULT '', is_admin INTEGER NOT NULL DEFAULT 0);
+                 INSERT INTO users (username, password_hash, is_admin) VALUES ('old-admin', 'h', 1);
+                 CREATE TABLE kol_requests (id INTEGER PRIMARY KEY, platform TEXT NOT NULL,
+                     external_id TEXT NOT NULL, user_id INTEGER NOT NULL);
+                 INSERT INTO kol_requests (platform, external_id, user_id) VALUES ('xueqiu', '1', 1);
+                 CREATE TABLE ima_document_index (group_id TEXT NOT NULL, media_id TEXT NOT NULL,
+                     name TEXT NOT NULL DEFAULT '', PRIMARY KEY (group_id, media_id));
+                 INSERT INTO ima_document_index (group_id, media_id, name) VALUES ('g', 'm', 'old.pdf');",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            pool.close().await;
+        }
+        for _ in 0..2 {
+            let db = Db::open(&path).await.unwrap();
+            let user = db.user_by_username("old-admin").await.unwrap().unwrap();
+            assert!(user.is_admin);
+            assert_eq!(user.wechat_openid, "");
+            let indexes: Vec<String> =
+                sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'index'")
+                    .fetch_all(db.pool())
+                    .await
+                    .unwrap();
+            for expected in [
+                "idx_users_wechat_openid",
+                "uq_kol_requests_pending",
+                "idx_ima_doc_latest",
+                "idx_ima_doc_group_latest",
+            ] {
+                assert!(indexes.iter().any(|name| name == expected), "{expected}");
+            }
+            let status: String = sqlx::query_scalar("SELECT status FROM kol_requests")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            assert_eq!(status, "pending");
+            db.pool().close().await;
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn schema_split_keeps_every_statement_and_defers_indexes() {
+        let (tables, indexes) = split_schema(SCHEMA);
+        assert!(!tables.to_ascii_uppercase().contains("CREATE INDEX"));
+        assert!(!tables.to_ascii_uppercase().contains("CREATE UNIQUE INDEX"));
+        assert!(indexes.len() >= 10);
+        assert_eq!(
+            addable_definition("TEXT NOT NULL DEFAULT (datetime('now'))").as_deref(),
+            Some("TEXT NOT NULL DEFAULT ''")
+        );
+        assert_eq!(addable_definition("INTEGER PRIMARY KEY"), None);
+        assert_eq!(addable_definition("INTEGER NOT NULL"), None);
+        assert!(schema_columns(SCHEMA)
+            .iter()
+            .any(|column| column.table == "users" && column.name == "wechat_openid"));
     }
 }

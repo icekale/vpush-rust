@@ -607,10 +607,7 @@ fn router(state: AppState) -> Router {
         .route("/api/ima-documents/{media_id}/pdf", get(ima_pdf))
         .route("/api/ima-documents/{media_id}/text", get(ima_text))
         .route("/api/ima-documents/{media_id}", get(feishu_document))
-        .route(
-            "/api/xincai/ingest",
-            post(xincai_ingest).layer(DefaultBodyLimit::max(128 * 1024 * 1024)),
-        )
+        .route("/api/xincai/ingest", post(xincai_ingest))
         .route("/api/news/sources", get(news_sources))
         .route("/api/news", get(news_list))
         .route("/api/news/seen", post(news_seen))
@@ -3177,10 +3174,11 @@ fn news_topic_from_query(q: &NewsQuery) -> Result<String, ApiError> {
         .map_err(|msg| ApiError::new(StatusCode::BAD_REQUEST, msg))
 }
 
+/// 请求体在鉴权通过之后才读取和解析，匿名请求不会占用内存。
 async fn xincai_ingest(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(body): Json<Value>,
+    body: Body,
 ) -> Result<Json<Value>, ApiError> {
     let expected = std::env::var("XINCAI_INGEST_TOKEN").unwrap_or_default();
     let header = headers
@@ -3196,6 +3194,16 @@ async fn xincai_ingest(
         Err(msg) => return Err(ApiError::new(StatusCode::UNAUTHORIZED, msg)),
         Ok(()) => {}
     }
+    static SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let _slot = SLOTS
+        .try_acquire()
+        .map_err(|_| ApiError::new(StatusCode::TOO_MANY_REQUESTS, "入库请求过多，请稍后重试"))?;
+    let bytes = axum::body::to_bytes(body, xincai::max_request_bytes())
+        .await
+        .map_err(|_| ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "请求体过大"))?;
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "请求体必须是 JSON 对象"))?;
+    drop(bytes);
     match xincai::ingest(&state.db, &body).await {
         Ok(value) => Ok(Json(value)),
         Err(CatalogError::Bad(msg)) => Err(ApiError::new(StatusCode::BAD_REQUEST, msg)),
@@ -8322,5 +8330,69 @@ mod tests {
             revived.id
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn xincai_ingest_rejects_before_reading_the_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let db = Db::open(std::path::Path::new(":memory:")).await.unwrap();
+        db.ensure_admin("hash").await.unwrap();
+        let app = router(AppState {
+            db,
+            secret: "xincai-test".into(),
+            allow_register: false,
+            static_dir: std::env::temp_dir(),
+            fails: new_login_limit(),
+        });
+        std::env::set_var("XINCAI_INGEST_TOKEN", "ingest-secret");
+        let polled = Arc::new(AtomicBool::new(false));
+        let watch = polled.clone();
+        let stream = futures_util::stream::poll_fn(move |_| {
+            watch.store(true, Ordering::SeqCst);
+            std::task::Poll::Ready(Some(Ok::<_, std::io::Error>(Bytes::from_static(b"{"))))
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/xincai/ingest")
+                    .header(header::AUTHORIZATION, "Bearer wrong")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from_stream(stream))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!polled.load(Ordering::SeqCst));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/xincai/ingest")
+                    .header(header::AUTHORIZATION, "Bearer ingest-secret")
+                    .body(Body::from(
+                        r#"{"articles":[{"externalId":"a","title":"t","html":"<p>x</p>"}]}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/xincai/ingest")
+                    .header(header::AUTHORIZATION, "Bearer ingest-secret")
+                    .body(Body::from("not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 }

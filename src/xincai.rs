@@ -9,6 +9,17 @@ use crate::news::plain;
 const MAX_BATCH: usize = 200;
 const MAX_BODY: usize = 512 * 1024;
 
+/// 单次 ingest 请求体上限，`XINCAI_INGEST_MAX_MB` 可调（1–128，默认 128，与旧版一致）。
+pub fn max_request_bytes() -> usize {
+    std::env::var("XINCAI_INGEST_MAX_MB")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(128)
+        .clamp(1, 128)
+        * 1024
+        * 1024
+}
+
 pub fn authorize(authorization: Option<&str>, expected: &str) -> Result<(), &'static str> {
     let expected = expected.trim();
     if expected.is_empty() {
